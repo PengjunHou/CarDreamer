@@ -60,7 +60,7 @@ def create_task(task_name: str, argv=None):
 
     :return: a tuple of the created environment and the configs
     """
-    import gym
+    import gymnasium as gym
 
     config = load_task_configs(task_name)
     config, _ = toolkit.Flags(config).parse_known(argv)
@@ -71,7 +71,7 @@ def _register_envs():
     import os
     from re import sub
 
-    from gym.envs.registration import register
+    import gymnasium as gym
 
     def toClassName(s):
         return sub(r"(_|-)+", " ", s).title().replace(" ", "")
@@ -80,7 +80,7 @@ def _register_envs():
         if file.endswith("env.py") and file != "__init__.py":
             file_name = file[:-3]
             class_name = toClassName(file_name)
-            exec(f"register(id='{class_name}-v0', entry_point='car_dreamer.{file_name}:{class_name}')")
+            exec(f"gym.register(id='{class_name}-v0', entry_point='car_dreamer.{file_name}:{class_name}')")
 
 
 _register_envs()

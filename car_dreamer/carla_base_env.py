@@ -2,9 +2,9 @@ from abc import abstractmethod
 from typing import Dict, Tuple
 
 import carla
-import gym
+import gymnasium as gym
 import numpy as np
-from gym import spaces
+from gymnasium import spaces
 
 from .toolkit import EnvMonitorOpenCV, Observer, WorldManager
 
@@ -100,7 +100,7 @@ class CarlaBaseEnv(gym.Env):
 
         print("[CARLA] Environment reset")
         self.obs, _ = self._observer.get_observation(self.get_state())
-        return self.obs
+        return self.obs, {}
 
     def get_vehicle_control(self, action):
         """
@@ -160,7 +160,12 @@ class CarlaBaseEnv(gym.Env):
         if self._config.display.enable:
             self._render(self.obs, info)
 
-        return (self.obs, reward, is_terminal, info)
+        # Gymnasium API: return (obs, reward, terminated, truncated, info)
+        # terminated: episode ended naturally (goal/failure)
+        # truncated: episode was cut short (time limit, etc.)
+        terminated = is_terminal
+        truncated = False  # CarDreamer doesn't use truncated separately
+        return self.obs, reward, terminated, truncated, info
 
     def is_collision(self):
         """

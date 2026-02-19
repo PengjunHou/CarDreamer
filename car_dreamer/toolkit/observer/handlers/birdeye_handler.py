@@ -3,7 +3,7 @@ from typing import Dict, Tuple
 import carla
 import cv2
 import numpy as np
-from gym import spaces
+from gymnasium import spaces
 
 from ...carla_manager import WorldManager
 from .base_handler import BaseHandler

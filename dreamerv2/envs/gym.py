@@ -1,6 +1,6 @@
 import functools
 
-import gym
+import gymnasium as gym
 import numpy as np
 
 import dreamerv2 as dm2
@@ -54,15 +54,16 @@ class FromGym(dm2.Env):
     def step(self, action):
         if action["reset"] or self._done:
             self._done = False
-            obs = self._env.reset()
+            obs, info = self._env.reset()
             return self._obs(obs, 0.0, is_first=True), {}
         if self._act_dict:
             action = self._unflatten(action)
         else:
             action = action[self._act_key]
-        obs, reward, self._done, self._info = self._env.step(action)
+        obs, reward, terminated, truncated, self._info = self._env.step(action)
+        self._done = terminated or truncated
         is_last = bool(self._done)
-        is_terminal = bool(self._info.get("is_terminal", self._done))
+        is_terminal = bool(self._info.get("is_terminal", terminated))
         self._info = self._flatten(self._info)
         return self._obs(obs, reward, is_last=is_last, is_terminal=is_terminal), self._info
 

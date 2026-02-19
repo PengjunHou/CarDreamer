@@ -5,7 +5,7 @@ from functools import partial as bind
 
 import embodied
 import numpy as np
-import tensorflow as tf
+# import tensorflow as tf
 
 
 class BasePrioritizedReverb:

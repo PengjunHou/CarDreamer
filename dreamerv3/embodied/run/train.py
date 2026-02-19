@@ -1,7 +1,7 @@
 import re
 
 import embodied
-import jax
+# import jax
 import numpy as np
 
 

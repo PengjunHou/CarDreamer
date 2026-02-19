@@ -3,7 +3,7 @@ import re
 
 import embodied
 import numpy as np
-from jax.tree_util import tree_map
+# from jax.tree_util import tree_map
 
 
 def eval_only(agent, env, logger, args):
