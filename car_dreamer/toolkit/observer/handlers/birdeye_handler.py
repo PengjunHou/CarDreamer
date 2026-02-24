@@ -1,5 +1,6 @@
 from typing import Dict, Tuple
 
+import os
 import carla
 import cv2
 import numpy as np
@@ -77,6 +78,11 @@ class BirdeyeHandler(BaseHandler):
 
         obs = {self._config.key: birdeye_resized.astype(np.uint8)}
         info = {}
+        
+        actor_id = self._ego.id if self._ego is not None else 0
+        os.makedirs(f"data/birdeye_frames/vehicle_{actor_id}", exist_ok=True)
+        cur_time_step = self._world.get_time_step()
+        cv2.imwrite(f"data/birdeye_frames/vehicle_{actor_id}/birdeye_{cur_time_step:06d}.png", birdeye_resized)
 
         return obs, info
 

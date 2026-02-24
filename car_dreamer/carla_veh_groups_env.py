@@ -173,14 +173,14 @@ class CarlaVehGroupsEnv(CarlaWptFixedEnv):
         
         # Spawn focus vehicles near random spawn points
         # (You may want to constrain them to an area / route later.)
-        for _ in range(self.num_focus_vehicles):
-            if getattr(self._config, "grouping_strategy", "spawn_near_ego") == "spawn_near_ego":
-                break # SpawnNearEgoGrouping will handle spawning focus vehicles in its form_groups()
-            tf = self._world.get_random_spawn_point()
-            v = self._world.try_spawn_actor(transform=tf)
-            if v is None:
-                continue
-            self.focus_vehicles.append(v)
+
+        if getattr(self._config, "grouping_strategy", "spawn_near_ego") != "spawn_near_ego":
+            blueprints = self._world.get_blueprint_library("vehicle.audi*", {"number_of_wheels": "4"})
+            actor_list = self._world.spawn_auto_actors(n = self.num_focus_vehicles, blueprints=blueprints)    # generate vehicle controller by world manager
+            for v in actor_list:
+                if v is None:
+                    continue
+                self.focus_vehicles.append(v)
 
         # Initial grouping immediately at reset
         self._update_groups()
@@ -197,17 +197,14 @@ class CarlaVehGroupsEnv(CarlaWptFixedEnv):
         tm_port = getattr(self._world, "_tm_port", None)
         for v in self.focus_vehicles:
             actor_id = v.id
-            observer = Observer(self._world, self._config.observation)
+            focus_observation = self._config.observation 
+            focus_observation = focus_observation.update(
+                enabled=["camera", "collision"]
+            )
+            observer = Observer(self._world, focus_observation)
             self._other_observers.setdefault(actor_id, observer) 
             self._other_observers[actor_id].reset(v)  
-            self.group_obs[actor_id] = self._other_observers[actor_id].get_observation({})
-            try:
-                if tm_port is None:
-                    v.set_autopilot(True)
-                else:
-                    v.set_autopilot(True, tm_port)
-            except Exception:
-                pass
+            self.group_obs[actor_id] = self._other_observers[actor_id].get_observation(self.get_state())
 
     def on_step(self) -> None:
         # 1) deliver messages whose time has come
@@ -220,7 +217,7 @@ class CarlaVehGroupsEnv(CarlaWptFixedEnv):
             actor_id = v.id
             observer = self._other_observers.get(actor_id, None)
             if observer is not None:
-                self.group_obs[actor_id], _ = observer.get_observation({})
+                self.group_obs[actor_id], _ = observer.get_observation(self.get_state())
                 
         # 3) periodic intra-group communication
         if self._time_step % max(self.comm_period, 1) == 0:

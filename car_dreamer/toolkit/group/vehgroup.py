@@ -174,6 +174,7 @@ class SpawnNearEgoGrouping(GroupingStrategy):
         spawned = 0
         cand_idx = 0
         total_cands = len(candidates)
+        
 
         while spawned < need and cand_idx < total_cands:
             _, sp = candidates[cand_idx]
@@ -182,8 +183,10 @@ class SpawnNearEgoGrouping(GroupingStrategy):
             v = None
             # 对同一个点不重复试太多次（意义不大），但给一个轻量 fallback
             for _ in range(min(self.spawn_max_tries, 3)):
-                v = wm.try_spawn_actor(transform=sp)
-                if v is not None:
+                blueprint = wm.get_blueprint("vehicle.audi*", {"number_of_wheels": "4"})
+                actor_list = wm.spawn_auto_actors(n = 1, transforms=[sp], blueprints=[blueprint])
+                if len(actor_list) > 0:
+                    v = actor_list[0]
                     break
 
             if v is not None:

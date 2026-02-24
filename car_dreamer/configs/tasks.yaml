@@ -36,7 +36,7 @@ carla_navigation:
 carla_veh_groups:
   env:
     name: CarlaVehGroupsEnv-v0
-    observation.enabled: [camera, collision]
+    observation.enabled: [camera, collision,birdeye_wpt]
     num_vehicles: 50
     <<: *carla_wpt
     lane_start_points:
@@ -53,14 +53,14 @@ carla_veh_groups:
   dreamerv3:
     encoder.cnn_keys: "birdeye_wpt"
     decoder.cnn_keys: "birdeye_wpt"
-    run.log_keys_video: [camera]
+    run.log_keys_video: [camera, birdeye_wpt]
     run.log_keys_max: "collision"
 
   dreamerv2:
     encoder.cnn_keys: "birdeye_wpt"
     decoder.cnn_keys: "birdeye_wpt"
     decoder.cnn_kernels: [5, 5, 5, 6, 6]
-    train.log_keys_video: [camera]
+    train.log_keys_video: [camera, birdeye_wpt]
 
 carla_four_lane:
   env:
