@@ -38,13 +38,13 @@ def main(argv=None):
     config = embodied.Config({"dreamerv3": model_configs["defaults"]})
     config = config.update({"dreamerv3": model_configs["small"]})
 
-    parsed, other = embodied.Flags(task=["carla_navigation"]).parse_known(argv)
+    parsed, other = embodied.Flags(task=["carla_veh_groups"]).parse_known(argv)
     for name in parsed.task:
         print("Using task: ", name)
         env, env_config = car_dreamer.create_task(name, argv)
         config = config.update(env_config)
     config = embodied.Flags(config).parse(other)
-    print(config)
+    # print(config)
 
     logdir = embodied.Path(config.dreamerv3.logdir)
     step = embodied.Counter()
@@ -69,7 +69,7 @@ def main(argv=None):
     config.save(str(logdir / config_filename))
     print(f"[Train] Config saved to {logdir / config_filename}")
 
-    agent = dreamerv3.Agent(env.obs_space, env.act_space, step, dreamerv3_config)
+    agent = None #dreamerv3.Agent(env.obs_space, env.act_space, step, dreamerv3_config)
     replay = embodied.replay.Uniform(dreamerv3_config.batch_length, dreamerv3_config.replay_size, logdir / "replay")
     args = embodied.Config(
         **dreamerv3_config.run,
@@ -77,7 +77,9 @@ def main(argv=None):
         batch_steps=dreamerv3_config.batch_size * dreamerv3_config.batch_length,
         actor_dist_disc=dreamerv3_config.actor_dist_disc,
     )
-    # embodied.run.train(agent, env, replay, logger, args)
+    embodied.run.train(agent, env, replay, logger, args)
+    
+    print(f"testing agent...")
 
 
 if __name__ == "__main__":

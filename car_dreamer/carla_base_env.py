@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, Any
 
 import carla
 import gymnasium as gym
@@ -17,10 +17,11 @@ class CarlaBaseEnv(gym.Env):
         self._world = WorldManager(self._config)
         self._world.on_reset(self.on_reset)
         self._world.on_step(self.on_step)
-        self._observer = Observer(self._world, self._config.observation)
+        self._ego_observer = Observer(self._world, self._config.observation)
 
         self.action_space = self._get_action_space()
         self.observation_space = self._get_observation_space()
+        self._time_step = 0
 
     @abstractmethod
     def on_reset(self) -> None:
@@ -87,19 +88,25 @@ class CarlaBaseEnv(gym.Env):
             )
 
     def _get_observation_space(self):
-        return self._observer.get_observation_space()
+        return self._ego_observer.get_observation_space()
 
-    def reset(self):
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        """Reset environment (Gymnasium API): accepts `seed` and `options`.
+
+        Returns (obs, info).
+        """
         print("[CARLA] Reset environment")
+        super().reset(seed=seed)
 
-        self._observer.destroy()
+        # Keep behavior unchanged: seed is accepted but not applied here.
+        self._ego_observer.destroy()
         self._world.reset()
-        self._observer.reset(self.get_ego_vehicle())
+        self._ego_observer.reset(self.get_ego_vehicle())
 
         self._time_step = 0
 
         print("[CARLA] Environment reset")
-        self.obs, _ = self._observer.get_observation(self.get_state())
+        self.obs, _ = self._ego_observer.get_observation(self.get_state())
         return self.obs, {}
 
     def get_vehicle_control(self, action):
@@ -121,7 +128,9 @@ class CarlaBaseEnv(gym.Env):
         else:
             throttle = 0
             brake = np.clip(-acc / 3, 0, 1)
-
+        # throttle（油门）: 0 to 1, where 0 means no throttle and 1 means full throttle.
+        # steer（转向）: -1 to 1, where -1 means full
+        # brake（刹车）: 0 to 1, where 0 means no brake and 1 means full brake.
         return carla.VehicleControl(throttle=float(throttle), steer=float(-steer), brake=float(brake))
 
     def _is_terminal(self):
@@ -144,7 +153,7 @@ class CarlaBaseEnv(gym.Env):
 
         env_state = self.get_state()
         is_terminal, terminal_conds = self._is_terminal()
-        self.obs, obs_info = self._observer.get_observation(env_state)
+        self.obs, obs_info = self._ego_observer.get_observation(env_state)
         reward, reward_info = self.reward()
 
         info = {

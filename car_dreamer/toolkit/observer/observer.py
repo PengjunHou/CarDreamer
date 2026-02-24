@@ -77,4 +77,5 @@ class Observer:
             obs_data, info_data = handler.get_observation(env_state)
             obs.update(obs_data)
             info.update(info_data)
+        # print(f"[Observer] Collected observation: {obs}")
         return obs, info

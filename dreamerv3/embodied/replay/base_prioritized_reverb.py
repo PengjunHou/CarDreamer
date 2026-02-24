@@ -5,7 +5,7 @@ from functools import partial as bind
 
 import embodied
 import numpy as np
-# import tensorflow as tf
+import torch
 
 
 class BasePrioritizedReverb:
@@ -54,8 +54,8 @@ class BasePrioritizedReverb:
 
     def _create_server(self):
         import reverb
-        import tensorflow as tf
-
+        def torch_signature(shape, dtype):
+            return {'shape': shape, 'dtype': dtype}
         self.server = reverb.Server(
             tables=[
                 reverb.Table(
@@ -64,7 +64,7 @@ class BasePrioritizedReverb:
                     remover=reverb.selectors.Fifo(),
                     max_size=int(self.capacity),
                     rate_limiter=reverb.rate_limiters.MinSize(1),
-                    signature={key: tf.TensorSpec(shape, dtype) for key, (shape, dtype) in self.signature.items()},
+                    signature={key: torch_signature(shape, dtype) for key, (shape, dtype) in self.signature.items()},
                 )
             ],
             port=None,
@@ -187,16 +187,15 @@ class BasePrioritizedReverb:
 
     def _split_key(self, key):
         """Split the uint64 key into two 32 bit ints"""
-        keyA_tf = key // tf.constant(2**32, dtype=tf.uint64)
-        keyB_tf = key % tf.constant(2**32, dtype=tf.uint64)
-        return np.uint32(keyA_tf), np.uint32(keyB_tf)
+        keyA = key // np.uint64(2**32)
+        keyB = key % np.uint64(2**32)
+        return np.uint32(keyA), np.uint32(keyB)
 
-    def _combine_key(self, keyA, keyB) -> tf.uint64:
+    def _combine_key(self, keyA, keyB):
         """Combine the two 32bit ints into a single 64bit int"""
-        keyA_tf = tf.convert_to_tensor(keyA, dtype=tf.uint64)
-        keyB_tf = tf.convert_to_tensor(keyB, dtype=tf.uint64)
-
-        return keyA_tf * tf.constant(2**32, dtype=tf.uint64) + keyB_tf
+        keyA_np = np.uint64(keyA)
+        keyB_np = np.uint64(keyB)
+        return keyA_np * np.uint64(2**32) + keyB_np
 
     def update_visit_count(self, env_steps):
         flat_env_steps = env_steps.flatten()

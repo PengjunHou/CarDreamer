@@ -1,0 +1,150 @@
+# feature_extractor.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Any, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MultiSizeCNNFeatureExtractor(nn.Module):
+    """
+    Shared CNN backbone -> 1024-d embedding, with projection heads to 256 and 64.
+    Supports feature_size in {64, 256, 1024}.
+    """
+    def __init__(self):
+        super().__init__()
+
+        # A lightweight CNN backbone
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),  # /2
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), # /4
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),# /8
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),# /16
+            nn.ReLU(inplace=True),
+        )
+
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))  # -> [B,256,1,1]
+        self.fc_1024 = nn.Sequential(
+            nn.Flatten(),                          # -> [B,256]
+            nn.Linear(256, 1024),
+            nn.ReLU(inplace=True),
+        )
+
+        # Projection heads
+        self.head_256 = nn.Linear(1024, 256)
+        self.head_64  = nn.Linear(1024, 64)
+
+    @torch.no_grad()
+    def forward_features(self, x: torch.Tensor) -> Dict[int, torch.Tensor]:
+        """
+        x: [B,3,H,W] float32 in [0,1]
+        returns dict {1024: [B,1024], 256: [B,256], 64: [B,64]}
+        """
+        h = self.conv(x)
+        h = self.pool(h)
+        z1024 = self.fc_1024(h)
+        z256 = self.head_256(z1024)
+        z64 = self.head_64(z1024)
+        return {1024: z1024, 256: z256, 64: z64}
+
+
+@dataclass
+class FeatureExtractorConfig:
+    input_hw: int = 128           # resize image to input_hw x input_hw
+    device: Optional[str] = None  # "cuda" / "cpu" / None(auto)
+
+
+class FeatureExtractorService:
+    """
+    A thin wrapper providing:
+      - image preprocessing (numpy uint8 HxWx3 -> torch float32 Bx3xHxW)
+      - cached model and device placement
+      - feature extraction for {64,256,1024}
+    """
+    def __init__(self, cfg: FeatureExtractorConfig = FeatureExtractorConfig()):
+        self.cfg = cfg
+        self.device = self._resolve_device(cfg.device)
+        self.model = MultiSizeCNNFeatureExtractor().to(self.device)
+        self.model.eval()
+
+    def _resolve_device(self, device: Optional[str]) -> str:
+        if device is not None:
+            return device
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    def _preprocess(self, img: np.ndarray) -> torch.Tensor:
+        """
+        img: uint8 HxWx3 (RGB)
+        returns: float32 [1,3,input_hw,input_hw] in [0,1]
+        """
+        if not isinstance(img, np.ndarray):
+            raise TypeError(f"camera image must be np.ndarray, got {type(img)}")
+        if img.ndim != 3 or img.shape[2] != 3:
+            raise ValueError(f"camera image must be HxWx3, got shape={img.shape}")
+        if img.dtype != np.uint8:
+            # be tolerant
+            img = img.astype(np.uint8, copy=False)
+
+        # HWC -> CHW
+        x = torch.from_numpy(img).to(torch.float32) / 255.0
+        x = x.permute(2, 0, 1).unsqueeze(0)  # [1,3,H,W]
+
+        # resize on tensor
+        x = F.interpolate(
+            x,
+            size=(self.cfg.input_hw, self.cfg.input_hw),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return x.to(self.device)
+
+    @torch.no_grad()
+    def extract(self, img: np.ndarray, feature_size: int) -> np.ndarray:
+        if feature_size not in (64, 256, 1024):
+            raise ValueError(f"feature_size must be one of {{64,256,1024}}, got {feature_size}")
+
+        x = self._preprocess(img)
+        feats = self.model.forward_features(x)[feature_size]  # [1,D]
+        feat = feats[0].detach().to("cpu").to(torch.float32).numpy()
+        # Ensure contiguous float32
+        return np.ascontiguousarray(feat, dtype=np.float32)
+
+
+# ---- singleton cache (so payload_fn doesn't re-create model repeatedly) ----
+_EXTRACTOR_SINGLETON: Optional[FeatureExtractorService] = None
+
+
+def get_extractor(cfg: Optional[FeatureExtractorConfig] = None) -> FeatureExtractorService:
+    global _EXTRACTOR_SINGLETON
+    if _EXTRACTOR_SINGLETON is None:
+        _EXTRACTOR_SINGLETON = FeatureExtractorService(cfg or FeatureExtractorConfig())
+    return _EXTRACTOR_SINGLETON
+
+
+def  payload_fn_cnn(sender, obs: Dict[str, Any], feature_size: int) -> Dict[str, Any]:
+    """
+    Your payload_fn(sender, obs, feature_size) implementation.
+
+    obs format:
+      {"camera": np.ndarray(H,W,3,uint8), "message": str}
+    We ignore text embedding for now.
+    """
+    # print(f"obs {obs}")
+    img = obs.get("camera", None)
+    text = obs.get("message", "")
+
+    # Always return fixed-size feature (float32[feature_size])
+    if img is None:
+        feat = np.zeros((feature_size,), dtype=np.float32)
+        return {"feat": feat, "feat_dim": feature_size, "has_image": False, "text": text}
+
+    extractor = get_extractor()
+    feat = extractor.extract(img, feature_size)
+    return {"feat": feat, "feat_dim": feature_size, "has_image": True, "text": text}

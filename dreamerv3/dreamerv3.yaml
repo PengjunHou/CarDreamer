@@ -2,7 +2,7 @@ defaults:
   seed: 0
   method: name
   task: dummy_disc
-  logdir: /dev/null
+  logdir: /home/peh324/Codes/CarDreamer/logdir #/dev/null
   replay: uniform
   # Use smalelr replay t osave memory; 1e5 can be suffcient for most tasks
   replay_size: 1e6

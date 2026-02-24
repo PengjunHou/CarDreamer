@@ -4,6 +4,8 @@ from typing import Dict, Tuple
 import carla
 import numpy as np
 from gymnasium import spaces
+import os
+import cv2
 
 from ...carla_manager import WorldManager
 from .base_handler import BaseHandler
@@ -63,6 +65,7 @@ class SensorHandler(BaseHandler):
     def reset(self, ego: carla.Actor) -> None:
         self._sensor = self._world.spawn_unmanaged_actor(self._transform, self._blueprint, attach_to=ego)
         self._sensor.listen(self._update_data)
+        # print(f"[SensorHandler] Spawned sensor {self._config.key} for ego id {ego.id}")
 
 
 class CameraHandler(SensorHandler):
@@ -73,8 +76,21 @@ class CameraHandler(SensorHandler):
         camera_data = np.frombuffer(data.raw_data, dtype=np.uint8)
         camera_data = np.reshape(camera_data, (data.height, data.width, 4))
         camera_data = camera_data[:, :, :3]
-        camera_data = camera_data[:, :, ::-1]
+        camera_data = camera_data[:, :, ::-1].copy()
         self._data = camera_data
+        
+    def get_observation(self, env_state: Dict) -> Tuple[Dict, Dict]:
+        if self._data is None:
+            return {self._config.key: self._default_obs}, {}
+
+        cur_time_step = self._world.get_time_step()
+        actor_id = self._sensor.parent.id if self._sensor is not None else 0
+        os.makedirs(f"data/camera_frames/vehicle_{actor_id}", exist_ok=True)
+        cv2.imwrite(f"data/camera_frames/vehicle_{actor_id}/camera_{cur_time_step:06d}.png", self._data)
+
+        obs = {self._config.key: self._data}
+        info = {}
+        return obs, info
 
 
 class LidarHandler(SensorHandler):
@@ -119,6 +135,11 @@ class LidarHandler(SensorHandler):
         image[ground_mask] = colors[: ground_mask.sum()]
         image[obstacle_mask] = np.array([0, 255, 0], dtype=np.uint8)
         image = np.flip(image, axis=0)
+        
+        cur_time_step = self._world.get_time_step()
+        actor_id = self._sensor.parent.id if self._sensor is not None else 0
+        os.makedirs(f"data/lidar_frames/vehicle_{actor_id}", exist_ok=True)
+        cv2.imwrite(f"data/lidar_frames/vehicle_{actor_id}/lidar_{cur_time_step:06d}.png", image)
 
         obs = {self._config.key: image}
         info = {}
@@ -126,6 +147,14 @@ class LidarHandler(SensorHandler):
 
 
 class CollisionHandler(SensorHandler):
+    def get_observation(self, env_state):
+        # 把obs保存到本地文件，方便调试
+        cur_time_step = self._world.get_time_step()
+        actor_id = self._sensor.parent.id if self._sensor is not None else 0
+        os.makedirs(f"data/collision_frames/vehicle_{actor_id}", exist_ok=True)
+        np.save(f"data/collision_frames/vehicle_{actor_id}/collision_{cur_time_step:06d}.npy", self._data if self._data is not None else np.zeros(self._config.shape, dtype=self._default_obs_type))
+        return super().get_observation(env_state)   
+    
     def _get_observation_space(self) -> spaces.Space:
         return spaces.Box(low=0, high=np.inf, shape=self._config.shape, dtype=np.float32)
 

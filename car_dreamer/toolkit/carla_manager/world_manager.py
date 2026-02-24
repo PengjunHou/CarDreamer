@@ -94,6 +94,12 @@ class WorldManager:
         if self._on_step is not None:
             self._on_step()
 
+    def get_time_step(self) -> int:
+        """
+        Get the current time step of the world.
+        """
+        return self._time_step 
+
     def get_blueprint_library(self, pattern_filter: str, attribute_filter: Dict[str, str] = None) -> carla.BlueprintLibrary:
         """
         Get blueprint library based on the pattern filter and attribute filter.

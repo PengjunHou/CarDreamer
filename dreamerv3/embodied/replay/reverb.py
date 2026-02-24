@@ -36,8 +36,8 @@ class Reverb:
 
     def _create_server(self):
         import reverb
-        import tensorflow as tf
-
+        def torch_signature(shape, dtype):
+            return {'shape': shape, 'dtype': dtype}
         self.server = reverb.Server(
             tables=[
                 reverb.Table(
@@ -46,7 +46,7 @@ class Reverb:
                     remover=reverb.selectors.Fifo(),
                     max_size=int(self.capacity),
                     rate_limiter=reverb.rate_limiters.MinSize(1),
-                    signature={key: tf.TensorSpec(shape, dtype) for key, (shape, dtype) in self.signature.items()},
+                    signature={key: torch_signature(shape, dtype) for key, (shape, dtype) in self.signature.items()},
                 )
             ],
             port=None,
