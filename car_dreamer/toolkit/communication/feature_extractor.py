@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import cv2
 
 
 class MultiSizeCNNFeatureExtractor(nn.Module):
@@ -128,23 +129,42 @@ def get_extractor(cfg: Optional[FeatureExtractorConfig] = None) -> FeatureExtrac
     return _EXTRACTOR_SINGLETON
 
 
-def  payload_fn_cnn(sender, obs: Dict[str, Any], feature_size: int) -> Dict[str, Any]:
-    """
-    Your payload_fn(sender, obs, feature_size) implementation.
+# def  payload_fn_cnn(sender, obs: Dict[str, Any], feature_size: int) -> Dict[str, Any]:
+#     """
+#     Your payload_fn(sender, obs, feature_size) implementation.
 
-    obs format:
-      {"camera": np.ndarray(H,W,3,uint8), "message": str}
-    We ignore text embedding for now.
-    """
-    # print(f"obs {obs}")
+#     obs format:
+#       {"camera": np.ndarray(H,W,3,uint8), "message": str}
+#     We ignore text embedding for now.
+#     """
+#     img = obs.get("camera", None)
+#     text = obs.get("message", "")
+
+#     # Always return fixed-size feature (float32[feature_size])
+#     if img is None:
+#         feat = np.zeros((feature_size,), dtype=np.float32)
+#         return {"feat": feat, "feat_dim": feature_size, "has_image": False, "text": text}
+
+#     extractor = get_extractor()
+#     feat = extractor.extract(img, feature_size)
+#     return {"feat": feat, "feat_dim": feature_size, "has_image": True, "text": text}
+def payload_fn_cnn(sender, obs, feature_size):
     img = obs.get("camera", None)
     text = obs.get("message", "")
 
-    # Always return fixed-size feature (float32[feature_size])
     if img is None:
         feat = np.zeros((feature_size,), dtype=np.float32)
         return {"feat": feat, "feat_dim": feature_size, "has_image": False, "text": text}
 
-    extractor = get_extractor()
-    feat = extractor.extract(img, feature_size)
+    side = int(np.sqrt(feature_size / 3))
+    resized = cv2.resize(img, (side, side), interpolation=cv2.INTER_AREA)
+    flat = resized.astype(np.float32).reshape(-1) / 255.0
+
+    # 如果不完全匹配，再截断/补零
+    if flat.shape[0] >= feature_size:
+        feat = flat[:feature_size]
+    else:
+        feat = np.zeros((feature_size,), dtype=np.float32)
+        feat[:flat.shape[0]] = flat
+
     return {"feat": feat, "feat_dim": feature_size, "has_image": True, "text": text}

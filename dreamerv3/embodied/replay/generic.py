@@ -69,6 +69,7 @@ class Generic:
 
     def add(self, step, worker=0, load=False):
         step = {k: v for k, v in step.items() if not k.startswith("log_")}
+        # print(f"[Replay] Adding step for worker {worker}, keys: {step.keys()}")
         step["id"] = np.asarray(embodied.uuid(step.get("id")))
         stream = self.streams[worker]
         stream.append(step)
@@ -79,6 +80,7 @@ class Generic:
             if len(stream) >= self.length and (self.online_counters[worker] >= self.online_stride):
                 self.online_queue.append(tuple(stream))
                 self.online_counters[worker] = 0
+        # print(f"[Replay] Stream length for worker {worker}: {len(stream)}, length {self.length}, counter: {self.counters[worker]}, stride: {self.stride}")
         if len(stream) < self.length or self.counters[worker] < self.stride:
             return
         self.counters[worker] = 0

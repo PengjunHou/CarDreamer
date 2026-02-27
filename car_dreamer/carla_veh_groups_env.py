@@ -32,7 +32,7 @@ import random
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
-
+import torch
 import carla
 import numpy as np
 
@@ -43,6 +43,7 @@ from .toolkit import _dist_m, GroupingStrategy, AllInOneGroup, NearestNeighborsG
 from .toolkit import NetResource, V2VMessage, _safe_nbytes, LatencyModel, SimpleWirelessLatency, _tx_bytes_for_latency
 from .toolkit import Observer, payload_fn_cnn
 from .toolkit import RandomPlanner
+from .toolkit import VehicleNodeGraphBuilder, GraphBuildConfig
 
 class CarlaVehGroupsEnv(CarlaWptFixedEnv):
     """
@@ -138,6 +139,9 @@ class CarlaVehGroupsEnv(CarlaWptFixedEnv):
         self.group_obs = {}
         self.feature_size = 1024
         
+        cfg = GraphBuildConfig(window_s=2.0, Tmax=20, max_nodes=6, feat_dim_max=1024, star_graph=True)
+        self._graph_builder = VehicleNodeGraphBuilder(cfg)
+        
 
     # -----------------------------
     # Core lifecycle
@@ -204,7 +208,7 @@ class CarlaVehGroupsEnv(CarlaWptFixedEnv):
             observer = Observer(self._world, focus_observation)
             self._other_observers.setdefault(actor_id, observer) 
             self._other_observers[actor_id].reset(v)  
-            self.group_obs[actor_id] = self._other_observers[actor_id].get_observation(self.get_state())
+            self.group_obs[actor_id], _ = self._other_observers[actor_id].get_observation(self.get_state())
 
     def on_step(self) -> None:
         # 1) deliver messages whose time has come
@@ -391,26 +395,110 @@ class CarlaVehGroupsEnv(CarlaWptFixedEnv):
         state = {
             "time_step": int(self._time_step),
             "ego_waypoints": self.waypoints,
-            "ego_id": int(ego_id),
-            "focus_ids": [int(v.id) for v in self.focus_vehicles],
-            "background_ids": [int(v.id) for v in self.background_vehicles],
-            # group assignments
-            "groups": dict(self.groups),
-            "veh_to_group": dict(self.veh_to_group),
-            # comm buffers (full, for fusion handlers)
-            "comm_in_flight": list(self._in_flight),
-            "comm_received": self._received,  # dict[veh_id] -> deque[V2VMessage]
-            # quick ego summary
-            "comm_received_summary": {
-                "n_received": int(len(recv_buf)),
-                "latest_sender": int(latest.sender_id) if latest is not None else -1,
-                "latest_latency_s": float(latest.latency_s) if latest is not None else 0.0,
-                "latest_payload_bytes": int(latest.payload_bytes) if latest is not None else 0,
-                "latest_distance_m": float(latest.distance_m) if latest is not None else 0.0,
-            },
+            # "ego_id": int(ego_id),
+            # "focus_ids": [int(v.id) for v in self.focus_vehicles],
+            # "background_ids": [int(v.id) for v in self.background_vehicles],
+            # # group assignments
+            # "groups": dict(self.groups),
+            # "veh_to_group": dict(self.veh_to_group),
+            # # comm buffers (full, for fusion handlers)
+            # "comm_in_flight": list(self._in_flight),
+            # "comm_received": self._received,  # dict[veh_id] -> deque[V2VMessage]
+            # # quick ego summary
+            # "comm_received_summary": {
+            #     "n_received": int(len(recv_buf)),
+            #     "latest_sender": int(latest.sender_id) if latest is not None else -1,
+            #     "latest_latency_s": float(latest.latency_s) if latest is not None else 0.0,
+            #     "latest_payload_bytes": int(latest.payload_bytes) if latest is not None else 0,
+            #     "latest_distance_m": float(latest.distance_m) if latest is not None else 0.0,
+            # },
         }
         # print(f"[Carla State] Step {self._time_step}: Ego received {state['comm_received_summary']['n_received']} messages; latest from {state['comm_received_summary']['latest_sender']} with latency {state['comm_received_summary']['latest_latency_s']:.3f}s and size {state['comm_received_summary']['latest_payload_bytes']} bytes at distance {state['comm_received_summary']['latest_distance_m']:.1f}m.")
         # print(f"    Groups: {state['groups']}")
         # print(f"    In-flight messages: {len(state['comm_in_flight'])}")
         # print(f"    Vehicle to group mapping: {state['veh_to_group']}")
         return state
+    
+    def step(self, action):
+        self.apply_control(action)
+        self._world.step()
+        self._time_step += 1
+
+        env_state = self.get_state()
+        is_terminal, terminal_conds = self._is_terminal()
+        self.obs, obs_info = self._ego_observer.get_observation(env_state)
+        reward, reward_info = self.reward()
+        
+        print(f"[Carla Step] Step {self._time_step}: obs keys {self.obs.keys()}, reward {reward}, terminal {is_terminal}")
+        info = {
+            **env_state,
+            **terminal_conds,
+            **obs_info,
+            **reward_info,
+            "action": action,
+        }
+        if self._config.eval:
+            info = {f"eval_{k}": v for k, v in info.items()}
+            self.obs = {**self.obs, **info}
+        if self._config.display.enable:
+            self._render(self.obs, info)
+            
+        ego_feature = self.payload_fn(self.ego, self.obs, self.feature_size)
+        msgs = self._received.get(self.ego.id, deque())
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        shared_data = self._graph_builder.build(
+            ego_actor=self.ego,
+            carla_world=self._world._world,  # carla.World
+            ego_feat=ego_feature.get("feat", None),
+            ego_feat_dim=ego_feature.get("feat_dim", None),
+            msgs=msgs,
+            t_step=self._time_step,
+            dt=float(self._config.world.fixed_delta_seconds),
+            device=device,
+        )
+        # info.update(shared_data)
+        info = shared_data
+
+        # Gymnasium API: return (obs, reward, terminated, truncated, info)
+        # terminated: episode ended naturally (goal/failure)
+        # truncated: episode was cut short (time limit, etc.)
+        terminated = is_terminal
+        truncated = False  # CarDreamer doesn't use truncated separately
+        return self.obs, reward, terminated, truncated, info    
+    
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        """Reset environment (Gymnasium API): accepts `seed` and `options`.
+
+        Returns (obs, info).
+        """
+        print("[CARLA] Reset environment")
+        # super().reset(seed=seed)
+
+        # Keep behavior unchanged: seed is accepted but not applied here.
+        self._ego_observer.destroy()
+        self._world.reset()
+        self._ego_observer.reset(self.get_ego_vehicle())
+
+        self._time_step = 0
+
+        print("[CARLA] Environment reset")
+        self.obs, info = self._ego_observer.get_observation(self.get_state())
+        
+        ego_feature = self.payload_fn(self.ego, self.obs, self.feature_size)
+        msgs = self._received.get(self.ego.id, deque())
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        shared_data = self._graph_builder.build(
+            ego_actor=self.ego,
+            carla_world=self._world._world,  # carla.World
+            ego_feat=ego_feature.get("feat", None),
+            ego_feat_dim=ego_feature.get("feat_dim", None),
+            msgs=msgs,
+            t_step=self._time_step,
+            dt=float(self._config.world.fixed_delta_seconds),
+            device=device,
+        )
+        # 把shared_data中的数据也放到obs里，方便后续使用
+        # info.update(shared_data)
+        info = shared_data
+        
+        return self.obs, info

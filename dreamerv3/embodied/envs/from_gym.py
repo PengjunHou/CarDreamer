@@ -52,12 +52,14 @@ class FromGym(embodied.Env):
         if action["reset"] or self._done:
             self._done = False
             obs, info = self._env.reset()
+            obs.update(info)
             return self._obs(obs, 0.0, is_first=True), {}
         if self._act_dict:
             action = self._unflatten(action)
         else:
             action = action[self._act_key]
         obs, reward, terminated, truncated, self._info = self._env.step(action)
+        obs.update(self._info)
         self._done = terminated or truncated
         is_last = bool(self._done)
         is_terminal = bool(self._info.get("is_terminal", terminated))

@@ -117,26 +117,6 @@ class V2VMessage:
     latency_s: float
     distance_m: float
 
-
-class LatencyModel:
-    """
-    Latency model interface.
-    """
-
-    def compute_latency_s(
-        self,
-        sender: carla.Actor,
-        receiver: carla.Actor,
-        payload_size_bytes: int,
-        sender_res: NetResource,
-        receiver_res: NetResource,
-        out_degree: int,
-        in_degree: int,
-        **kwargs,
-    ) -> float:
-        raise NotImplementedError
-
-
 class LatencyModel:
     """
     Latency model interface.

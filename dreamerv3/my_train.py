@@ -69,7 +69,8 @@ def main(argv=None):
     config.save(str(logdir / config_filename))
     print(f"[Train] Config saved to {logdir / config_filename}")
 
-    agent = None #dreamerv3.Agent(env.obs_space, env.act_space, step, dreamerv3_config)
+    # agent = dreamerv3.Agent(env.obs_space, env.act_space, step, dreamerv3_config)
+    agent = dreamerv3.CoopSACAgent(env.obs_space, env.act_space, step, dreamerv3_config)
     replay = embodied.replay.Uniform(dreamerv3_config.batch_length, dreamerv3_config.replay_size, logdir / "replay")
     args = embodied.Config(
         **dreamerv3_config.run,

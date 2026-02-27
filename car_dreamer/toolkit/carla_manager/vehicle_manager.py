@@ -18,3 +18,7 @@ class VehicleManager:
 
     def set_desired_speed(self, actor, speed):
         self._tm.set_desired_speed(actor, speed)
+        
+    def set_lane_change_percent(self, actor, left=100.0, right=100.0):
+        self._tm.random_left_lanechange_percentage(actor, left)
+        self._tm.random_right_lanechange_percentage(actor, right)

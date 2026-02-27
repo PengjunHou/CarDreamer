@@ -231,9 +231,12 @@ class WorldManager:
                 actor_list.append(actor)
                 self.actor_dict[actor.id] = actor
                 self._vehicle_manager.set_auto_lane_change(actor, self._config.auto_lane_change)
+                self._vehicle_manager.set_lane_change_percent(actor, left=100.0, right=100.0)
                 if "background_speed" in self._config:
                     self._vehicle_manager.set_desired_speed(actor, self._config.background_speed)
         return actor_list
+
+
 
     def try_spawn_aggresive_actor(
         self,

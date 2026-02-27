@@ -7,3 +7,4 @@ except ImportError:
 
 from .core import *
 from . import envs, run, replay
+from .policy import CoopGNNPolicy
