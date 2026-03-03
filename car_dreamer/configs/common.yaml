@@ -10,18 +10,18 @@ env:
     traffic:
       tm_seed: 2024
 
-  observation:
+  observation: &observation
     camera:
       handler: camera
       blueprint: sensor.camera.rgb
       key: camera
-      shape: [128, 128, 3]
+      shape: [640, 640, 3]
       transform:
         x: 1.5
         z: 2.0
       attributes:
-        image_size_x: 128
-        image_size_y: 128
+        image_size_x: 640
+        image_size_y: 640
         fov: 120.0
         sensor_tick: 0.1
 
@@ -76,12 +76,12 @@ env:
       handler: birdeye
       key: birdeye_wpt
       shape: [128, 128, 3]
-      obs_range: 32
+      obs_range: 64
       ego_offset: 12
       # sight_fov = 150 equivalent to [150, 150] for [front, rear] FOV
       # Use [150, 90] to mimic human driver views
-      sight_fov: 150
-      sight_range: 32
+      sight_fov: 64
+      sight_range: 128
       observability: full
       color_by_obs: False
       waypoint_obs: visible
@@ -156,6 +156,9 @@ env:
       extend_wpt: False
       error_rate: 0.2
       entities: [roadmap, waypoints, error_background_waypoints, ego_vehicle, background_vehicles]
+  
+  group_observation:
+    <<: *observation
 
   display:
     enable: True

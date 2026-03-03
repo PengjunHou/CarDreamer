@@ -38,7 +38,7 @@ def main(argv=None):
     config = embodied.Config({"dreamerv3": model_configs["defaults"]})
     config = config.update({"dreamerv3": model_configs["small"]})
 
-    parsed, other = embodied.Flags(task=["carla_veh_groups"]).parse_known(argv)
+    parsed, other = embodied.Flags(task=["carla_group_right_turn"]).parse_known(argv)
     for name in parsed.task:
         print("Using task: ", name)
         env, env_config = car_dreamer.create_task(name, argv)
