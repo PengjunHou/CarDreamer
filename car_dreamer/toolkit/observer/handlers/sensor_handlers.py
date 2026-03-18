@@ -52,7 +52,7 @@ class SensorHandler(BaseHandler):
     def get_observation_space(self) -> Dict:
         return {self._config.key: self._get_observation_space()}
 
-    def get_observation(self, env_state: Dict) -> Tuple[Dict, Dict]:
+    def get_observation(self, env_state: Dict, visualize: bool = False) -> Tuple[Dict, Dict]:
         obs = {self._config.key: (self._data if self._data is not None else self._default_obs)}
         info = {}
         return obs, info
@@ -79,14 +79,15 @@ class CameraHandler(SensorHandler):
         camera_data = camera_data[:, :, ::-1].copy()
         self._data = camera_data
         
-    def get_observation(self, env_state: Dict) -> Tuple[Dict, Dict]:
+    def get_observation(self, env_state: Dict, visualize: bool = False) -> Tuple[Dict, Dict]:
         if self._data is None:
             return {self._config.key: self._default_obs}, {}
 
-        cur_time_step = self._world.get_time_step()
-        actor_id = self._sensor.parent.id if self._sensor is not None else 0
-        os.makedirs(f"data/camera_frames/vehicle_{actor_id}", exist_ok=True)
-        cv2.imwrite(f"data/camera_frames/vehicle_{actor_id}/camera_{cur_time_step:06d}.png", self._data)
+        if visualize:
+            cur_time_step = self._world.get_time_step()
+            actor_id = self._sensor.parent.id if self._sensor is not None else 0
+            os.makedirs(f"data/camera_frames/vehicle_{actor_id}", exist_ok=True)
+            cv2.imwrite(f"data/camera_frames/vehicle_{actor_id}/camera_{cur_time_step:06d}.png", self._data)
 
         obs = {self._config.key: self._data}
         info = {}
@@ -107,7 +108,7 @@ class LidarHandler(SensorHandler):
     def _get_observation_space(self) -> spaces.Space:
         return spaces.Box(low=0, high=255, shape=self._config.shape, dtype=np.uint8)
 
-    def get_observation(self, env_state: Dict) -> Tuple[Dict]:
+    def get_observation(self, env_state: Dict, visualize: bool = False) -> Tuple[Dict]:
         if self._data is None:
             return {self._config.key: self._default_obs}, {}
 
@@ -136,10 +137,11 @@ class LidarHandler(SensorHandler):
         image[obstacle_mask] = np.array([0, 255, 0], dtype=np.uint8)
         image = np.flip(image, axis=0)
         
-        cur_time_step = self._world.get_time_step()
-        actor_id = self._sensor.parent.id if self._sensor is not None else 0
-        os.makedirs(f"data/lidar_frames/vehicle_{actor_id}", exist_ok=True)
-        cv2.imwrite(f"data/lidar_frames/vehicle_{actor_id}/lidar_{cur_time_step:06d}.png", image)
+        if  visualize:
+            cur_time_step = self._world.get_time_step()
+            actor_id = self._sensor.parent.id if self._sensor is not None else 0
+            os.makedirs(f"data/lidar_frames/vehicle_{actor_id}", exist_ok=True)
+            cv2.imwrite(f"data/lidar_frames/vehicle_{actor_id}/lidar_{cur_time_step:06d}.png", image)
 
         obs = {self._config.key: image}
         info = {}
@@ -147,13 +149,14 @@ class LidarHandler(SensorHandler):
 
 
 class CollisionHandler(SensorHandler):
-    def get_observation(self, env_state):
+    def get_observation(self, env_state, visualize: bool = False):
         # 把obs保存到本地文件，方便调试
         cur_time_step = self._world.get_time_step()
-        actor_id = self._sensor.parent.id if self._sensor is not None else 0
-        os.makedirs(f"data/collision_frames/vehicle_{actor_id}", exist_ok=True)
-        np.save(f"data/collision_frames/vehicle_{actor_id}/collision_{cur_time_step:06d}.npy", self._data if self._data is not None else np.zeros(self._config.shape, dtype=self._default_obs_type))
-        return super().get_observation(env_state)   
+        if visualize:
+            actor_id = self._sensor.parent.id if self._sensor is not None else 0
+            os.makedirs(f"data/collision_frames/vehicle_{actor_id}", exist_ok=True)
+            np.save(f"data/collision_frames/vehicle_{actor_id}/collision_{cur_time_step:06d}.npy", self._data if self._data is not None else np.zeros(self._config.shape, dtype=self._default_obs_type))
+        return super().get_observation(env_state, visualize)   
     
     def _get_observation_space(self) -> spaces.Space:
         return spaces.Box(low=0, high=np.inf, shape=self._config.shape, dtype=np.float32)

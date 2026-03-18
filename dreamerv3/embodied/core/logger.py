@@ -219,14 +219,14 @@ class TensorBoardOutput(AsyncOutput):
 
 
 class WandBOutput:
-    def __init__(self, run_name, config, pattern=r".*", resume=False):
+    def __init__(self, run_name, config, entity, project, pattern=r".*", resume=False):
         self._pattern = re.compile(pattern)
         import wandb
 
         wandb.init(
             name=run_name,
-            entity="worldmodel2025",
-            project="message",
+            entity=entity,
+            project=project,
             config=dict(config),
             resume=resume,
         )

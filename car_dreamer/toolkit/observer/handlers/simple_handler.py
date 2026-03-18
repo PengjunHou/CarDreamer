@@ -32,7 +32,7 @@ class SimpleHandler(BaseHandler):
     def get_observation_space(self) -> Dict:
         return self._observation_spaces
 
-    def get_observation(self, env_state: Dict) -> Tuple[Dict, Dict]:
+    def get_observation(self, env_state: Dict, visualize: bool = False) -> Tuple[Dict, Dict]:
         obs = {name: obs_fn(env_state) for name, obs_fn in self._observation_functions.items()}
         return obs, {}
 

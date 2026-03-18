@@ -63,6 +63,7 @@ class Driver:
         for i in range(len(self._env)):
             trn = {k: v[i] for k, v in trns.items()}
             inf = {k: v[i] for k, v in info.items()}
+            # print(f"Step {step}, Episode {episode}, Agent {i}, Transition keys: {trn.keys()}, Info keys: {inf.keys()}")
             [self._eps[i][k].append(v) for k, v in trn.items()]
             [self._eps_info[i][k].append(v) for k, v in inf.items()]
             [fn(trn, inf, i, **self._kwargs) for fn in self._on_steps]

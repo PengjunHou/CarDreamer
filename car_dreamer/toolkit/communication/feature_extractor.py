@@ -151,20 +151,21 @@ def get_extractor(cfg: Optional[FeatureExtractorConfig] = None) -> FeatureExtrac
 def payload_fn_cnn(sender, obs, feature_size):
     img = obs.get("camera", None)
     text = obs.get("message", "")
+    feat = img
 
-    if img is None:
-        feat = np.zeros((feature_size,), dtype=np.float32)
-        return {"feat": feat, "feat_dim": feature_size, "has_image": False, "text": text}
+    # if img is None:
+    #     feat = np.zeros((feature_size,), dtype=np.float32)
+    #     return {"feat": feat, "feat_dim": feature_size, "has_image": False, "text": text}
 
-    side = int(np.sqrt(feature_size / 3))
-    resized = cv2.resize(img, (side, side), interpolation=cv2.INTER_AREA)
-    flat = resized.astype(np.float32).reshape(-1) / 255.0
+    # side = int(np.sqrt(feature_size / 3))
+    # resized = cv2.resize(img, (side, side), interpolation=cv2.INTER_AREA)
+    # flat = resized.astype(np.float32).reshape(-1) / 255.0
 
-    # 如果不完全匹配，再截断/补零
-    if flat.shape[0] >= feature_size:
-        feat = flat[:feature_size]
-    else:
-        feat = np.zeros((feature_size,), dtype=np.float32)
-        feat[:flat.shape[0]] = flat
+    # # 如果不完全匹配，再截断/补零
+    # if flat.shape[0] >= feature_size:
+    #     feat = flat[:feature_size]
+    # else:
+    #     feat = np.zeros((feature_size,), dtype=np.float32)
+    #     feat[:flat.shape[0]] = flat
 
     return {"feat": feat, "feat_dim": feature_size, "has_image": True, "text": text}

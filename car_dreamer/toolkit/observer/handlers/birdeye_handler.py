@@ -34,7 +34,7 @@ class BirdeyeHandler(BaseHandler):
     def get_observation_space(self) -> Dict:
         return {self._config.key: spaces.Box(low=0, high=255, shape=self._config.shape, dtype=np.uint8)}
 
-    def get_observation(self, env_state: Dict) -> Tuple[Dict, Dict]:
+    def get_observation(self, env_state: Dict, visualize: bool = False) -> Tuple[Dict, Dict]:
         # Append actors polygon list
         entities = [BirdeyeEntity(c) for c in self._config.entities]
 
@@ -79,10 +79,11 @@ class BirdeyeHandler(BaseHandler):
         obs = {self._config.key: birdeye_resized.astype(np.uint8)}
         info = {}
         
-        actor_id = self._ego.id if self._ego is not None else 0
-        os.makedirs(f"data/birdeye_frames/vehicle_{actor_id}", exist_ok=True)
-        cur_time_step = self._world.get_time_step()
-        cv2.imwrite(f"data/birdeye_frames/vehicle_{actor_id}/birdeye_{cur_time_step:06d}.png", birdeye)
+        if visualize:
+            actor_id = self._ego.id if self._ego is not None else 0
+            os.makedirs(f"data/birdeye_frames/vehicle_{actor_id}", exist_ok=True)
+            cur_time_step = self._world.get_time_step()
+            cv2.imwrite(f"data/birdeye_frames/vehicle_{actor_id}/birdeye_{cur_time_step:06d}.png", birdeye)
 
         return obs, info
 

@@ -166,10 +166,22 @@ env:
     image_size: 512
 
   action:
-    discrete: False
+    discrete: True
     # Discrete control space. Use continuos_acc and continuous_steer if discrete is False
     discrete_acc: [-2.0, 0.0, 2.0] # discrete value of accelerations
     discrete_steer: [-0.6, -0.2, 0.0, 0.2, 0.6] # discrete value of steering angles
     continuous_acc: [-3.0, 3.0] # continuous value of accelerations
     continuous_steer: [-1.0, 1.0] # continuous value of steering angles
     n_commands: 3 # number of text commands for message handler
+
+  communication: # V2V communication global default settings
+    group_update_period: 20   # how often to recompute groups (steps)
+    comm_period: 1            # how often to trigger intra-group communication (steps)
+    uplink_bps: 6000000.0     # per-vehicle uplink bandwidth (bps)
+    downlink_bps: 12000000.0  # per-vehicle downlink bandwidth (bps)
+    base_rtt_s: 0.02          # base round-trip time (seconds)
+    proc_delay_s: 0.005       # processing delay (seconds)
+    distance_decay_m: 60.0    # distance decay constant for latency model (meters)
+    min_rate_factor: 0.2      # minimum rate factor (prevents rate from dropping to zero)
+    jitter_s: 0.0             # random jitter added to latency (seconds, 0 = disabled)
+    overhead_bytes: 64        # fixed protocol overhead per message (bytes)

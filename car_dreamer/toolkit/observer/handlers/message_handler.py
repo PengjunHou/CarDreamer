@@ -30,7 +30,7 @@ class MessageHandler(BaseHandler):
             "dest": spaces.Box(low=0, high=1, shape=(self._config.dest_num,), dtype=np.float32),
         }
 
-    def get_observation(self, env_state: Dict) -> Tuple[Dict, Dict]:
+    def get_observation(self, env_state: Dict, visualize: bool = False) -> Tuple[Dict, Dict]:
         dest = np.zeros((self._config.dest_num,), dtype=np.float32)
         dest[env_state["dest_lane_idx"]] = 1
 

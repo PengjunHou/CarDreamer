@@ -126,6 +126,8 @@ class CarlaWptEnv(CarlaBaseEnv):
             "r_speed": r_speed,
             "r_collision": r_collision,
             "r_out_of_lane": r_out_of_lane,
+            'r_destination': r_destination,
+            'time_penalty': time_penalty,
             "ttc": ttc,
         }
 

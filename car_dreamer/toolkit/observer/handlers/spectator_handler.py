@@ -18,7 +18,7 @@ class SpectatorHandler(BaseHandler):
     def get_observation_space(self) -> Dict:
         return {self._config.key: spaces.Box(low=0, high=255, shape=self._config.shape, dtype=np.uint8)}
 
-    def get_observation(self, env_state: Dict) -> Tuple[Dict, Dict]:
+    def get_observation(self, env_state: Dict, visualize: bool = False) -> Tuple[Dict, Dict]:
         if self._spectator_camera is None or self._ego is None or self._data is None:
             return {self._config.key: np.zeros(self._config.shape, dtype=np.uint8)}, {}
 

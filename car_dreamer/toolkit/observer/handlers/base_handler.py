@@ -21,7 +21,7 @@ class BaseHandler(ABC):
         pass
 
     @abstractmethod
-    def get_observation(self, env_state: Dict) -> Tuple[Dict, Dict]:
+    def get_observation(self, env_state: Dict, visualize: bool = False) -> Tuple[Dict, Dict]:
         """
         Fetch observations from the environment.
 

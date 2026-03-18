@@ -117,12 +117,16 @@ class VehicleNodeGraphBuilder:
         for m in msgs:
             # 用“到达时间”判定是否在窗口内
             t_deliver = float(m.deliver_step) * float(dt)
+            # print(f"[Build] t_now: {t_now}, t_deliver: {t_deliver}, window_s: {cfg.window_s}, diff: {t_now - t_deliver}")
             if (t_now - t_deliver) <= cfg.window_s:
                 sid = int(m.sender_id)
                 msgs_by_sender.setdefault(sid, []).append(m)
 
         # 2) 选最多 max_nodes-1 个 sender（优先：最近到达 or 最近 created）
         sender_ids = list(msgs_by_sender.keys())
+        # 打印每个sender id有多少条消息
+        # for sid in sender_ids:
+        #     print(f"[Build] Sender {sid} has {len(msgs_by_sender[sid])} messages")
 
         # 排序：按该 sender 最新 deliver_step 降序（最新先）
         sender_ids.sort(
@@ -296,6 +300,7 @@ class VehicleNodeGraphBuilder:
         lat = np.array([float(latency_s)], dtype=np.float32)
         dist = np.array([float(distance_m)], dtype=np.float32)
 
+        # image feature size + extra feature
         parts = [feat_pad, feat_dim_ratio, rel_pose.astype(np.float32), age, lat, dist, payload_kb]
 
         # if cfg.include_sender_state:

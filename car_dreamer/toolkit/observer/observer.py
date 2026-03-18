@@ -69,12 +69,12 @@ class Observer:
             obs_spaces.update(handler.get_observation_space())
         return spaces.Dict(obs_spaces)
 
-    def get_observation(self, env_state: Dict) -> Tuple[Dict, Dict]:
+    def get_observation(self, env_state: Dict, visualize: bool = True) -> Tuple[Dict, Dict]:
         """Get the current observation data from all the registered handlers."""
         obs = {}
         info = {}
         for handler in self._data_handlers.values():
-            obs_data, info_data = handler.get_observation(env_state)
+            obs_data, info_data = handler.get_observation(env_state, visualize)
             obs.update(obs_data)
             info.update(info_data)
         # print(f"[Observer] Collected observation: {obs}")

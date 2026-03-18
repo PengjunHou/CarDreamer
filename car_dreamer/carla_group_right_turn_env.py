@@ -35,43 +35,29 @@ class CarlaGroupRightTurnEnv(CarlaWptFixedEnv):
         self.num_group_vehs = int(getattr(self._config, "num_group_vehs", 2))
         self._other_observers = {} 
         self.group_obs = {}
+        self._prev_action = None  # for action smoothing
 
-        # How often to recompute groups / send comm (in steps)
-        self.group_update_period = int(getattr(self._config, "group_update_period", 20))
-        self.comm_period = int(getattr(self._config, "comm_period", 5))
+        # --- Communication parameters (read from config.communication, with safe defaults) ---
+        comm_cfg = getattr(self._config, "communication", None)
+        self.group_update_period = int(getattr(comm_cfg, "group_update_period", 20))
+        self.comm_period         = int(getattr(comm_cfg, "comm_period", 5))
+        uplink_bps               = float(getattr(comm_cfg, "uplink_bps", 6e6))
+        downlink_bps             = float(getattr(comm_cfg, "downlink_bps", 12e6))
+        base_rtt_s               = float(getattr(comm_cfg, "base_rtt_s", 0.02))
+        proc_delay_s             = float(getattr(comm_cfg, "proc_delay_s", 0.005))
+        distance_decay_m         = float(getattr(comm_cfg, "distance_decay_m", 60.0))
+        min_rate_factor          = float(getattr(comm_cfg, "min_rate_factor", 0.2))
+        jitter_s                 = float(getattr(comm_cfg, "jitter_s", 0.0))
+        overhead_bytes           = int(getattr(comm_cfg, "overhead_bytes", 64))
 
-        # Grouping policy selection
-        # grouping_name = getattr(self._config, "grouping_strategy", "fixed")
-        # if grouping_name == "all":
-        #     self.grouping_strategy: GroupingStrategy = AllInOneGroup
-        # elif grouping_name == "fixed":
-        #     group_spawn_points = getattr(self._config, "group_spawn_points", None)
-        #     assert group_spawn_points is not None, "group_spawn_points must be provided for fixed grouping strategy"
-        #     assert len(group_spawn_points) >= self.num_group_vehs, "Not enough spawn points for the number of group vehicles"
-        #     self.grouping_strategy = FixedGrouping
-        # else:
-        #     # allow user to inject a custom instance externally
-        #     self.grouping_strategy = AllInOneGroup
-
-        # Network resources (global default per-vehicle caps; you can override per-vehicle later)
-        uplink_bps = float(getattr(self._config, "uplink_bps", 6e6))
-        downlink_bps = float(getattr(self._config, "downlink_bps", 12e6))
         self._default_net_res = NetResource(uplink_bps=uplink_bps, downlink_bps=downlink_bps)
-
-        # Latency model
-        base_rtt_s = float(getattr(self._config, "base_rtt_s", 0.02))
-        proc_delay_s = float(getattr(self._config, "proc_delay_s", 0.005))
-        distance_decay_m = float(getattr(self._config, "distance_decay_m", 60.0))
-        min_rate_factor = float(getattr(self._config, "min_rate_factor", 0.2))
-        jitter_s = float(getattr(self._config, "jitter_s", 0.0))
-
         self.latency_model: LatencyModel = SimpleWirelessLatency(
             base_rtt_s=base_rtt_s,
             proc_delay_s=proc_delay_s,
             distance_decay_m=distance_decay_m,
             min_rate_factor=min_rate_factor,
             jitter_s=jitter_s,
-            overhead_bytes=64,  # You can adjust overhead_bytes as needed
+            overhead_bytes=overhead_bytes,
         )
 
         # Optional hook to build your cooperative perception payload
@@ -85,16 +71,27 @@ class CarlaGroupRightTurnEnv(CarlaWptFixedEnv):
         # Per-vehicle network resources (if you want heterogeneous vehicles)
         self._veh_net_res: Dict[int, NetResource] = {}
 
-        # terminal: time limit (reuse world.fixed_delta_seconds already)
+        # terminal: time limit
         self._time_limit_steps = int(getattr(self._config.terminal, "time_limit", 500))
-        
-        self.feature_size = 1024
-        cfg = GraphBuildConfig(window_s=2.0, Tmax=20, max_nodes=4, feat_dim_max=1024, star_graph=True)
+
+        # --- Feature size (read from config, with safe default) ---
+        self.feature_size = int(getattr(self._config, "feature_size", 1024))
+
+        # --- Graph build config (read from config.graph, with safe defaults) ---
+        graph_cfg = getattr(self._config, "graph", None)
+        cfg = GraphBuildConfig(
+            window_s     = float(getattr(graph_cfg, "window_s", 2.0)),
+            Tmax         = int(getattr(graph_cfg, "tmax", 15)),
+            max_nodes    = int(getattr(graph_cfg, "max_nodes", 3)),
+            feat_dim_max = int(getattr(graph_cfg, "feat_dim_max", 1024)),
+            star_graph   = bool(getattr(graph_cfg, "star_graph", True)),
+        )
         self._graph_builder = VehicleNodeGraphBuilder(cfg)
         
     def generate_group_vehicles(self):
         # Generate group vehicles based on the grouping strategy
         self.groups.setdefault(0, set())
+        self.groups[0].add(self.ego.id)
         spawn_points = self._config.group_spawn_points
         assert spawn_points is not None and len(spawn_points) >= self.num_group_vehs, "Not enough spawn points for the number of group vehicles"
         for spawn_point in spawn_points[:self.num_group_vehs]:
@@ -119,6 +116,7 @@ class CarlaGroupRightTurnEnv(CarlaWptFixedEnv):
         #     self._world.destroy_actor(veh_id)
         self.group_vehs = []
         self.groups = {}
+        self._prev_action = None
 
         # comm buffers
         self._in_flight = []
@@ -255,6 +253,7 @@ class CarlaGroupRightTurnEnv(CarlaWptFixedEnv):
                     delay_steps = int(math.ceil(latency_s / max(fixed_dt, 1e-6)))
                     delay_steps = max(delay_steps, 0)
                     deliver_step = int(self._time_step + delay_steps)
+                    # print(f"[CARLA] Step {self._time_step}: Sender {sender_id} to Receiver {receiver_id}, Latency: {latency_s:.4f}s, Delay Steps: {delay_steps}, Deliver Step: {deliver_step}")
 
                     msg = V2VMessage(
                         sender_id=int(sender_id),
@@ -277,8 +276,10 @@ class CarlaGroupRightTurnEnv(CarlaWptFixedEnv):
             return
 
         cur = int(self._time_step)
+        # print(f"[CARLA] Step {self._time_step}: Delivering messages, in_flight: {len(self._in_flight)}")
         remaining: List[V2VMessage] = []
         for msg in self._in_flight:
+            # print(f"    Message {msg.sender_id} to {msg.receiver_id}, Deliver Step: {msg.deliver_step}")    
             if msg.deliver_step <= cur:
                 self._received[msg.receiver_id].append(msg)
             else:
@@ -290,11 +291,35 @@ class CarlaGroupRightTurnEnv(CarlaWptFixedEnv):
         return self._state
 
     def step(self, action):
+        # repeat and smoothing action for the ego vehicle
         self.get_state()
-        _, reward, terminated, truncated, info = super().step(action)  # important! this will trigger on_step() and update the group vehicles
+        alpha = 0.7          # smoothing coefficient
+        # ---------- init prev_action ----------
+        if self._prev_action is None:
+            self._prev_action = action
+
+        repeat = 4 
+        total_reward = 0.0
+        terminated = False
+        truncated = False
+        info = None
+        for _ in range(repeat):
+            # ---------- smoothing ----------
+            if self._config.action.discrete:
+                smooth_action = action   
+            else:
+                smooth_action = alpha * self._prev_action + (1 - alpha) * action
+            self._prev_action = smooth_action
+            obs, reward, terminated, truncated, info = super().step(smooth_action)
+            total_reward += reward
+            if terminated or truncated:
+                break
+
+        # _, reward, terminated, truncated, info = super().step(action)  # important! this will trigger on_step() and update the group vehicles
             
         ego_feature = self.payload_fn(self.ego, self.obs, self.feature_size)
         msgs = self._received.get(self.ego.id, deque())
+        # print(f"msgs: {len(msgs)}")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         shared_data = self._graph_builder.build(
             ego_actor=self.ego,
@@ -307,10 +332,14 @@ class CarlaGroupRightTurnEnv(CarlaWptFixedEnv):
             device=device,
         )
         # info.update(shared_data)
+        partial_info = {k: v for k, v in info.items() if k.startswith("r_") or k in ["wpt_dis", "speed_parallel", "speed_perpendicular", "speed_norm", "ttc", "time_penalty"]}
+        partial_info["ego_x"] = self.ego.get_transform().location.x
+        partial_info["ego_y"] = self.ego.get_transform().location.y
+        shared_data.update(partial_info)  # make sure shared_data can overwrite existing keys in info if needed
         info = shared_data
-        print(f"[STEP] Shared data keys: {list(shared_data.keys())}, obs keys: {list(self.obs.keys())}")
+        # print(f"info keys: {info.keys()}")
         
-        return self.obs, reward, terminated, truncated, info    
+        return self.obs, total_reward, terminated, truncated, info    
     
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         """Reset environment (Gymnasium API): accepts `seed` and `options`.
@@ -318,18 +347,8 @@ class CarlaGroupRightTurnEnv(CarlaWptFixedEnv):
         Returns (obs, info).
         """
         print("[CARLA Group Right Turn Env] Reset environment")
-        super().reset(seed=seed)
-
-        # Keep behavior unchanged: seed is accepted but not applied here.
-        # self._ego_observer.destroy()
-        # self._world.reset()
-        # self._ego_observer.reset(self.get_ego_vehicle())
-
-        # self._time_step = 0
-
-        # print("[CARLA] Environment reset")
-        # self.obs, info = self._ego_observer.get_observation(self.get_state())
-        
+        _, info = super().reset(seed=seed)
+  
         ego_feature = self.payload_fn(self.ego, self.obs, self.feature_size)
         msgs = self._received.get(self.ego.id, deque())
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -345,6 +364,24 @@ class CarlaGroupRightTurnEnv(CarlaWptFixedEnv):
         )
         # 把shared_data中的数据也放到obs里，方便后续使用
         # info.update(shared_data)
+        ego_location = np.array([*get_vehicle_pos(self.ego)])
+        reward_info = {
+            "ego_x": ego_location[0],
+            "ego_y": ego_location[1],
+            "speed_parallel": 0,
+            "speed_perpendicular": 0,
+            "speed_norm": 0,
+            "wpt_dis": self.get_wpt_dist(ego_location),
+            "r_waypoints": 0,
+            "r_speed": 0,
+            "r_collision": 0,
+            "r_out_of_lane": 0,
+            'r_destination': 0,
+            'time_penalty': 0,
+            "ttc": 0,
+        }
+        
+        shared_data.update(reward_info)
         info = shared_data
         
         return self.obs, info

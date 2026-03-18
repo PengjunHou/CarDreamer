@@ -9,6 +9,13 @@ import dreamerv3
 
 warnings.filterwarnings("ignore", ".*truncated to dtype int32.*")
 
+import sys
+
+sys.path.append("/home/peh324/carla_simulator/PythonAPI/")
+sys.path.append("/home/peh324/carla_simulator/PythonAPI/carla")
+
+import carla
+from agents.navigation.basic_agent import BasicAgent
 
 def wrap_env(env, config):
     args = config.wrapper
@@ -38,7 +45,7 @@ def main(argv=None):
     config = embodied.Config({"dreamerv3": model_configs["defaults"]})
     config = config.update({"dreamerv3": model_configs["small"]})
 
-    parsed, other = embodied.Flags(task=["carla_group_right_turn"]).parse_known(argv)
+    parsed, other = embodied.Flags(task=["carla_group_right_turn_auto"]).parse_known(argv)
     for name in parsed.task:
         print("Using task: ", name)
         env, env_config = car_dreamer.create_task(name, argv)
@@ -48,18 +55,33 @@ def main(argv=None):
 
     logdir = embodied.Path(config.dreamerv3.logdir)
     step = embodied.Counter()
-    logger = embodied.Logger(
-        step,
-        [
-            embodied.logger.TerminalOutput(),
-            embodied.logger.JSONLOutput(logdir, "metrics.jsonl"),
-            embodied.logger.TensorBoardOutput(logdir),
-        ],
-    )
+    dreamerv3_config = config.dreamerv3
+
+    # --- Build logger outputs ---
+    log_outputs = [
+        embodied.logger.TerminalOutput(),
+        embodied.logger.JSONLOutput(logdir, "metrics.jsonl"),
+        # embodied.logger.TensorBoardOutput(logdir),
+    ]
+
+    wandb_cfg = getattr(dreamerv3_config, "wandb", None)
+    if wandb_cfg is not None and getattr(wandb_cfg, "enable", False):
+        run_name = getattr(wandb_cfg, "run_name", "") or logdir.name
+        log_outputs.append(
+            embodied.logger.WandBOutput(
+                run_name=run_name,
+                config=config,
+                entity=getattr(wandb_cfg, "entity", ""),
+                project=getattr(wandb_cfg, "project", "CarDreamer"),
+                resume=getattr(wandb_cfg, "resume", False),
+            )
+        )
+        print(f"[WandB] Logging to project '{getattr(wandb_cfg, 'project', 'CarDreamer')}', run '{run_name}'")
+
+    logger = embodied.Logger(step, log_outputs)
 
     from embodied.envs import from_gym
 
-    dreamerv3_config = config.dreamerv3
     env = from_gym.FromGym(env)
     env = wrap_env(env, dreamerv3_config)
     env = embodied.BatchEnv([env], parallel=False)
@@ -70,7 +92,8 @@ def main(argv=None):
     print(f"[Train] Config saved to {logdir / config_filename}")
 
     # agent = dreamerv3.Agent(env.obs_space, env.act_space, step, dreamerv3_config)
-    agent = dreamerv3.CoopSACAgent(env.obs_space, env.act_space, step, dreamerv3_config)
+    # agent = dreamerv3.CoopSACAgent(env.obs_space, env.act_space, step, dreamerv3_config)
+    agent = dreamerv3.TestAgent(env.obs_space, env.act_space, step, dreamerv3_config)
     replay = embodied.replay.Uniform(dreamerv3_config.batch_length, dreamerv3_config.replay_size, logdir / "replay")
     args = embodied.Config(
         **dreamerv3_config.run,
