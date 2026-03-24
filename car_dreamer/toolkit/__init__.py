@@ -6,4 +6,4 @@ from .observer.observer import Observer
 from .planner import *
 from .utils import _dist_m
 from .group import GroupingStrategy, AllInOneGroup, NearestNeighborsGrouping, SpawnNearEgoGrouping, VehicleNodeGraphBuilder, GraphBuildConfig
-from .communication import NetResource, V2VMessage, _safe_nbytes, LatencyModel, SimpleWirelessLatency, _tx_bytes_for_latency, payload_fn_cnn 
+from .communication import NetResource, V2VMessage, _safe_nbytes, LatencyModel, SimpleWirelessLatency, _tx_bytes_for_latency, payload_fn_llm

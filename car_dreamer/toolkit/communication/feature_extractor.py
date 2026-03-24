@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import cv2
+from .comm import _feature_nbytes
 
 
 class MultiSizeCNNFeatureExtractor(nn.Module):
@@ -148,24 +149,87 @@ def get_extractor(cfg: Optional[FeatureExtractorConfig] = None) -> FeatureExtrac
 #     extractor = get_extractor()
 #     feat = extractor.extract(img, feature_size)
 #     return {"feat": feat, "feat_dim": feature_size, "has_image": True, "text": text}
-def payload_fn_cnn(sender, obs, feature_size):
+# def payload_fn_cnn(sender, obs, feature_size):
+#     img = obs.get("camera", None)
+#     text = obs.get("message", "")
+#     feat = img
+
+#     # if img is None:
+#     #     feat = np.zeros((feature_size,), dtype=np.float32)
+#     #     return {"feat": feat, "feat_dim": feature_size, "has_image": False, "text": text}
+
+#     # side = int(np.sqrt(feature_size / 3))
+#     # resized = cv2.resize(img, (side, side), interpolation=cv2.INTER_AREA)
+#     # flat = resized.astype(np.float32).reshape(-1) / 255.0
+
+#     # # 如果不完全匹配，再截断/补零
+#     # if flat.shape[0] >= feature_size:
+#     #     feat = flat[:feature_size]
+#     # else:
+#     #     feat = np.zeros((feature_size,), dtype=np.float32)
+#     #     feat[:flat.shape[0]] = flat
+
+#     return {"feat": feat, "feat_dim": feature_size, "has_image": True, "text": text}
+
+from typing import Any
+import numpy as np
+
+
+def _safe_to_text(value: Any, max_len: int = 1200) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, dict):
+        text = str(value)
+    else:
+        raise ValueError(f"unsupported type: {type(value)}")
+    return text[:max_len]
+
+
+def payload_fn_llm(sender, obs, feature_size, *args, image_proc_fn=None, **kwargs):
     img = obs.get("camera", None)
-    text = obs.get("message", "")
-    feat = img
+    raw_message = obs.get("message", "")
+    raw_message_text = _safe_to_text(raw_message)
 
-    # if img is None:
-    #     feat = np.zeros((feature_size,), dtype=np.float32)
-    #     return {"feat": feat, "feat_dim": feature_size, "has_image": False, "text": text}
+    has_image = bool(img is not None)
+    scene_description = ""
+    feat = np.zeros((feature_size,), dtype=np.float32)
 
-    # side = int(np.sqrt(feature_size / 3))
-    # resized = cv2.resize(img, (side, side), interpolation=cv2.INTER_AREA)
-    # flat = resized.astype(np.float32).reshape(-1) / 255.0
+    if has_image and image_proc_fn is not None:
+        try:
+            proc_out = image_proc_fn(img)
 
-    # # 如果不完全匹配，再截断/补零
-    # if flat.shape[0] >= feature_size:
-    #     feat = flat[:feature_size]
-    # else:
-    #     feat = np.zeros((feature_size,), dtype=np.float32)
-    #     feat[:flat.shape[0]] = flat
+            # 情况1：返回字符串 -> 当作 scene_description
+            if isinstance(proc_out, str):
+                scene_description = proc_out.strip()
 
-    return {"feat": feat, "feat_dim": feature_size, "has_image": True, "text": text}
+            # 情况2：返回 dict -> 支持同时给 feat 和 scene_description
+            elif isinstance(proc_out, dict):
+                if "scene_description" in proc_out and proc_out["scene_description"] is not None:
+                    scene_description = str(proc_out["scene_description"]).strip()
+
+                if "feat" in proc_out and proc_out["feat"] is not None:
+                    feat = proc_out["feat"]
+
+            # 情况3：其他类型 -> 默认当作 feat
+            else:
+                feat = proc_out
+
+        except Exception as exc:
+            scene_description = f"image_proc_fn failed: {type(exc).__name__}: {exc}"
+
+    parts = []
+    if raw_message_text:
+        parts.append(f"observer_message: {raw_message_text}")
+    if scene_description:
+        parts.append(f"scene_description: {scene_description}")
+    merged_text = "\n".join(parts)
+
+    return {
+        "feat_dim": feature_size,       # TODO: 暂时没用
+        "has_image": has_image,
+        "img_emb": feat,
+        "text": merged_text,
+        "scene_description": scene_description,
+    }

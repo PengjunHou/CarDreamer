@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import json
+import re
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 import os
 import traceback
 from PIL import Image
-from transformers import CLIPModel, CLIPProcessor
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
 import carla
 from agents.navigation.basic_agent import BasicAgent
@@ -19,7 +20,7 @@ from agents.navigation.basic_agent import BasicAgent
 from .carla_wpt_fixed_env import CarlaWptFixedEnv
 from .toolkit import _dist_m
 from .toolkit import NetResource, V2VMessage, LatencyModel, SimpleWirelessLatency, _tx_bytes_for_latency
-from .toolkit import Observer, payload_fn_cnn
+from .toolkit import Observer, payload_fn_llm
 from .toolkit import get_vehicle_pos
 from .toolkit import VehicleNodeGraphBuilder, GraphBuildConfig
 
@@ -66,7 +67,8 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             overhead_bytes=overhead_bytes,
         )
 
-        self.payload_fn = payload_fn_cnn
+        self.payload_fn = payload_fn_llm
+        self.trans_msg_type = str(getattr(self._config, "trans_msg_type", "image"))
 
         # comm buffers
         self._in_flight: List[V2VMessage] = []
@@ -90,13 +92,13 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         self._graph_builder = VehicleNodeGraphBuilder(cfg)
 
         # -----------------------------
-        # VLM (CLIP) configuration
+        # VLM (Qwen2-VL) configuration
         # -----------------------------
         vlm_cfg = getattr(self._config, "vlm", None)
         self._vlm_enabled = bool(getattr(vlm_cfg, "enabled", True))
-        # Default to CLIP ViT-Large/14; can be overridden in config
-        self._vlm_model_name = str(getattr(vlm_cfg, "model_name", "openai/clip-vit-large-patch14"))
-        # image_template is no longer used by CLIP image encoder, kept for config compatibility
+        # Default to Qwen2-VL; can be overridden in config
+        self._vlm_model_name = str(getattr(vlm_cfg, "model_name", "Qwen/Qwen2-VL-2B-Instruct"))
+        # image_template is kept for config compatibility
         self._vlm_image_template = str(getattr(vlm_cfg, "image_template", "Analyze the driving scene."))
         self._vlm_eval_period = int(getattr(vlm_cfg, "eval_period", 1))
         self._vlm_image_obs_key = str(getattr(vlm_cfg, "image_obs_key", "camera"))
@@ -133,84 +135,83 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         self._vlm_sc_beta = float(getattr(vlm_cfg, "sc_beta", 1.0))
         self._vlm_sensor_fov_deg = float(getattr(vlm_cfg, "sensor_fov_deg", 120.0)) #TODO
 
-        # CLIP model and processor (replaces Qwen2-VL)
-        self._vlm_model: Optional[CLIPModel] = None
-        self._vlm_processor: Optional[CLIPProcessor] = None
+        self._vlm_do_sample = bool(getattr(vlm_cfg, "do_sample", False))
+        self._vlm_max_new_tokens = int(getattr(vlm_cfg, "max_new_tokens", 96))
+        self._vlm_temperature = float(getattr(vlm_cfg, "temperature", 0.0))
+        self._vlm_top_p = float(getattr(vlm_cfg, "top_p", 0.9))
+
+        # Qwen2-VL model and processor
+        self._vlm_model: Optional[Qwen2VLForConditionalGeneration] = None
+        self._vlm_processor: Optional[AutoProcessor] = None
 
         self._vlm_records: List[Dict[str, Any]] = []
         self._vlm_last_eval: Dict[str, Any] = {}
         self._vlm_questions = self._build_vlm_questions()
-        self._text_embedding_cache: Dict[str, torch.Tensor] = {}
 
         if self._vlm_enabled:
             self._init_vlm()
 
     # =========================================================
-    # VLM (CLIP) init / questions / embeddings
+    # VLM language-mediated communication
     # =========================================================
 
     def _init_vlm(self) -> None:
-        """Load CLIP model and processor."""
-        print(f"[CLIP] Loading model: {self._vlm_model_name}")
-        self._vlm_model = CLIPModel.from_pretrained(
+        """Load Qwen2-VL model and processor."""
+        print(f"[Qwen2-VL] Loading model: {self._vlm_model_name}")
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        self._vlm_model = Qwen2VLForConditionalGeneration.from_pretrained(
+            self._vlm_model_name,
+            torch_dtype=dtype,
+            local_files_only=self._vlm_local_files_only,
+        )
+        self._vlm_processor = AutoProcessor.from_pretrained(
             self._vlm_model_name,
             local_files_only=self._vlm_local_files_only,
         )
-        self._vlm_processor = CLIPProcessor.from_pretrained(
-            self._vlm_model_name,
-            local_files_only=self._vlm_local_files_only,
-        )
-        # Move model to GPU if available
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._vlm_model = self._vlm_model.to(device)
         self._vlm_model.eval()
-        print(f"[CLIP] Model loaded on {device}.")
+        print(f"[Qwen2-VL] Model loaded on {device}.")
 
     def _build_vlm_questions(self) -> List[Dict[str, Any]]:
         return [
             {
                 "id": "clg_left_rear_vehicle",
                 "type": "clg",
-                "positive": "There were no vehicles to the left rear of the ego vehicle.",
-                "negative": "There were vehicles to the left rear of the ego vehicle.",
+                "query": "Is there a vehicle in the left-rear region of the ego vehicle?",
+                "positive": "There is a vehicle in the left-rear region of the ego vehicle.",
+                "negative": "There is no vehicle in the left-rear region of the ego vehicle.",
             },
             {
                 "id": "clg_right_rear_vehicle",
                 "type": "clg",
-                "positive": "There were no vehicles to the right rear of the ego vehicle.",
-                "negative": "There were vehicles to the right rear of the ego vehicle.",
+                "query": "Is there a vehicle in the right-rear region of the ego vehicle?",
+                "positive": "There is a vehicle in the right-rear region of the ego vehicle.",
+                "negative": "There is no vehicle in the right-rear region of the ego vehicle.",
             },
             {
                 "id": "clg_right_front_vehicle",
                 "type": "clg",
-                "positive": "There were no vehicles to the right front of the ego vehicle.",
-                "negative": "There were vehicles to the right front of the ego vehicle.",
+                "query": "Is there a vehicle in the right-front region of the ego vehicle?",
+                "positive": "There is a vehicle in the right-front region of the ego vehicle.",
+                "negative": "There is no vehicle in the right-front region of the ego vehicle.",
             },
             {
                 "id": "clg_left_front_vehicle",
                 "type": "clg",
-                "positive": "There were no vehicles to the left front of the ego vehicle.",
-                "negative": "There were vehicles to the left front of the ego vehicle.",
-            },
-            {
-                "id": "clg_left_vehicle_speed",
-                "type": "clg",
-                "positive": "The left-side vehicles were either far away or moving slowly, posing no risk to the ego vehicle's right turn.",
-                "negative": "There were vehicles on the left side that were close or moving fast, posing a potential risk to the ego vehicle's right turn.",
+                "query": "Is there a vehicle in the left-front region of the ego vehicle?",
+                "positive": "There is a vehicle in the left-front region of the ego vehicle.",
+                "negative": "There is no vehicle in the left-front region of the ego vehicle.",
             },
         ]
 
-    # ------------------------------------------------------------------
-    # NOTE: _masked_mean_pool is no longer needed for CLIP, but kept
-    #       as a no-op to avoid breaking any external callers.
-    # ------------------------------------------------------------------
     def _masked_mean_pool(self, hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Legacy helper retained for API compatibility. Not used by CLIP."""
+        """Legacy helper retained for API compatibility."""
         mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
         denom = mask.sum(dim=1).clamp(min=1.0)
         pooled = (hidden * mask).sum(dim=1) / denom
         return pooled.squeeze(0)
-    
+
     def _compute_fov_alignment(
         self,
         sensor_yaw_rad: float,
@@ -219,10 +220,8 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
     ) -> float:
         half_fov = math.radians(float(fov_deg) / 2.0)
         angle_diff = self._wrap_angle(target_angle_rad - sensor_yaw_rad)
-
         if abs(angle_diff) > half_fov:
             return 0.0
-
         return 0.5 * (1.0 + math.cos(angle_diff))
 
     def _normalize_embedding(self, emb: torch.Tensor) -> torch.Tensor:
@@ -240,13 +239,11 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         yaw = math.radians(float(sensor_pose.get("yaw", 0.0)))
 
         d = math.sqrt(dx * dx + dy * dy) + 1e-6
-
         feat = torch.tensor([
             dx, dy, d,
             dx / d, dy / d,
             math.sin(yaw), math.cos(yaw)
         ], dtype=torch.float32, device=device)
-
         return feat
 
     def _fuse_image_with_position(
@@ -258,97 +255,11 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         if pos_emb.shape[0] != image_emb.shape[0]:
             repeat = image_emb.shape[0] // pos_emb.shape[0] + 1
             pos_emb = pos_emb.repeat(repeat)[:image_emb.shape[0]]
-
         fused = image_emb + gamma * pos_emb
         return F.normalize(fused, p=2, dim=-1)
 
-    def _compute_text_embedding(self, text: str) -> torch.Tensor:
-        if text in self._text_embedding_cache:
-            return self._text_embedding_cache[text].clone()
-
-        if self._vlm_model is None or self._vlm_processor is None:
-            raise RuntimeError("CLIP model is not initialized.")
-
-        model_device = next(self._vlm_model.parameters()).device
-
-        inputs = self._vlm_processor(
-            text=[text],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        )
-        inputs = {k: v.to(model_device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            # get_text_features 在部分版本返回 BaseModelOutputWithPooling
-            # 统一用 text_model + text_projection 手动取 pooled output
-            text_outputs = self._vlm_model.text_model(**inputs)
-            # pooler_output 是 [CLS] token 经过 linear projection 前的表示
-            pooled = text_outputs.pooler_output  # (1, hidden_dim)
-            # 再过 text_projection 得到对齐后的 embedding
-            text_features = self._vlm_model.text_projection(pooled)  # (1, D)
-
-        emb = self._normalize_embedding(text_features.squeeze(0)).cpu()
-        self._text_embedding_cache[text] = emb
-        return emb.clone()
-
-    def _compute_single_image_embedding(self, image: Image.Image) -> torch.Tensor:
-        if self._vlm_model is None or self._vlm_processor is None:
-            raise RuntimeError("CLIP model is not initialized.")
-
-        model_device = next(self._vlm_model.parameters()).device
-
-        inputs = self._vlm_processor(
-            images=image,
-            return_tensors="pt",
-        )
-        inputs = {k: v.to(model_device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            # 同样手动走 vision_model + visual_projection
-            vision_outputs = self._vlm_model.vision_model(**inputs)
-            pooled = vision_outputs.pooler_output  # (1, hidden_dim)
-            image_features = self._vlm_model.visual_projection(pooled)  # (1, D)
-
-        return self._normalize_embedding(image_features.squeeze(0)).cpu()
-
-    def _compute_similarity_score(self, image_emb: torch.Tensor, text_emb: torch.Tensor) -> float:
-        sim = F.cosine_similarity(image_emb.unsqueeze(0), text_emb.unsqueeze(0), dim=-1).item()
-        score = 0.5 * (sim + 1.0)
-        return float(max(0.0, min(1.0, score)))
-
-    def _compute_clg_scores_from_embeddings(
-        self,
-        image_emb: torch.Tensor,
-        positive_emb: torch.Tensor,
-        negative_emb: torch.Tensor,
-    ) -> Dict[str, float]:
-        positive_score = self._compute_similarity_score(image_emb, positive_emb)
-        negative_score = self._compute_similarity_score(image_emb, negative_emb)
-        confidence = abs(positive_score - negative_score)
-        return {
-            "positive_score": positive_score,
-            "negative_score": negative_score,
-            "confidence": confidence,
-        }
-
-    def _aggregate_sender_scores(self, per_sender_scores: Dict[int, List[Dict[str, float]]]) -> Dict[int, Dict[str, float]]:
-        aggregated: Dict[int, Dict[str, float]] = {}
-        for sender_id, scores in per_sender_scores.items():
-            if not scores:
-                continue
-            n = float(len(scores))
-            aggregated[sender_id] = {
-                "positive_score": float(sum(s["positive_score"] for s in scores) / n),
-                "negative_score": float(sum(s["negative_score"] for s in scores) / n),
-                "confidence": float(sum(s["confidence"] for s in scores) / n),
-                "num_images": int(len(scores)),
-            }
-        return aggregated
-
     def _wrap_angle(self, angle_rad: float) -> float:
         return (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
-
     def _question_target_angle_rad(self, question_cfg: Dict[str, Any]) -> float:
         """
         Return the target angle in the ego-local frame.
@@ -388,14 +299,248 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         target_local = self._question_target_angle_rad(question_cfg)
         ego_yaw_rad = math.radians(float(ego_pose.get("yaw", 0.0)))
         return self._wrap_angle(ego_yaw_rad + target_local)
+    
+    def _compute_single_image_embedding_from_array(self, img_np):
+        raise RuntimeError(
+            "Image embeddings are disabled for Qwen2-VL in this environment. "
+            "Use _compute_single_image_description_from_array instead."
+        )
+
+    def _compute_single_image_embedding(self, image: Image.Image) -> torch.Tensor:
+        raise RuntimeError(
+            "Image embeddings are disabled for Qwen2-VL in this environment. "
+            "Use _compute_single_image_description instead."
+        )
+
+    def _coerce_to_pil_image(self, image: Any) -> Optional[Image.Image]:
+        if image is None:
+            return None
+        if isinstance(image, Image.Image):
+            return image.convert("RGB")
+        if isinstance(image, torch.Tensor):
+            image = image.detach().cpu().numpy()
+        image = np.asarray(image)
+        return Image.fromarray(image).convert("RGB")
+
+    def _build_scene_description_prompt(self) -> str:
+        return (
+            "You are analyzing a single driving image for cooperative perception. "
+            "Describe only safety-relevant facts visible in the image. "
+            "Focus on regions relative to the ego vehicle: front, rear, left-front, right-front, left-rear, right-rear. "
+            "Mention vehicles, pedestrians, cyclists, lane occupancy, and visibility quality such as visible / partially visible / occluded / unclear / absent. "
+            "Use short factual sentences only. Do not speculate.\n\n"
+            "Return exactly this format:\n"
+            "Front: ...\n"
+            "Rear: ...\n"
+            "Left-front: ...\n"
+            "Right-front: ...\n"
+            "Left-rear: ...\n"
+            "Right-rear: ...\n"
+            "Visibility: ...\n"
+            "Key evidence: ..."
+        )
+
+    def _build_language_scoring_prompt(
+        self,
+        question_cfg: Dict[str, Any],
+        fused_evidence: str,
+    ) -> str:
+        question_id = str(question_cfg.get("id", "unknown_question"))
+        question_type = str(question_cfg.get("type", "clg"))
+        query = str(question_cfg.get("query", "")).strip()
+        positive = str(question_cfg.get("positive", "")).strip()
+        negative = str(question_cfg.get("negative", "")).strip()
+        return (
+            "You are evaluating cooperative driving evidence for one binary question.\n"
+            f"Question ID: {question_id}\n"
+            f"Question type: {question_type}\n"
+            f"Query: {query}\n"
+            f"Positive statement: {positive}\n"
+            f"Negative statement: {negative}\n\n"
+            "Evidence from multiple vehicles is provided below. Some evidence may be partial, occluded, or uncertain. "
+            "Use only the provided evidence. Do not assume unseen facts.\n\n"
+            f"EVIDENCE:\n{fused_evidence if fused_evidence else 'No textual evidence provided.'}\n\n"
+            "Return JSON only, with this schema:\n"
+            "{\n"
+            '  "positive_score": float in [0, 1],\n'
+            '  "negative_score": float in [0, 1],\n'
+            '  "uncertainty": float in [0, 1],\n'
+            '  "answer": "positive" or "negative" or "uncertain",\n'
+            '  "reason": "one short sentence"\n'
+            "}\n\n"
+            "positive_score should be high only if the evidence supports the positive statement. "
+            "negative_score should be high only if the evidence supports the negative statement. "
+            "Use uncertainty for occlusion, ambiguity, weak evidence, or conflicting evidence."
+        )
+
+    def _extract_first_json_object(self, text: str) -> Optional[Dict[str, Any]]:
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return None
+
+    def _run_qwen_generation(
+        self,
+        prompt: str,
+        image: Optional[Image.Image] = None,
+        max_new_tokens: Optional[int] = None,
+    ) -> str:
+        if self._vlm_model is None or self._vlm_processor is None:
+            raise RuntimeError("Qwen2-VL model is not initialized.")
+
+        model_device = next(self._vlm_model.parameters()).device
+
+        if image is not None:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            text = self._vlm_processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            inputs = self._vlm_processor(
+                text=[text],
+                images=[image],
+                padding=True,
+                return_tensors="pt",
+            )
+        else:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            text = self._vlm_processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            inputs = self._vlm_processor(
+                text=[text],
+                padding=True,
+                return_tensors="pt",
+            )
+
+        inputs = {k: v.to(model_device) if hasattr(v, "to") else v for k, v in inputs.items()}
+
+        gen_kwargs = {
+            "max_new_tokens": int(max_new_tokens or self._vlm_max_new_tokens),
+            "do_sample": bool(self._vlm_do_sample),
+        }
+        if bool(self._vlm_do_sample):
+            gen_kwargs["temperature"] = float(self._vlm_temperature)
+            gen_kwargs["top_p"] = float(self._vlm_top_p)
+
+        with torch.no_grad():
+            generated_ids = self._vlm_model.generate(**inputs, **gen_kwargs)
+
+        prompt_len = int(inputs["input_ids"].shape[1]) if "input_ids" in inputs else 0
+        generated_only = generated_ids[:, prompt_len:] if prompt_len > 0 else generated_ids
+        raw_text = self._vlm_processor.batch_decode(
+            generated_only,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        )[0]
+        return raw_text.strip()
+
+    def _compute_single_image_description(self, image: Image.Image) -> str:
+        if self._vlm_model is None or self._vlm_processor is None:
+            raise RuntimeError("Qwen2-VL model is not initialized.")
+        if image is None:
+            raise ValueError("Image cannot be converted to PIL for Qwen2-VL captioning.")
+        prompt = self._build_scene_description_prompt()
+        return self._run_qwen_generation(prompt=prompt, image=image, max_new_tokens=160)
+
+    def _compute_single_image_description_from_array(self, img_np):
+        image = Image.fromarray(img_np).convert("RGB")
+        if image is None:
+            raise ValueError("img_np cannot be converted to PIL image")
+        return self._compute_single_image_description(image)
+
+    def _parse_language_scores(self, raw_text: str) -> Dict[str, Any]:
+        parsed = self._extract_first_json_object(raw_text) or {}
+
+        def _clip01(v: Any, default: float) -> float:
+            try:
+                return float(max(0.0, min(1.0, float(v))))
+            except Exception:
+                return float(default)
+
+        pos = _clip01(parsed.get("positive_score", 0.0), 0.0)
+        neg = _clip01(parsed.get("negative_score", 0.0), 0.0)
+        unc = _clip01(parsed.get("uncertainty", 1.0), 1.0)
+        total = pos + neg + unc
+        if total > 1e-8:
+            pos /= total
+            neg /= total
+            unc /= total
+        else:
+            pos, neg, unc = 0.0, 0.0, 1.0
+        answer = str(parsed.get("answer", "uncertain")).strip().lower()
+        if answer not in {"positive", "negative", "uncertain"}:
+            if pos > neg and pos > unc:
+                answer = "positive"
+            elif neg > pos and neg > unc:
+                answer = "negative"
+            else:
+                answer = "uncertain"
+        reason = str(parsed.get("reason", "")).strip()
+        belief = float(pos - neg)
+        evidence = float(1.0 - unc)
+        ambiguity = float(1.0 - abs(pos - neg))
+        confidence = float(abs(belief) * evidence)
+        return {
+            "positive_score": float(pos),
+            "negative_score": float(neg),
+            "unknown_score": float(unc),
+            "uncertainty": float(unc),
+            "answer": answer,
+            "reason": reason,
+            "belief": belief,
+            "evidence": evidence,
+            "ambiguity": ambiguity,
+            "confidence": confidence,
+            "raw_text": raw_text,
+        }
+
+    def _score_question_from_language_evidence(
+        self,
+        question_cfg: Dict[str, Any],
+        fused_evidence: str,
+    ) -> Dict[str, Any]:
+        prompt = self._build_language_scoring_prompt(question_cfg, fused_evidence)
+        raw_text = self._run_qwen_generation(prompt=prompt, image=None, max_new_tokens=128)
+        return self._parse_language_scores(raw_text)
 
     def _build_ego_sensor_instances(self, ego_image: Image.Image) -> List[Dict[str, Any]]:
         tf = self.ego.get_transform()
         yaw_rad = math.radians(float(tf.rotation.yaw))
+        scene_description = self._compute_single_image_description(ego_image)
         return [{
             "sender_id": int(self.ego.id),
             "sensor_name": "cam0",
-            "image": ego_image,
+            "img_emb": None, #ego_image,
+            "scene_description": scene_description,
             "pose": {
                 "x": float(tf.location.x),
                 "y": float(tf.location.y),
@@ -414,7 +559,8 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             sensor_infos.append({
                 "sender_id": int(info["sender_id"]),
                 "sensor_name": str(info.get("sensor_name", "cam0")),
-                "image": info["image"],
+                "img_emb": info.get("img_emb", None),
+                "scene_description": str(info.get("scene_description", "")).strip(),
                 "pose": {
                     "x": float(pose.get("x", 0.0)),
                     "y": float(pose.get("y", 0.0)),
@@ -447,11 +593,22 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
                 "is_ego": bool(items[0].get("is_ego", False)),
                 "positive_score": float(sum(x["positive_score"] for x in items) / n),
                 "negative_score": float(sum(x["negative_score"] for x in items) / n),
-                "confidence": float(sum(x["confidence"] for x in items) / n),
+                "unknown_score": float(sum(x.get("unknown_score", x.get("uncertainty", 0.0)) for x in items) / n),
+                "belief": float(sum(x.get("belief", 0.0) for x in items) / n),
+                "evidence": float(sum(x.get("evidence", 0.0) for x in items) / n),
+                "ambiguity": float(sum(x.get("ambiguity", 1.0) for x in items) / n),
+                "confidence": float(sum(float(x.get("confidence", 0.0)) for x in items) / n),
+                "visibility_score": float(sum(1.0 - float(x.get("uncertainty", x.get("unknown_score", 1.0))) for x in items) / n),
+                "answer": str(items[-1].get("answer", "uncertain")),
                 "num_images": int(len(items)),
                 "received_age_s_mean": float(sum(float(x.get("received_age_s", 0.0)) for x in items) / n),
                 "pose": dict(items[0].get("pose", {})),
                 "sensor_yaw_rad": float(items[0].get("sensor_yaw_rad", 0.0)),
+                "reason": str(items[-1].get("reason", "")),
+                "reasons": [str(x.get("reason", "")) for x in items],
+                "raw_outputs": [str(x.get("raw_text", "")) for x in items],
+                "scene_description": str(items[-1].get("scene_description", "")),
+                "language_evidence": str(items[-1].get("language_evidence", "")),
             }
         return aggregated
 
@@ -469,6 +626,9 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             aggregated[sender_id] = {
                 "positive_score": float(sum(x["positive_score"] for x in items) / n),
                 "negative_score": float(sum(x["negative_score"] for x in items) / n),
+                "unknown_score": float(sum(x.get("unknown_score", 0.0) for x in items) / n),
+                "belief": float(sum(x.get("belief", 0.0) for x in items) / n),
+                "evidence": float(sum(x.get("evidence", 0.0) for x in items) / n),
                 "confidence": float(sum(x["confidence"] for x in items) / n),
                 "num_sensors": int(len(items)),
             }
@@ -513,69 +673,29 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         details: Dict[str, Dict[str, Any]] = {}
         # 把rad转化为angle
         target_angle_deg = (math.degrees(target_angle) + 180) % 360 - 180
-        print(f"global target rad {target_angle}, angle {target_angle_deg:.2f} deg")
 
         for sensor_key, sensor_score in sensor_mean_scores.items():
             feats = self._build_sensor_position_features(sensor_score, ego_pose)
             d = feats["distance_m"]
 
-
             if sensor_score["is_ego"]:
                 angle_diff = self._wrap_angle(feats["sensor_yaw_rad"] - target_angle)
-
                 half_fov = math.radians(self._vlm_sensor_fov_deg)
-
                 if abs(angle_diff) <= half_fov:
                     region_alignment = 0.5 * (1.0 + math.cos(angle_diff))
                     facing_alignment = region_alignment
                 else:
                     region_alignment = 0.0
                     facing_alignment = 0.0
-
                 distance_alignment = 1.0
-
             else:
                 region_alignment = 0.5 * (1.0 + math.cos(self._wrap_angle(feats["bearing_from_ego_rad"] - target_angle)))
                 facing_alignment = 0.5 * (1.0 + math.cos(self._wrap_angle(feats["sensor_yaw_rad"] - feats["bearing_to_ego_rad"])))
-            #     region_alignment = 0.5 * (
-            #         1.0 + math.cos(
-            #             self._wrap_angle(feats["bearing_from_ego_rad"] - target_angle)
-            #         )
-            #     )
-            fov_alignment = 0
-            # fov_alignment = self._compute_fov_alignment(
-            #     sensor_yaw_rad=feats["sensor_yaw_rad"],
-            #     target_angle_rad=target_angle,
-            #     fov_deg=self._vlm_sensor_fov_deg,
-            # )
-            # # fov_alignment_target = self._compute_fov_alignment(
-            # #     sensor_yaw_rad=feats["sensor_yaw_rad"],
-            # #     target_angle_rad=target_angle,
-            # #     fov_deg=self._vlm_sensor_fov_deg,
-            # # )
-            # region_alignment = region_alignment * fov_alignment
+                distance_alignment = math.exp(-d / tau)
 
-            # # sensor朝向是否能覆盖ego方向，用ego方向的FOV做门控
-            # facing_alignment = self._compute_fov_alignment(
-            #     sensor_yaw_rad=feats["sensor_yaw_rad"],
-            #     target_angle_rad=feats["bearing_to_ego_rad"],   # ← 改成朝向ego的方向
-            #     fov_deg=self._vlm_sensor_fov_deg,
-            # )
-
-            distance_alignment = math.exp(-d / tau)
-
-            # region_alignment = region_alignment * fov_alignment
-            # facing_alignment = fov_alignment
-
-            ego_bias = float(self._vlm_importance_ego_bias) if bool(sensor_score.get("is_ego", False)) else 0.0
-
-            # logit = (
-            #     float(self._vlm_importance_region_weight) * region_alignment
-            #     + float(self._vlm_importance_facing_weight) * facing_alignment
-            #     + float(self._vlm_importance_distance_weight) * distance_alignment
-            #     + ego_bias
-            # )
-            logit = (float(region_alignment) + float(facing_alignment)) * float(distance_alignment)
+            fov_alignment = 0.0
+            text_evidence = float(max(0.0, min(1.0, sensor_score.get("evidence", 0.0))))
+            logit = (float(region_alignment) + float(facing_alignment)) * float(distance_alignment) * (0.5 + 0.5 * text_evidence)
             logits.append(float(logit))
             sensor_keys.append(sensor_key)
             details[sensor_key] = {
@@ -592,7 +712,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         if not sensor_keys:
             return {"per_sensor": {}, "per_sender_positive": {}, "per_sender_negative": {}}
 
-        weights =  logits#torch.softmax(torch.tensor(logits, dtype=torch.float32), dim=0).tolist()
+        weights = logits
         per_sensor: Dict[str, Dict[str, Any]] = {}
         per_sender_positive: Dict[int, float] = defaultdict(float)
         per_sender_negative: Dict[int, float] = defaultdict(float)
@@ -623,11 +743,9 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         total_penalty = 0.0
         for sensor_key, sensor_score in sensor_mean_scores.items():
             imp = importance_maps.get("per_sensor", {}).get(sensor_key, {})
-            m_pos = float(imp.get("importance_positive", 0.0))
-            m_neg = float(imp.get("importance_negative", 0.0))
-            s_pos = max(float(sensor_score["positive_score"]), 1e-6)
-            s_neg = max(float(sensor_score["negative_score"]), 1e-6)
-            penalty = m_pos * (-math.log(s_pos)) + m_neg * (-math.log(s_neg))
+            m = float(imp.get("importance_positive", 0.0))
+            evidence = max(float(sensor_score.get("evidence", 0.0)), 1e-6)
+            penalty = m * (-math.log(evidence)) # TODO: 这里的定义，参考老师的意见
             per_sensor_penalty[sensor_key] = float(penalty)
             total_penalty += float(penalty)
         return {
@@ -649,120 +767,127 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
     ) -> Dict[str, Any]:
         per_sensor_importance = importance_maps.get("per_sensor", {})
         per_sensor_details: List[Dict[str, Any]] = []
-        
-        weighted_pos  = 0.0
-        weighted_neg  = 0.0
-        weighted_conf = 0.0
-        total_weight  = 0.0
-        
-        # Per-sender rollup accumulators (for logging)
-        per_sender_w_pos:  Dict[int, float] = defaultdict(float)
-        per_sender_w_neg:  Dict[int, float] = defaultdict(float)
-        per_sender_w_conf: Dict[int, float] = defaultdict(float)
-        per_sender_w:      Dict[int, float] = defaultdict(float)
-        
+
+        weighted_pos = 0.0
+        weighted_neg = 0.0
+        weighted_unk = 0.0
+        total_weight = 0.0
+        total_support = 0.0
+        total_contrib = 0.0
+        ego_only = {
+            "positive_score": 0.0,
+            "negative_score": 0.0,
+            "unknown_score": 1.0,
+            "belief": 0.0,
+            "evidence": 0.0,
+            "confidence": 0.0,
+            "answer": "uncertain",
+        }
+
+        per_sender_w_pos: Dict[int, float] = defaultdict(float)
+        per_sender_w_neg: Dict[int, float] = defaultdict(float)
+        per_sender_w_unk: Dict[int, float] = defaultdict(float)
+        per_sender_support: Dict[int, float] = defaultdict(float)
+        per_sender_contrib: Dict[int, float] = defaultdict(float)
+        per_sender_w: Dict[int, float] = defaultdict(float)
+
         for sensor_key in sorted(sensor_mean_scores.keys()):
             sensor_score = sensor_mean_scores[sensor_key]
-            imp          = per_sensor_importance.get(sensor_key, {})
+            imp = per_sensor_importance.get(sensor_key, {})
 
-            w_pos      = float(imp.get("importance_positive", 0.0))
-            w_neg      = float(imp.get("importance_negative", 0.0)) # 这里正负一样
-            s_pos  = float(sensor_score["positive_score"])
-            s_neg  = float(sensor_score["negative_score"])
-            s_conf = float(sensor_score["confidence"])      # 这里的confidence实际上是不看权重的
+            importance_weight = float(imp.get("importance_positive", 0.0))
             sender_id = int(sensor_score["sender_id"])
-            is_ego    = bool(sensor_score.get("is_ego", False))
+            is_ego = bool(sensor_score.get("is_ego", False))
+            sender_weight = self._get_sender_weight(sender_id, is_ego)
+            sensor_weight = importance_weight * sender_weight
 
-            weighted_pos  += w_pos * s_pos
-            weighted_neg  += w_neg * s_neg
-            weighted_conf += w_pos * s_conf
-            total_weight  += w_pos
-            
+            s_pos = float(sensor_score.get("positive_score", 0.0))
+            s_neg = float(sensor_score.get("negative_score", 0.0))
+            s_unk = float(sensor_score.get("unknown_score", 1.0))
+            belief = float(sensor_score.get("belief", s_pos - s_neg))
+            evidence = float(sensor_score.get("evidence", 1.0 - s_unk))
+
+            support = sensor_weight * evidence
+            contrib = support * abs(belief)
+
+            weighted_pos += sensor_weight * s_pos
+            weighted_neg += sensor_weight * s_neg
+            weighted_unk += sensor_weight * s_unk
+            total_weight += sensor_weight
+            total_support += support
+            total_contrib += contrib
+
             if is_ego:
                 ego_only = {
                     "positive_score": s_pos,
                     "negative_score": s_neg,
-                    "confidence":     w_pos * s_conf,
+                    "unknown_score": s_unk,
+                    "belief": belief,
+                    "evidence": evidence,
+                    "confidence": abs(belief) * evidence,
+                    "answer": str(sensor_score.get("answer", "uncertain")),
                 }
 
             per_sensor_details.append({
-                "sensor_key":        sensor_key,
-                "sender_id":         sender_id,
-                "is_ego":            is_ego,
-                "importance_weight": w_pos,
-                "positive_score":    s_pos,
-                "negative_score":    s_neg,
-                "confidence":        w_pos * s_conf,
+                "sensor_key": sensor_key,
+                "sender_id": sender_id,
+                "is_ego": is_ego,
+                "importance_weight": importance_weight,
+                "sender_weight": sender_weight,
+                "sensor_weight": sensor_weight,
+                "support": support,
+                "contribution": contrib,
+                "positive_score": s_pos,
+                "negative_score": s_neg,
+                "unknown_score": s_unk,
+                "belief": belief,
+                "evidence": evidence,
+                "confidence": abs(belief) * evidence,
             })
 
-            per_sender_w_pos[sender_id]  += w_pos * s_pos
-            per_sender_w_neg[sender_id]  += w_neg * s_neg
-            per_sender_w_conf[sender_id] += w_pos * s_conf
-            per_sender_w[sender_id]      += w_pos
+            per_sender_w_pos[sender_id] += sensor_weight * s_pos
+            per_sender_w_neg[sender_id] += sensor_weight * s_neg
+            per_sender_w_unk[sender_id] += sensor_weight * s_unk
+            per_sender_support[sender_id] += support
+            per_sender_contrib[sender_id] += contrib
+            per_sender_w[sender_id] += sensor_weight
 
-
-        # Per-sender rollup for logging
         per_sender_aggregated: List[Dict[str, Any]] = []
         for sender_id in sorted(per_sender_w.keys()):
             sw = per_sender_w[sender_id]
+            ss = per_sender_support[sender_id]
+            belief = float(per_sender_contrib[sender_id] / ss) if ss > 0 else 0.0
             per_sender_aggregated.append({
-                "sender_id":               sender_id,
+                "sender_id": sender_id,
                 "total_importance_weight": float(sw),
-                "weighted_positive_score": float(per_sender_w_pos[sender_id]  / sw) if sw > 0 else 0.0,
-                "weighted_negative_score": float(per_sender_w_neg[sender_id]  / sw) if sw > 0 else 0.0,
-                "weighted_confidence":     float(per_sender_w_conf[sender_id] / sw) if sw > 0 else 0.0,
+                "weighted_positive_score": float(per_sender_w_pos[sender_id] / sw) if sw > 0 else 0.0,
+                "weighted_negative_score": float(per_sender_w_neg[sender_id] / sw) if sw > 0 else 0.0,
+                "weighted_unknown_score": float(per_sender_w_unk[sender_id] / sw) if sw > 0 else 1.0,
+                "weighted_belief": belief,
+                "weighted_confidence": abs(belief),
+                "evidence": float(ss / sw) if sw > 0 else 0.0,
             })
 
+        # TODO: 这里要不要除以total
+        final_belief = float(total_contrib / total_support) if total_support > 0 else 0.0
+        final_pos = float(weighted_pos / total_weight) if total_weight > 0 else 0.0
+        final_neg = float(weighted_neg / total_weight) if total_weight > 0 else 0.0
+        final_unk = float(weighted_unk / total_weight) if total_weight > 0 else 1.0
+        final_evidence = float(total_support / total_weight) if total_weight > 0 else 0.0
+
         return {
-            "positive_score":        float(weighted_pos),
-            "negative_score":        float(weighted_neg),
-            "confidence":            float(weighted_conf),
-            "total_weight":          float(total_weight),
-            "ego_only":              ego_only,
-            "per_sensor_details":    per_sensor_details,
+            "positive_score": final_pos,
+            "negative_score": final_neg,
+            "unknown_score": final_unk,
+            "belief": final_belief,
+            "evidence": final_evidence,
+            "confidence": abs(final_belief),
+            "total_weight": float(total_weight),
+            "total_support": float(total_support),
+            "ego_only": ego_only,
+            "per_sensor_details": per_sensor_details,
             "per_sender_aggregated": per_sender_aggregated,
         }
-
-    # =========================================================
-    # Image helpers
-    # =========================================================
-
-    def _get_rgb_image_from_obs(self, obs: Optional[Dict[str, Any]]) -> Optional[np.ndarray]:
-        if not isinstance(obs, dict):
-            return None
-        img = obs.get(self._vlm_image_obs_key, None)
-        if img is None:
-            return None
-
-        if isinstance(img, torch.Tensor):
-            img = img.detach().cpu().numpy()
-
-        img = np.asarray(img)
-        if img.ndim != 3:
-            return None
-
-        if img.shape[0] in (1, 3, 4) and img.shape[-1] not in (1, 3, 4):
-            img = np.transpose(img, (1, 2, 0))
-
-        if img.shape[-1] == 4:
-            img = img[..., :3]
-        if img.shape[-1] != 3:
-            return None
-
-        if img.dtype != np.uint8:
-            if np.issubdtype(img.dtype, np.floating):
-                img = np.clip(img, 0, 255).astype(np.uint8)
-            else:
-                img = img.astype(np.uint8)
-
-        return img
-
-    def _to_pil_image(self, img_np: np.ndarray) -> Image.Image:
-        return Image.fromarray(img_np).convert("RGB")
-
-    def _reconstruct_image_from_feat(self, feat: np.ndarray, feature_size: int) -> np.ndarray:
-        img = feat
-        return img
 
     # =========================================================
     # Shared-message selection helpers
@@ -840,12 +965,11 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
                 "y": float(tf.location.y),
                 "yaw": float(tf.rotation.yaw),
             },
-            "pose_text": f"x={tf.location.x:.2f}, y={tf.location.y:.2f}, yaw={tf.rotation.yaw:.2f}",
             "received_age_s": 0.0,
-            "image": image,
+            "image": image,         # 只有raw获得的neighbor信息才有raw image，received 是image_emb
         }
 
-    def _make_shared_info_from_message(self, msg: V2VMessage, image: Image.Image) -> Optional[Dict[str, Any]]:
+    def _make_shared_info_from_message(self, msg: V2VMessage, payload) -> Optional[Dict[str, Any]]:
         sender_id = int(msg.sender_id)
         actor = None
         for veh in self.group_vehs:
@@ -861,28 +985,25 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
 
         return {
             "sender_id": sender_id,
-            "pose": {
-                "x": float(tf.location.x),
-                "y": float(tf.location.y),
-                "yaw": float(tf.rotation.yaw),
-            },
-            "pose_text": f"x={tf.location.x:.2f}, y={tf.location.y:.2f}, yaw={tf.rotation.yaw:.2f}",
             "received_age_s": float(received_age_s),
             "deliver_step": int(msg.deliver_step),
             "created_step": int(msg.created_step),
-            "image": image,
+            **payload,
         }
 
-    def _get_raw_shared_images_for_vlm(self) -> Tuple[List[Image.Image], List[Dict[str, Any]], Dict[str, Any]]:
+    def _get_raw_shared_images_info(self) -> Tuple[List[Image.Image], List[Dict[str, Any]], Dict[str, Any]]:
         shared_infos: List[Dict[str, Any]] = []
 
         for veh in self.group_vehs:
             obs = self.group_obs.get(veh.id, None)
-            img_np = self._get_rgb_image_from_obs(obs)
-            if img_np is None:
+            image_np = obs.get("camera", None)
+            if image_np is None:
                 continue
-            pil_img = self._to_pil_image(img_np)
-            shared_infos.append(self._make_shared_info_from_actor(veh, pil_img))
+            image = Image.fromarray(image_np).convert("RGB")
+            scene_description = self._compute_single_image_description(image)
+            info = self._make_shared_info_from_actor(veh, image)
+            info["scene_description"] = scene_description
+            shared_infos.append(info)
             if len(shared_infos) >= self._vlm_max_total_shared_images:
                 break
 
@@ -897,7 +1018,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         }
         return shared_images, shared_infos, meta
 
-    def _get_received_shared_images_for_vlm(self) -> Tuple[List[Image.Image], List[Dict[str, Any]], Dict[str, Any]]:
+    def _get_received_shared_images_info(self) -> Tuple[List[Image.Image], List[Dict[str, Any]], Dict[str, Any]]:
         receiver_id = int(self.ego.id)
         window_msgs = self._get_received_messages_in_window(receiver_id, self._vlm_received_window_s)
         num_candidate_msgs = len(window_msgs)
@@ -907,7 +1028,6 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         per_sender_infos: Dict[int, List[Dict[str, Any]]] = {}
         for sender_id, msgs in grouped.items():
             msgs = sorted(msgs, key=lambda m: (int(m.deliver_step), int(m.created_step)))
-            print(f"[CLIP] Sender {sender_id} has {len(msgs)} messages in the received window.")
             if self._vlm_max_msgs_per_sender > 0:
                 msgs = msgs[-self._vlm_max_msgs_per_sender:]
 
@@ -920,17 +1040,12 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             infos: List[Dict[str, Any]] = []
             for msg in chosen_msgs:
                 payload = msg.payload if isinstance(msg.payload, dict) else {}
-                feat = payload.get("feat", None)
-                if feat is None:
+                if not payload:
                     continue
-                try:
-                    img_np = self._reconstruct_image_from_feat(feat, self.feature_size)
-                    pil_img = self._to_pil_image(img_np)
-                except Exception:
+                info = self._make_shared_info_from_message(msg, payload)    #TODO: image修改
+                if info is None:
                     continue
-
-                info = self._make_shared_info_from_message(msg, pil_img)
-                if info is not None:
+                if info.get("scene_description") or info.get("img_emb"):    # 要么是自然语言描述，要么是图片embedding
                     infos.append(info)
 
             if infos:
@@ -949,30 +1064,30 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             )
             shared_infos.extend(infos)
 
-        shared_images = [info["image"] for info in shared_infos]
+        shared_images = [None for info in shared_infos] # received 要么是自然语言描述，要么是图片embedding
         meta = {
             "shared_source": "received_feat",
             "num_candidate_msgs": num_candidate_msgs,
-            "num_selected_shared_images": len(shared_images),
+            "num_selected_shared_images": len(shared_infos),
             "selected_sender_ids": [info["sender_id"] for info in shared_infos],
             "window_s": self._vlm_received_window_s,
             "sampling_strategy": self._vlm_sampling_strategy,
         }
         return shared_images, shared_infos, meta
 
-    def _get_ego_and_shared_pil_images(self) -> Tuple[Optional[Image.Image], List[Image.Image], List[Dict[str, Any]], Dict[str, Any]]:
-        ego_img_np = self._get_rgb_image_from_obs(self.obs)
-        ego_pil = self._to_pil_image(ego_img_np) if ego_img_np is not None else None
+    def _get_ego_and_shared_images_info(self) -> Tuple[Optional[Image.Image], List[Image.Image], List[Dict[str, Any]], Dict[str, Any]]:
+        ego_image_np = self.obs.get("camera", None)
+        ego_image = Image.fromarray(ego_image_np).convert("RGB") if ego_image_np is not None else None
 
         if self._vlm_shared_source == "raw":
-            shared_images, shared_infos, meta = self._get_raw_shared_images_for_vlm()
+            shared_images, shared_infos, meta = self._get_raw_shared_images_info()
         else:
-            shared_images, shared_infos, meta = self._get_received_shared_images_for_vlm()
+            shared_images, shared_infos, meta = self._get_received_shared_images_info()
 
-        return ego_pil, shared_images, shared_infos, meta
+        return ego_image, shared_images, shared_infos, meta
 
     # =========================================================
-    # CLIP evaluation (mirrors original VLM evaluation interface)
+    # Qwen language evaluation
     # =========================================================
 
     def _evaluate_single_question(
@@ -986,10 +1101,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
 
         positive_text = question_cfg["positive"]
         negative_text = question_cfg["negative"]
-
-        # CLIP text embeddings (cached after first call)
-        positive_emb = self._compute_text_embedding(positive_text)
-        negative_emb = self._compute_text_embedding(negative_text)
+        query_text = question_cfg["query"]
 
         ego_sensor_infos = self._build_ego_sensor_instances(ego_image)
         shared_sensor_infos = self._build_shared_sensor_instances(shared_infos)
@@ -1005,24 +1117,11 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         per_sensor_instance_scores: List[Dict[str, Any]] = []
 
         for sensor_info in all_sensor_infos:
-            # CLIP image embedding
-            img_emb = self._compute_single_image_embedding(sensor_info["image"])
+            scene_description = str(sensor_info.get("scene_description", "")).strip()
+            if not scene_description:
+                continue
 
-            # Fuse with spatial position embedding
-            pos_emb = self._build_position_embedding_tensor(
-                sensor_info["pose"],
-                ego_pose,
-                device=img_emb.device,
-            )
-            img_emb = self._fuse_image_with_position(img_emb, pos_emb, gamma=0.3)
-
-            # CLG scoring via cosine similarity
-            score = self._compute_clg_scores_from_embeddings(
-                img_emb,
-                positive_emb,
-                negative_emb,
-            )
-
+            scoring = self._score_question_from_language_evidence(question_cfg, scene_description)
             per_sensor_instance_scores.append({
                 "sender_id": int(sensor_info["sender_id"]),
                 "sensor_name": str(sensor_info["sensor_name"]),
@@ -1030,20 +1129,38 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
                 "received_age_s": float(sensor_info.get("received_age_s", 0.0)),
                 "pose": dict(sensor_info.get("pose", {})),
                 "sensor_yaw_rad": float(sensor_info.get("sensor_yaw_rad", 0.0)),
-                **score,
+                "scene_description": scene_description,
+                "language_evidence": scene_description,
+                **scoring,
             })
 
         sensor_mean_scores = self._aggregate_sensor_scores(per_sensor_instance_scores)
-        # sender_mean_scores = self._aggregate_sender_scores_from_sensor_means(sensor_mean_scores)
-
-        # ego_score = sender_mean_scores.get(int(self.ego.id), {"positive_score": 0.0, "negative_score": 0.0, "confidence": 0.0})
-        # shared_sender_scores = {sid: s for sid, s in sender_mean_scores.items() if int(sid) != int(self.ego.id)}
-
         importance_maps = self._compute_sensor_importance_maps(question_cfg, sensor_mean_scores, ego_pose)
         importance_penalty = self._compute_importance_penalty(sensor_mean_scores, importance_maps)
-        
         aggregated = self._weighted_confidence_aggregate(sensor_mean_scores, importance_maps)
         ego_score = aggregated["ego_only"]
+
+        fused_lines: List[str] = []
+        for sensor_key in sorted(sensor_mean_scores.keys()):
+            s = sensor_mean_scores[sensor_key]
+            region = "ego" if bool(s.get("is_ego", False)) else f"sender_{int(s.get('sender_id', -1))}"
+            desc = str(s.get("scene_description", "")).strip()
+            if desc:
+                fused_lines.append(f"[{region}] {desc}")
+        fused_evidence = "\n\n".join(fused_lines)
+        fused_reasoning = self._score_question_from_language_evidence(question_cfg, fused_evidence) if fused_evidence else {
+            "positive_score": 0.0,
+            "negative_score": 0.0,
+            "unknown_score": 1.0,
+            "uncertainty": 1.0,
+            "answer": "uncertain",
+            "reason": "",
+            "belief": 0.0,
+            "evidence": 0.0,
+            "ambiguity": 1.0,
+            "confidence": 0.0,
+            "raw_text": "",
+        }
 
         per_sensor_scores_out: List[Dict[str, Any]] = []
         for sensor_key in sorted(sensor_mean_scores.keys()):
@@ -1064,8 +1181,11 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             "selected_sender_ids": shared_meta.get("selected_sender_ids", []),
             "received_window_s": shared_meta.get("window_s", 0.0),
             "sampling_strategy": shared_meta.get("sampling_strategy", ""),
+            "query_text": query_text,
             "positive_text": positive_text,
             "negative_text": negative_text,
+            "fused_language_evidence": fused_evidence,
+            "fused_reasoning": fused_reasoning,
             "per_sensor_scores": per_sensor_scores_out,
             "sender_importance_positive": importance_maps.get("per_sender_positive", {}),
             "sender_importance_negative": importance_maps.get("per_sender_negative", {}),
@@ -1073,10 +1193,14 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             "ego_plus_shared": {
                 "positive_score": aggregated["positive_score"],
                 "negative_score": aggregated["negative_score"],
+                "unknown_score": aggregated["unknown_score"],
+                "belief": aggregated["belief"],
+                "evidence": aggregated["evidence"],
                 "confidence": aggregated["confidence"],
             },
             "aggregated_details": {
                 "total_weight": aggregated["total_weight"],
+                "total_support": aggregated["total_support"],
                 "per_sensor": aggregated["per_sensor_details"],
                 "per_sender": aggregated["per_sender_aggregated"],
             },
@@ -1090,7 +1214,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         if not self._vlm_enabled:
             return {}
 
-        ego_image, shared_images, shared_infos, shared_meta = self._get_ego_and_shared_pil_images()
+        ego_image, shared_images, shared_infos, shared_meta = self._get_ego_and_shared_images_info()
         if ego_image is None:
             self._vlm_last_eval = {
                 "step": int(self._time_step),
@@ -1131,7 +1255,6 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
 
         self._vlm_last_eval = eval_result
         return eval_result
-
     # =========================================================
     # Environment
     # =========================================================
@@ -1225,19 +1348,24 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         super().on_step()
 
     def _make_payload(self, sender: carla.Actor) -> Any:
+        payload = {}
         if self.payload_fn is not None:
             obs = self.obs if sender.id == self.ego.id else self.group_obs.get(sender.id, {})
-            return self.payload_fn(sender, obs, self.feature_size)
+            payload = self.payload_fn(sender, obs, self.feature_size, image_proc_fn=self._compute_single_image_description_from_array)
 
         tf = sender.get_transform()
         vel = sender.get_velocity()
-        payload = {
-            "pose": np.array(
-                [tf.location.x, tf.location.y, tf.location.z, tf.rotation.yaw],
-                dtype=np.float32,
-            ),
-            "vel": np.array([vel.x, vel.y, vel.z], dtype=np.float32),
-        }
+        payload.update({
+            "pose": {
+                "x": float(tf.location.x),
+                "y": float(tf.location.y),
+                "yaw": float(tf.rotation.yaw),
+            },
+            "vel": {
+                "vx": float(vel.x),
+                "vy": float(vel.y),
+            },
+        })
         return payload
 
     def _run_group_communication(self) -> None:
@@ -1273,6 +1401,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
                     payload,
                     overhead_bytes=getattr(self.latency_model, "overhead_bytes", 64),
                 )
+                print(f"payload bytes: {payload_bytes}")
 
                 for receiver_id in members:
                     if receiver_id == sender_id:
@@ -1336,7 +1465,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         self.get_state()
         _, reward, terminated, truncated, info = super().step(action)
 
-        ego_feature = self.payload_fn(self.ego, self.obs, self.feature_size)
+        ego_feature = self.payload_fn(self.ego, self.obs, self.feature_size, image_proc_fn=self._compute_single_image_description_from_array)
         msgs = self._received.get(self.ego.id, deque())
         device = "cuda" if torch.cuda.is_available() else "cpu"
         shared_data = self._graph_builder.build(
@@ -1377,7 +1506,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         print("[CARLA Group Right Turn Env] Reset environment")
         _, info = super().reset(seed=seed)
 
-        ego_feature = self.payload_fn(self.ego, self.obs, self.feature_size)
+        ego_feature = self.payload_fn(self.ego, self.obs, self.feature_size, image_proc_fn=self._compute_single_image_description_from_array)
         msgs = self._received.get(self.ego.id, deque())
         device = "cuda" if torch.cuda.is_available() else "cpu"
         shared_data = self._graph_builder.build(
