@@ -40,33 +40,26 @@ def _safe_nbytes(payload: Any) -> int:
 # -----------------------------
 
 def _feature_nbytes(payload: Any) -> int:
-    """
-    Only count the feature tensor/array bytes.
-    Supports payload formats:
-        - np.ndarray: treat as feature itself
-        - dict with key 'feat' or 'data': np.ndarray
-        - nested dict/list/tuple: best-effort search; strings/metadata ignored
-    """
     if payload is None:
         return 0
     if isinstance(payload, np.ndarray):
         return int(payload.nbytes)
+    if isinstance(payload, str):
+        return len(payload.encode("utf-8"))
     if isinstance(payload, dict):
-        # common keys
+        if "scene_description" in payload and payload["scene_description"] is not None:
+            return _feature_nbytes(payload["scene_description"])
         if "feat" in payload and isinstance(payload["feat"], np.ndarray):
             return int(payload["feat"].nbytes)
         if "data" in payload and isinstance(payload["data"], np.ndarray):
             return int(payload["data"].nbytes)
-        # best-effort: sum feature bytes in values recursively
         total = 0
         for v in payload.values():
             total += _feature_nbytes(v)
         return int(total)
     if isinstance(payload, (list, tuple)):
         return int(sum(_feature_nbytes(x) for x in payload))
-    # strings/metadata do not count as "feature bytes"
     return 0
-
 
 def _tx_bytes_for_latency(payload: Any, overhead_bytes: int) -> int:
     """

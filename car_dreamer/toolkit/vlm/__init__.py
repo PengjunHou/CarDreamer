@@ -1,0 +1,1 @@
+from .ego_query_direction_mapper import compute_query_direction_from_observer

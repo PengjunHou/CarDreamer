@@ -63,25 +63,49 @@ def infer_sender_mapping(records: List[Dict[str, Any]]) -> Tuple[Optional[int], 
     return ego_sender_id, non_ego_sender_ids_sorted
 
 
-def compute_subset_confidence(per_sensor_scores, include_sender_ids):
-    pos = 0.0
-    neg = 0.0
-    conf = 0.0
+def _to_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except (TypeError, ValueError):
+        return default
 
+
+def _find_sensor_by_sender(per_sensor_scores: List[Dict[str, Any]], sender_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if sender_id is None:
+        return None
     for s in per_sensor_scores or []:
-        sid = s.get("sender_id")
-        if sid not in include_sender_ids:
-            continue
+        if s.get("sender_id") == sender_id:
+            return s
+    return None
 
-        w = float(s.get("importance_positive") or 0.0)
-        pos_s = float(s.get("positive_score") or 0.0)
-        neg_s = float(s.get("negative_score") or 0.0)
 
-        pos += w * pos_s
-        neg += w * neg_s
-        conf += abs(pos_s - neg_s) * w
+def compute_ego_plus_member_confidence(
+    ego_only: Dict[str, Any],
+    member_sensor: Optional[Dict[str, Any]],
+    member_aggregated:Dict[str, Any],
+) -> Optional[float]:
+    """
+    New user-specified formula:
+        | ego_only["weight"] * ego_only["belief"] + member["weight"] * member["belief"] |
 
-    return pos, neg, conf
+    For the member sensor, if "weight" is missing, fall back to "importance_weight"
+    because the new JSON stores the effective weight there.
+    """
+    if member_sensor is None:
+        return None
+
+    ego_weight = _to_float(ego_only.get("weight"), 0.0)
+    ego_belief = _to_float(ego_only.get("belief"), 0.0)
+
+    member_weight = _to_float(member_aggregated.get("weight"), None)
+    if member_weight is None:
+        print("member weight is None")
+        member_weight = _to_float(member_sensor.get("importance_weight"), 0.0)
+    member_belief = _to_float(member_aggregated.get("belief"), 0.0)
+
+    return abs(ego_weight * ego_belief + member_weight * member_belief)
 
 
 # --------------------------------------------------
@@ -98,39 +122,35 @@ def build_confidence_table(records: List[Dict[str, Any]]) -> pd.DataFrame:
 
     for rec in records:
         per_sensor_scores = rec.get("per_sensor_scores", []) or []
+        per_sensor_aggregated = rec.get("aggregated_details") or {}
+        ego_only = rec.get("ego_only") or {}
+        ego_plus_shared = rec.get("ego_plus_shared") or {}
 
-        ego_only_conf = float((rec.get("ego_only") or {}).get("confidence") or 0.0)
-        ego_plus_shared_conf = float((rec.get("ego_plus_shared") or {}).get("confidence") or 0.0)
+        ego_only_conf = _to_float(ego_only.get("confidence"), 0.0)
+        ego_plus_shared_conf = _to_float(ego_plus_shared.get("confidence"), 0.0)
+        confidence_gain = _to_float(rec.get("confidence_gain"), 0.0)
 
-        ego_plus_member1_conf = None
-        ego_plus_member2_conf = None
+        member1_sensor = _find_sensor_by_sender(per_sensor_scores, member1_id)
+        member2_sensor = _find_sensor_by_sender(per_sensor_scores, member2_id)
+        member1_aggregated = _find_sensor_by_sender(per_sensor_aggregated.get("per_sensor"), member1_id)
+        member2_aggregated = _find_sensor_by_sender(per_sensor_aggregated.get("per_sensor"), member2_id)
 
-        if ego_sender_id is not None and member1_id is not None:
-            _, _, ego_plus_member1_conf = compute_subset_confidence(
-                per_sensor_scores,
-                {ego_sender_id, member1_id},
-            )
-
-        if ego_sender_id is not None and member2_id is not None:
-            _, _, ego_plus_member2_conf = compute_subset_confidence(
-                per_sensor_scores,
-                {ego_sender_id, member2_id},
-            )
+        ego_plus_member1_conf = compute_ego_plus_member_confidence(ego_only, member1_sensor, member1_aggregated)
+        ego_plus_member2_conf = compute_ego_plus_member_confidence(ego_only, member2_sensor, member2_aggregated)
 
         rows.append(
             {
                 "step": rec.get("step"),
                 "question_id": rec.get("question_id"),
                 "question_type": rec.get("question_type"),
-
                 "ego_sender_id": ego_sender_id,
                 "member1_sender_id": member1_id,
                 "member2_sender_id": member2_id,
-
                 "confidence_ego_only": ego_only_conf,
                 "confidence_ego_plus_member1": ego_plus_member1_conf,
                 "confidence_ego_plus_member2": ego_plus_member2_conf,
                 "confidence_ego_plus_shared": ego_plus_shared_conf,
+                "confidence_gain": confidence_gain,
             }
         )
 
@@ -147,6 +167,7 @@ def build_confidence_table(records: List[Dict[str, Any]]) -> pd.DataFrame:
         "confidence_ego_plus_member1",
         "confidence_ego_plus_member2",
         "confidence_ego_plus_shared",
+        "confidence_gain",
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -164,26 +185,26 @@ def build_sensor_table(records: List[Dict[str, Any]]) -> pd.DataFrame:
 
     for rec in records:
         for s in rec.get("per_sensor_scores", []) or []:
-            region_alignment = float(s.get("region_alignment") or 0.0)
-            facing_alignment = float(s.get("facing_alignment") or 0.0)
-            distance_alignment = float(s.get("distance_alignment") or 0.0)
-
-            contribution = (region_alignment + facing_alignment) * distance_alignment
+            region_alignment = _to_float(s.get("region_alignment"), 0.0)
+            facing_alignment = _to_float(s.get("facing_alignment"), 0.0)
+            distance_alignment = _to_float(s.get("distance_alignment"), 0.0)
+            fov_alignment = _to_float(s.get("fov_alignment"), 0.0)
+            
+            contribution = _to_float(s.get("weight"), 0.0)
 
             rows.append(
                 {
                     "step": rec.get("step"),
                     "question_id": rec.get("question_id"),
                     "question_type": rec.get("question_type"),
-
                     "sensor_key": s.get("sensor_key"),
                     "sender_id": s.get("sender_id"),
                     "sensor_name": s.get("sensor_name"),
                     "is_ego": s.get("is_ego"),
-
                     "facing_alignment": facing_alignment,
                     "region_alignment": region_alignment,
                     "distance_alignment": distance_alignment,
+                    "fov_alignment": fov_alignment,
                     "confidence_contribution": contribution,
                 }
             )
@@ -277,6 +298,32 @@ def save_confidence_timeseries(conf_df: pd.DataFrame, output_dir: Path) -> None:
 
 
 # --------------------------------------------------
+# Plot 3: confidence gain time series for each question
+# --------------------------------------------------
+
+def save_confidence_gain_timeseries(conf_df: pd.DataFrame, output_dir: Path) -> None:
+    if conf_df.empty or "confidence_gain" not in conf_df.columns:
+        return
+
+    for qid, sub in conf_df.groupby("question_id", dropna=False):
+        sub = sub.sort_values("step")
+        if sub["step"].isna().all():
+            continue
+
+        plt.figure(figsize=(9, 5))
+        plt.plot(sub["step"], sub["confidence_gain"], label="confidence_gain")
+        plt.xlabel("Step")
+        plt.ylabel("Confidence gain")
+        plt.title(f"Confidence gain over time: {qid}")
+        plt.legend()
+        plt.tight_layout()
+
+        safe_name = str(qid).replace("/", "_")
+        plt.savefig(output_dir / f"timeseries_confidence_gain_{safe_name}.png", dpi=220)
+        plt.close()
+
+
+# --------------------------------------------------
 # Generic per-question sensor line plot
 # --------------------------------------------------
 
@@ -317,7 +364,7 @@ def save_sensor_metric_timeseries(
 # --------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualize VLM records with only requested plots.")
+    parser = argparse.ArgumentParser(description="Visualize VLM records with updated confidence formula.")
     parser.add_argument("--input", type=str, required=True, help="Path to records json/jsonl file")
     parser.add_argument("--output_dir", type=str, default="vlm_viz_selected", help="Directory to save outputs")
     args = parser.parse_args()
@@ -331,19 +378,15 @@ def main() -> None:
     conf_df = build_confidence_table(records)
     sensor_df = build_sensor_table(records)
 
-    # save tables for debugging / checking
     if not conf_df.empty:
         conf_df.to_csv(output_dir / "confidence_table.csv", index=False)
     if not sensor_df.empty:
         sensor_df.to_csv(output_dir / "sensor_alignment_table.csv", index=False)
 
-    # (1)
     save_avg_confidence_bar(conf_df, output_dir)
-
-    # (2)
     save_confidence_timeseries(conf_df, output_dir)
+    save_confidence_gain_timeseries(conf_df, output_dir)
 
-    # (3) facing_alignment
     save_sensor_metric_timeseries(
         sensor_df,
         output_dir,
@@ -352,7 +395,6 @@ def main() -> None:
         filename_prefix="timeseries_facing_alignment",
     )
 
-    # (4) region_alignment
     save_sensor_metric_timeseries(
         sensor_df,
         output_dir,
@@ -361,7 +403,6 @@ def main() -> None:
         filename_prefix="timeseries_region_alignment",
     )
 
-    # (5) distance_alignment
     save_sensor_metric_timeseries(
         sensor_df,
         output_dir,
@@ -369,8 +410,15 @@ def main() -> None:
         title_prefix="Distance alignment over time",
         filename_prefix="timeseries_distance_alignment",
     )
+    
+    save_sensor_metric_timeseries(
+        sensor_df,
+        output_dir,
+        metric="fov_alignment",
+        title_prefix="FOV alignment over time",
+        filename_prefix="timeseries_distance_alignment",
+    )
 
-    # (6) contribution = (region_alignment + facing_alignment) * distance_alignment
     save_sensor_metric_timeseries(
         sensor_df,
         output_dir,

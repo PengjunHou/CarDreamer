@@ -22,7 +22,7 @@ from .toolkit import _dist_m
 from .toolkit import NetResource, V2VMessage, LatencyModel, SimpleWirelessLatency, _tx_bytes_for_latency
 from .toolkit import Observer, payload_fn_llm
 from .toolkit import get_vehicle_pos
-from .toolkit import VehicleNodeGraphBuilder, GraphBuildConfig
+from .toolkit import VehicleNodeGraphBuilder, GraphBuildConfig, compute_query_direction_from_observer
 
 
 class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
@@ -86,7 +86,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             window_s=float(getattr(graph_cfg, "window_s", 2.0)),
             Tmax=int(getattr(graph_cfg, "tmax", 15)),
             max_nodes=int(getattr(graph_cfg, "max_nodes", 3)),
-            feat_dim_max=int(getattr(graph_cfg, "feat_dim_max", 1024)),
+            feat_dim_max=int(getattr(graph_cfg, "feat_dim_max", 128)),
             star_graph=bool(getattr(graph_cfg, "star_graph", True)),
         )
         self._graph_builder = VehicleNodeGraphBuilder(cfg)
@@ -103,7 +103,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         self._vlm_eval_period = int(getattr(vlm_cfg, "eval_period", 1))
         self._vlm_image_obs_key = str(getattr(vlm_cfg, "image_obs_key", "camera"))
         self._vlm_local_files_only = bool(getattr(vlm_cfg, "local_files_only", False))
-        self._vlm_shared_source = str(getattr(vlm_cfg, "shared_source", "raw"))  # received_feat | raw
+        self._vlm_shared_source = str(getattr(vlm_cfg, "shared_source", "received_feat"))  # received_feat | raw
         self._vlm_received_window_s = float(getattr(vlm_cfg, "received_window_s", 2.0))
         self._vlm_max_msgs_per_sender = int(getattr(vlm_cfg, "max_msgs_per_sender", 20))
         self._vlm_max_images_per_sender_for_inference = int(
@@ -136,7 +136,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         self._vlm_sensor_fov_deg = float(getattr(vlm_cfg, "sensor_fov_deg", 120.0)) #TODO
 
         self._vlm_do_sample = bool(getattr(vlm_cfg, "do_sample", False))
-        self._vlm_max_new_tokens = int(getattr(vlm_cfg, "max_new_tokens", 96))
+        self._vlm_score_max_new_tokens = int(getattr(vlm_cfg, "score_max_new_tokens", 128))
         self._vlm_temperature = float(getattr(vlm_cfg, "temperature", 0.0))
         self._vlm_top_p = float(getattr(vlm_cfg, "top_p", 0.9))
 
@@ -178,30 +178,30 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             {
                 "id": "clg_left_rear_vehicle",
                 "type": "clg",
-                "query": "Is there a vehicle in the left-rear region of the ego vehicle?",
-                "positive": "There is a vehicle in the left-rear region of the ego vehicle.",
-                "negative": "There is no vehicle in the left-rear region of the ego vehicle.",
+                "query": "Is there a vehicle in the left-rear region of the vehicle?",
+                "positive": "There is a vehicle in the left-rear region of the vehicle.",
+                "negative": "There is no vehicle in the left-rear region of the vehicle.",
             },
             {
                 "id": "clg_right_rear_vehicle",
                 "type": "clg",
-                "query": "Is there a vehicle in the right-rear region of the ego vehicle?",
-                "positive": "There is a vehicle in the right-rear region of the ego vehicle.",
-                "negative": "There is no vehicle in the right-rear region of the ego vehicle.",
+                "query": "Is there a vehicle in the right-rear region of the vehicle?",
+                "positive": "There is a vehicle in the right-rear region of the vehicle.",
+                "negative": "There is no vehicle in the right-rear region of the vehicle.",
             },
             {
                 "id": "clg_right_front_vehicle",
                 "type": "clg",
-                "query": "Is there a vehicle in the right-front region of the ego vehicle?",
-                "positive": "There is a vehicle in the right-front region of the ego vehicle.",
-                "negative": "There is no vehicle in the right-front region of the ego vehicle.",
+                "query": "Is there a vehicle in the right-front region of the vehicle?",
+                "positive": "There is a vehicle in the right-front region of the vehicle.",
+                "negative": "There is no vehicle in the right-front region of the vehicle.",
             },
             {
                 "id": "clg_left_front_vehicle",
                 "type": "clg",
-                "query": "Is there a vehicle in the left-front region of the ego vehicle?",
-                "positive": "There is a vehicle in the left-front region of the ego vehicle.",
-                "negative": "There is no vehicle in the left-front region of the ego vehicle.",
+                "query": "Is there a vehicle in the left-front region of the vehicle?",
+                "positive": "There is a vehicle in the left-front region of the vehicle.",
+                "negative": "There is no vehicle in the left-front region of the vehicle.",
             },
         ]
 
@@ -260,26 +260,39 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
 
     def _wrap_angle(self, angle_rad: float) -> float:
         return (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
+
+
     def _question_target_angle_rad(self, question_cfg: Dict[str, Any]) -> float:
         """
-        Return the target angle in the ego-local frame.
-        0     : front
-        +pi/2 : left
-        -pi/2 : right
-        +/-pi : rear
+        Return the target angle in the ego-local semantic frame,
+        consistent with the simulator convention:
+
+            0       : front
+            +pi/2   : right
+            -pi/2   : left
+            +/-pi   : rear
+
+        This matches the environment's angle convention:
+        - angle is measured from +X
+        - clockwise is positive
+        - counterclockwise is negative
         """
-        qid = str(question_cfg.get("id", "")).lower()
-        if "left_rear" in qid:
-            return 3.0 * math.pi / 4.0
-        if "right_rear" in qid:
-            return -3.0 * math.pi / 4.0
-        if "right_front" in qid:
-            return -math.pi / 4.0
-        if "left_front" in qid:
-            return math.pi / 4.0
-        if "left_vehicle_speed" in qid or "left_side" in qid:
-            return math.pi / 2.0
-        return 0.0
+        # qid = str(question_cfg.get("id", "")).lower()
+
+        # if "left_rear" in qid:
+        #     return -3.0 * math.pi / 4.0
+        # if "right_rear" in qid:
+        #     return 3.0 * math.pi / 4.0
+        # if "right_front" in qid:
+        #     return math.pi / 4.0
+        # if "left_front" in qid:
+        #     return -math.pi / 4.0
+        # if "left_vehicle_speed" in qid or "left_side" in qid:
+        #     return -math.pi / 2.0
+
+        # return 0.0
+        dx_local, dy_local = self._question_target_offset_xy(question_cfg)
+        return self._wrap_angle(math.atan2(dy_local, dx_local))
 
 
     def _question_target_angle_global_rad(
@@ -290,15 +303,81 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         """
         Convert the ego-local target angle into the global frame.
 
-        bearing_from_ego_rad is currently computed in the global frame:
-            atan2(sensor_y - ego_y, sensor_x - ego_x)
+        In this simulator:
+        - yaw is measured from global +X
+        - clockwise is positive
 
-        So the target angle used for region_alignment must also be in the
-        global frame, otherwise we compare angles from different frames.
+        So the ego-local target angle can be added directly to ego yaw.
         """
         target_local = self._question_target_angle_rad(question_cfg)
         ego_yaw_rad = math.radians(float(ego_pose.get("yaw", 0.0)))
         return self._wrap_angle(ego_yaw_rad + target_local)
+
+    def _question_target_offset_xy(self, question_cfg: Dict[str, Any]) -> tuple[float, float]:
+        """
+        Return the queried target-region center in the ego-local frame.
+
+        Ego-local semantic frame:
+            +x = front
+            -x = rear
+            +y = right
+            -y = left
+
+        This is chosen to match the simulator's clockwise-positive convention.
+        """
+        qid = str(question_cfg.get("id", "")).lower()
+
+        front_d = 8.0
+        side_d = 3.5
+
+        if "left_rear" in qid:
+            return (-front_d, -side_d)
+        if "right_rear" in qid:
+            return (-front_d, side_d)
+        if "right_front" in qid:
+            return (front_d, side_d)
+        if "left_front" in qid:
+            return (front_d, -side_d)
+        if "left_vehicle_speed" in qid or "left_side" in qid:
+            return (0.0, -side_d)
+
+        return (front_d, 0.0)
+
+
+    def _question_target_point_global(
+        self,
+        question_cfg: Dict[str, Any],
+        ego_pose: Dict[str, float],
+    ) -> Dict[str, float]:
+        """
+        Convert the queried target-region center from ego-local frame to global frame.
+
+        Environment convention:
+        - global +X points right
+        - global +Y points down
+        - clockwise rotation is positive
+
+        Under this convention, rotating a local vector by yaw uses:
+
+            x_global = cos(yaw) * x_local + sin(yaw) * y_local
+            y_global = -sin(yaw) * x_local + cos(yaw) * y_local
+        """
+        dx_local, dy_local = self._question_target_offset_xy(question_cfg)
+
+        ego_x = float(ego_pose.get("x", 0.0))
+        ego_y = float(ego_pose.get("y", 0.0))
+        ego_yaw_rad = math.radians(float(ego_pose.get("yaw", 0.0)))
+
+        c = math.cos(ego_yaw_rad)
+        s = math.sin(ego_yaw_rad)
+
+        dx_global = c * dx_local - s * dy_local
+        dy_global = s * dx_local + c * dy_local
+
+        return {
+            "x": ego_x + dx_global,
+            "y": ego_y + dy_global,
+        }
     
     def _compute_single_image_embedding_from_array(self, img_np):
         raise RuntimeError(
@@ -326,7 +405,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         return (
             "You are analyzing a single driving image for cooperative perception. "
             "Describe only safety-relevant facts visible in the image. "
-            "Focus on regions relative to the ego vehicle: front, rear, left-front, right-front, left-rear, right-rear. "
+            "Focus on regions relative to the vehicle: front, rear, left-front, right-front, left-rear, right-rear. "
             "Mention vehicles, pedestrians, cyclists, lane occupancy, and visibility quality such as visible / partially visible / occluded / unclear / absent. "
             "Use short factual sentences only. Do not speculate.\n\n"
             "Return exactly this format:\n"
@@ -357,7 +436,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             f"Query: {query}\n"
             f"Positive statement: {positive}\n"
             f"Negative statement: {negative}\n\n"
-            "Evidence from multiple vehicles is provided below. Some evidence may be partial, occluded, or uncertain. "
+            "Evidence is provided below. Some evidence may be partial, occluded, or uncertain. "
             "Use only the provided evidence. Do not assume unseen facts.\n\n"
             f"EVIDENCE:\n{fused_evidence if fused_evidence else 'No textual evidence provided.'}\n\n"
             "Return JSON only, with this schema:\n"
@@ -444,7 +523,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         inputs = {k: v.to(model_device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
         gen_kwargs = {
-            "max_new_tokens": int(max_new_tokens or self._vlm_max_new_tokens),
+            "max_new_tokens": int(max_new_tokens),
             "do_sample": bool(self._vlm_do_sample),
         }
         if bool(self._vlm_do_sample):
@@ -463,19 +542,19 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         )[0]
         return raw_text.strip()
 
-    def _compute_single_image_description(self, image: Image.Image) -> str:
+    def _compute_single_image_description(self, image: Image.Image, token_size) -> str:
         if self._vlm_model is None or self._vlm_processor is None:
             raise RuntimeError("Qwen2-VL model is not initialized.")
         if image is None:
             raise ValueError("Image cannot be converted to PIL for Qwen2-VL captioning.")
         prompt = self._build_scene_description_prompt()
-        return self._run_qwen_generation(prompt=prompt, image=image, max_new_tokens=160)
+        return self._run_qwen_generation(prompt=prompt, image=image, max_new_tokens=token_size)
 
-    def _compute_single_image_description_from_array(self, img_np):
+    def _compute_single_image_description_from_array(self, img_np, token_size):
         image = Image.fromarray(img_np).convert("RGB")
         if image is None:
             raise ValueError("img_np cannot be converted to PIL image")
-        return self._compute_single_image_description(image)
+        return self._compute_single_image_description(image, token_size)
 
     def _parse_language_scores(self, raw_text: str) -> Dict[str, Any]:
         parsed = self._extract_first_json_object(raw_text) or {}
@@ -529,13 +608,13 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         fused_evidence: str,
     ) -> Dict[str, Any]:
         prompt = self._build_language_scoring_prompt(question_cfg, fused_evidence)
-        raw_text = self._run_qwen_generation(prompt=prompt, image=None, max_new_tokens=128)
+        raw_text = self._run_qwen_generation(prompt=prompt, image=None, max_new_tokens=self._vlm_score_max_new_tokens)     # 这里的max_new_token不影响传输延迟
         return self._parse_language_scores(raw_text)
 
     def _build_ego_sensor_instances(self, ego_image: Image.Image) -> List[Dict[str, Any]]:
         tf = self.ego.get_transform()
         yaw_rad = math.radians(float(tf.rotation.yaw))
-        scene_description = self._compute_single_image_description(ego_image)
+        scene_description = self._compute_single_image_description(ego_image, token_size=self.feature_size)
         return [{
             "sender_id": int(self.ego.id),
             "sensor_name": "cam0",
@@ -601,6 +680,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
                 "visibility_score": float(sum(1.0 - float(x.get("uncertainty", x.get("unknown_score", 1.0))) for x in items) / n),
                 "answer": str(items[-1].get("answer", "uncertain")),
                 "num_images": int(len(items)),
+                "latency": float(min(float(x.get("received_age_s", 0.0)) for x in items)),
                 "received_age_s_mean": float(sum(float(x.get("received_age_s", 0.0)) for x in items) / n),
                 "pose": dict(items[0].get("pose", {})),
                 "sensor_yaw_rad": float(items[0].get("sensor_yaw_rad", 0.0)),
@@ -639,75 +719,227 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         sensor_score: Dict[str, Any],
         ego_pose: Dict[str, float],
     ) -> Dict[str, float]:
+        """
+        Build geometric features in the simulator's global frame.
+
+        Assumed simulator convention:
+        - +X points right
+        - +Y points down
+        - angle is measured from +X
+        - clockwise is positive
+
+        Under this convention, atan2(dy, dx) is consistent with the simulator angle.
+        """
         sx = float(sensor_score.get("pose", {}).get("x", 0.0))
         sy = float(sensor_score.get("pose", {}).get("y", 0.0))
-        dx = sx - float(ego_pose.get("x", 0.0))
-        dy = sy - float(ego_pose.get("y", 0.0))
+
+        ex = float(ego_pose.get("x", 0.0))
+        ey = float(ego_pose.get("y", 0.0))
+
+        dx = sx - ex
+        dy = sy - ey
         d = math.sqrt(dx * dx + dy * dy)
-        bearing_from_ego = math.atan2(dy, dx) if d > 1e-6 else 0.0
-        bearing_to_ego = math.atan2(-dy, -dx) if d > 1e-6 else 0.0
+
+        if d > 1e-6:
+            # ego -> sensor
+            bearing_from_ego = math.atan2(dy, dx)
+            # sensor -> ego
+            bearing_to_ego = math.atan2(-dy, -dx)
+        else:
+            bearing_from_ego = 0.0
+            bearing_to_ego = 0.0
+
         psi = float(sensor_score.get("sensor_yaw_rad", 0.0))
+
         return {
+            "sensor_x": float(sx),
+            "sensor_y": float(sy),
+            "ego_x": float(ex),
+            "ego_y": float(ey),
             "dx": float(dx),
             "dy": float(dy),
             "distance_m": float(d),
             "bearing_from_ego_rad": float(bearing_from_ego),
             "bearing_to_ego_rad": float(bearing_to_ego),
+            "bearing_from_ego_deg": float((math.degrees(bearing_from_ego) + 180.0) % 360.0 - 180.0),
+            "bearing_to_ego_deg": float((math.degrees(bearing_to_ego) + 180.0) % 360.0 - 180.0),
             "sin_theta": float(math.sin(bearing_from_ego)),
             "cos_theta": float(math.cos(bearing_from_ego)),
             "sensor_yaw_rad": float(psi),
+            "sensor_yaw_deg": float((math.degrees(psi) + 180.0) % 360.0 - 180.0),
             "sin_psi": float(math.sin(psi)),
             "cos_psi": float(math.cos(psi)),
         }
-
+        
     def _compute_sensor_importance_maps(
         self,
         question_cfg: Dict[str, Any],
         sensor_mean_scores: Dict[str, Dict[str, Any]],
         ego_pose: Dict[str, float],
     ) -> Dict[str, Dict[str, Any]]:
+        """
+        Compute per-sensor importance weights for the queried region.
+
+        Definitions:
+        - region_alignment:
+            Is the sensor spatially located on the useful side of the ego vehicle?
+        - facing_alignment:
+            Is the sensor heading toward the queried target-region center?
+        - fov_alignment:
+            Is the queried target-region center inside the sensor FOV?
+        - distance_alignment:
+            Is the sensor close enough to be useful?
+        """
         target_angle = self._question_target_angle_global_rad(question_cfg, ego_pose)
+        target_angle_deg = (math.degrees(target_angle) + 180.0) % 360.0 - 180.0
+        target_point = self._question_target_point_global(question_cfg, ego_pose)
+
         tau = max(float(self._vlm_importance_distance_tau), 1e-6)
+        half_fov = 0.5 * math.radians(float(self._vlm_sensor_fov_deg))
+
         logits: List[float] = []
         sensor_keys: List[str] = []
         details: Dict[str, Dict[str, Any]] = {}
-        # 把rad转化为angle
-        target_angle_deg = (math.degrees(target_angle) + 180) % 360 - 180
+
+        ego_x = float(ego_pose.get("x", 0.0))
+        ego_y = float(ego_pose.get("y", 0.0))
 
         for sensor_key, sensor_score in sensor_mean_scores.items():
             feats = self._build_sensor_position_features(sensor_score, ego_pose)
-            d = feats["distance_m"]
+            d = float(feats["distance_m"])
+
+            sensor_x = feats.get("sensor_x", None)
+            sensor_y = feats.get("sensor_y", None)
+            if sensor_x is None or sensor_y is None:
+                pose = sensor_score.get("pose", {})
+                sensor_x = float(pose.get("x", ego_x))
+                sensor_y = float(pose.get("y", ego_y))
+            else:
+                sensor_x = float(sensor_x)
+                sensor_y = float(sensor_y)
+
+            sensor_yaw_rad = float(feats["sensor_yaw_rad"])
+
+            # sensor -> queried target region center
+            bearing_to_target_rad = math.atan2(
+                float(target_point["y"]) - sensor_y,
+                float(target_point["x"]) - sensor_x,
+            )
+
+            # If your simulator angles are already produced in the same convention
+            # as sensor_yaw_rad / bearing_from_ego_rad / bearing_to_ego_rad,
+            # then wrap_angle difference is still valid.
+            angle_diff_target = self._wrap_angle(sensor_yaw_rad - bearing_to_target_rad)
+
+            # heading alignment to target-region center
+            facing_alignment = 0.5 * (1.0 + math.cos(angle_diff_target))
+
+            # FOV gate
+            norm = angle_diff_target / max(half_fov, 1e-6)
+            if abs(norm) <= 1.0:
+                fov_alignment = 0.5 * (1.0 + math.cos(0.5 * norm * math.pi)) # TODO: 这里如果在边缘，就变成0了，不至于，稍微缩小下边缘衰退
+            else:
+                fov_alignment = 0.0
 
             if sensor_score["is_ego"]:
-                angle_diff = self._wrap_angle(feats["sensor_yaw_rad"] - target_angle)
-                half_fov = math.radians(self._vlm_sensor_fov_deg)
-                if abs(angle_diff) <= half_fov:
-                    region_alignment = 0.5 * (1.0 + math.cos(angle_diff))
-                    facing_alignment = region_alignment
-                else:
-                    region_alignment = 0.0
-                    facing_alignment = 0.0
+                region_alignment = 1.0
                 distance_alignment = 1.0
             else:
-                region_alignment = 0.5 * (1.0 + math.cos(self._wrap_angle(feats["bearing_from_ego_rad"] - target_angle)))
-                facing_alignment = 0.5 * (1.0 + math.cos(self._wrap_angle(feats["sensor_yaw_rad"] - feats["bearing_to_ego_rad"])))
+                region_alignment = 0.5 * (
+                    1.0
+                    + math.cos(
+                        self._wrap_angle(
+                            float(feats["bearing_from_ego_rad"]) - target_angle
+                        )
+                    )
+                )
                 distance_alignment = math.exp(-d / tau)
+                
+            logit = (
+                float(region_alignment)
+                * float(facing_alignment)
+                * float(fov_alignment)
+                * float(distance_alignment)
+            )
 
-            fov_alignment = 0.0
-            text_evidence = float(max(0.0, min(1.0, sensor_score.get("evidence", 0.0))))
-            logit = (float(region_alignment) + float(facing_alignment)) * float(distance_alignment) * (0.5 + 0.5 * text_evidence)
             logits.append(float(logit))
             sensor_keys.append(sensor_key)
+
             details[sensor_key] = {
                 **feats,
+                "sensor_x": float(sensor_x),
+                "sensor_y": float(sensor_y),
+                "target_point_x": float(target_point["x"]),
+                "target_point_y": float(target_point["y"]),
                 "target_angle_global_rad": float(target_angle),
                 "target_angle": float(target_angle_deg),
+                "bearing_to_target_rad": float(bearing_to_target_rad),
+                "bearing_to_target_deg": float(
+                    (math.degrees(bearing_to_target_rad) + 180.0) % 360.0 - 180.0
+                ),
+                "angle_diff_target_rad": float(angle_diff_target),
+                "angle_diff_target_deg": float(
+                    (math.degrees(angle_diff_target) + 180.0) % 360.0 - 180.0
+                ),
                 "region_alignment": float(region_alignment),
                 "fov_alignment": float(fov_alignment),
                 "facing_alignment": float(facing_alignment),
                 "distance_alignment": float(distance_alignment),
                 "raw_logit": float(logit),
             }
+
+        denom = sum(math.exp(v) for v in logits) + 1e-8
+        for sensor_key, logit in zip(sensor_keys, logits):
+            details[sensor_key]["importance_weight"] = logit # float(math.exp(logit) / denom)   # TODO: 要不要归一化，如果归一化，当只有ego时，ego权重就变成1了，反而不对
+
+    # def _compute_sensor_importance_maps(
+    #     self,
+    #     question_cfg: Dict[str, Any],
+    #     sensor_mean_scores: Dict[str, Dict[str, Any]],
+    #     ego_pose: Dict[str, float],
+    # ) -> Dict[str, Dict[str, Any]]:
+    #     target_angle = self._question_target_angle_global_rad(question_cfg, ego_pose)
+    #     tau = max(float(self._vlm_importance_distance_tau), 1e-6)
+    #     logits: List[float] = []
+    #     sensor_keys: List[str] = []
+    #     details: Dict[str, Dict[str, Any]] = {}
+    #     # 把rad转化为angle
+    #     target_angle_deg = (math.degrees(target_angle) + 180) % 360 - 180
+
+    #     for sensor_key, sensor_score in sensor_mean_scores.items():
+    #         feats = self._build_sensor_position_features(sensor_score, ego_pose)
+    #         d = feats["distance_m"]
+
+    #         if sensor_score["is_ego"]:
+    #             angle_diff = self._wrap_angle(feats["sensor_yaw_rad"] - target_angle)
+    #             half_fov = math.radians(self._vlm_sensor_fov_deg)
+    #             if abs(angle_diff) <= half_fov:
+    #                 region_alignment = 0.5 * (1.0 + math.cos(angle_diff))
+    #                 facing_alignment = region_alignment
+    #             else:
+    #                 region_alignment = 0.0
+    #                 facing_alignment = 0.0
+    #             distance_alignment = 1.0
+    #         else:
+    #             region_alignment = 0.5 * (1.0 + math.cos(self._wrap_angle(feats["bearing_from_ego_rad"] - target_angle)))
+    #             facing_alignment = 0.5 * (1.0 + math.cos(self._wrap_angle(feats["sensor_yaw_rad"] - feats["bearing_to_ego_rad"])))
+    #             distance_alignment = math.exp(-d / tau)
+
+    #         fov_alignment = 0.0
+    #         text_evidence = float(max(0.0, min(1.0, sensor_score.get("evidence", 0.0))))
+    #         logit = (float(region_alignment) + float(facing_alignment)) * float(distance_alignment) * (0.5 + 0.5 * text_evidence)
+    #         logits.append(float(logit))
+    #         sensor_keys.append(sensor_key)
+    #         details[sensor_key] = {
+    #             **feats,
+    #             "target_angle_global_rad": float(target_angle),
+    #             "target_angle": float(target_angle_deg),
+    #             "region_alignment": float(region_alignment),
+    #             "fov_alignment": float(fov_alignment),
+    #             "facing_alignment": float(facing_alignment),
+    #             "distance_alignment": float(distance_alignment),
+    #             "raw_logit": float(logit),
+    #         }
 
         if not sensor_keys:
             return {"per_sensor": {}, "per_sender_positive": {}, "per_sender_negative": {}}
@@ -721,8 +953,8 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             sensor_score = sensor_mean_scores[sensor_key]
             sender_id = int(sensor_score["sender_id"])
             per_sensor[sensor_key] = {
-                "importance_positive": float(w),
-                "importance_negative": float(w),
+                # "importance_positive": float(w),        # TODO：这里改个名吧，importance_positive 还以为是权重
+                # "importance_negative": float(w),
                 **details[sensor_key],
             }
             per_sender_positive[sender_id] += float(w)
@@ -734,25 +966,28 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             "per_sender_negative": {int(k): float(v) for k, v in per_sender_negative.items()},
         }
 
-    def _compute_importance_penalty(
+    def _compute_information(
         self,
         sensor_mean_scores: Dict[str, Dict[str, Any]],
         importance_maps: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Any]:
-        per_sensor_penalty: Dict[str, float] = {}
-        total_penalty = 0.0
+        per_sensor_information: Dict[str, float] = {}
+        total_information = 0.0
         for sensor_key, sensor_score in sensor_mean_scores.items():
             imp = importance_maps.get("per_sensor", {}).get(sensor_key, {})
-            m = float(imp.get("importance_positive", 0.0))
-            evidence = max(float(sensor_score.get("evidence", 0.0)), 1e-6)
-            penalty = m * (-math.log(evidence)) # TODO: 这里的定义，参考老师的意见
-            per_sensor_penalty[sensor_key] = float(penalty)
-            total_penalty += float(penalty)
+            sender_id = int(sensor_score["sender_id"])
+            is_ego = bool(sensor_score.get("is_ego", False))
+            sender_weight = self._get_sender_weight(sender_id, is_ego)
+            m = float(imp.get("importance_weight", 0.0)) * sender_weight
+            s_pos, s_neg, s_unk = sensor_score["positive_score"], sensor_score["negative_score"], sensor_score["unknown_score"]
+            information = m * (math.log(1+s_pos) + math.log(1+s_neg) + math.log(1+s_unk)) # TODO: 这里的定义，参考老师的意见
+            per_sensor_information[sensor_key] = float(information)
+            total_information += float(information)
         return {
             "beta": float(self._vlm_sc_beta),
-            "unweighted_penalty": float(total_penalty),
-            "weighted_penalty": float(self._vlm_sc_beta * total_penalty),
-            "per_sensor_penalty": per_sensor_penalty,
+            "unweighted_information": float(total_information),
+            "weighted_information": float(self._vlm_sc_beta * total_information),
+            "per_sensor_information": per_sensor_information,
         }
 
     def _get_sender_weight(self, sender_id: int, is_ego: bool) -> float:
@@ -768,12 +1003,11 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         per_sensor_importance = importance_maps.get("per_sensor", {})
         per_sensor_details: List[Dict[str, Any]] = []
 
-        weighted_pos = 0.0
-        weighted_neg = 0.0
-        weighted_unk = 0.0
-        total_weight = 0.0
-        total_support = 0.0
-        total_contrib = 0.0
+        total_pos = 0.0
+        total_neg = 0.0
+        total_unk = 0.0
+        total_evidence = 0.0
+        total_belief = 0.0
         ego_only = {
             "positive_score": 0.0,
             "negative_score": 0.0,
@@ -784,22 +1018,18 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             "answer": "uncertain",
         }
 
-        per_sender_w_pos: Dict[int, float] = defaultdict(float)
-        per_sender_w_neg: Dict[int, float] = defaultdict(float)
-        per_sender_w_unk: Dict[int, float] = defaultdict(float)
-        per_sender_support: Dict[int, float] = defaultdict(float)
-        per_sender_contrib: Dict[int, float] = defaultdict(float)
-        per_sender_w: Dict[int, float] = defaultdict(float)
-
         for sensor_key in sorted(sensor_mean_scores.keys()):
             sensor_score = sensor_mean_scores[sensor_key]
             imp = per_sensor_importance.get(sensor_key, {})
+            
+            latency = imp.get("latency", 0.0)
+            timeliness = math.exp(-latency)
 
-            importance_weight = float(imp.get("importance_positive", 0.0))
+            importance_weight = float(imp.get("importance_weight", 0.0))
             sender_id = int(sensor_score["sender_id"])
             is_ego = bool(sensor_score.get("is_ego", False))
             sender_weight = self._get_sender_weight(sender_id, is_ego)
-            sensor_weight = importance_weight * sender_weight
+            sensor_weight = importance_weight * sender_weight * timeliness
 
             s_pos = float(sensor_score.get("positive_score", 0.0))
             s_neg = float(sensor_score.get("negative_score", 0.0))
@@ -807,15 +1037,14 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             belief = float(sensor_score.get("belief", s_pos - s_neg))
             evidence = float(sensor_score.get("evidence", 1.0 - s_unk))
 
-            support = sensor_weight * evidence
-            contrib = support * abs(belief)
+            total_pos += sensor_weight * s_pos
+            total_neg += sensor_weight * s_neg
+            total_unk += sensor_weight * s_unk
+            total_evidence += sensor_weight * evidence
+            weight = sensor_weight * evidence       # final weight
+            contrib = weight * belief         
 
-            weighted_pos += sensor_weight * s_pos
-            weighted_neg += sensor_weight * s_neg
-            weighted_unk += sensor_weight * s_unk
-            total_weight += sensor_weight
-            total_support += support
-            total_contrib += contrib
+            total_belief += contrib
 
             if is_ego:
                 ego_only = {
@@ -824,7 +1053,11 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
                     "unknown_score": s_unk,
                     "belief": belief,
                     "evidence": evidence,
-                    "confidence": abs(belief) * evidence,
+                    "timeliness": timeliness,
+                    "importance_weight": importance_weight,
+                    "sender_weight": sender_weight,
+                    "weight": weight,
+                    "confidence": abs(belief) * weight,
                     "answer": str(sensor_score.get("answer", "uncertain")),
                 }
 
@@ -832,61 +1065,39 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
                 "sensor_key": sensor_key,
                 "sender_id": sender_id,
                 "is_ego": is_ego,
-                "importance_weight": importance_weight,
                 "sender_weight": sender_weight,
                 "sensor_weight": sensor_weight,
-                "support": support,
-                "contribution": contrib,
                 "positive_score": s_pos,
                 "negative_score": s_neg,
                 "unknown_score": s_unk,
                 "belief": belief,
                 "evidence": evidence,
-                "confidence": abs(belief) * evidence,
+                "timeliness": timeliness,
+                "importance_weight": importance_weight,
+                "sender_weight": sender_weight,
+                "weight": weight,
+                "confidence": abs(belief) * weight,
+                "answer": str(sensor_score.get("answer", "uncertain")),
             })
 
-            per_sender_w_pos[sender_id] += sensor_weight * s_pos
-            per_sender_w_neg[sender_id] += sensor_weight * s_neg
-            per_sender_w_unk[sender_id] += sensor_weight * s_unk
-            per_sender_support[sender_id] += support
-            per_sender_contrib[sender_id] += contrib
-            per_sender_w[sender_id] += sensor_weight
-
-        per_sender_aggregated: List[Dict[str, Any]] = []
-        for sender_id in sorted(per_sender_w.keys()):
-            sw = per_sender_w[sender_id]
-            ss = per_sender_support[sender_id]
-            belief = float(per_sender_contrib[sender_id] / ss) if ss > 0 else 0.0
-            per_sender_aggregated.append({
-                "sender_id": sender_id,
-                "total_importance_weight": float(sw),
-                "weighted_positive_score": float(per_sender_w_pos[sender_id] / sw) if sw > 0 else 0.0,
-                "weighted_negative_score": float(per_sender_w_neg[sender_id] / sw) if sw > 0 else 0.0,
-                "weighted_unknown_score": float(per_sender_w_unk[sender_id] / sw) if sw > 0 else 1.0,
-                "weighted_belief": belief,
-                "weighted_confidence": abs(belief),
-                "evidence": float(ss / sw) if sw > 0 else 0.0,
-            })
-
-        # TODO: 这里要不要除以total
-        final_belief = float(total_contrib / total_support) if total_support > 0 else 0.0
-        final_pos = float(weighted_pos / total_weight) if total_weight > 0 else 0.0
-        final_neg = float(weighted_neg / total_weight) if total_weight > 0 else 0.0
-        final_unk = float(weighted_unk / total_weight) if total_weight > 0 else 1.0
-        final_evidence = float(total_support / total_weight) if total_weight > 0 else 0.0
+        final_answer = "uncertain"
+        if total_pos > total_neg and total_pos > total_unk:
+            final_answer = "positive"
+        elif total_neg > total_pos and total_neg > total_unk:
+            final_answer = "negative"
+        else:
+            final_answer = "uncertain"
 
         return {
-            "positive_score": final_pos,
-            "negative_score": final_neg,
-            "unknown_score": final_unk,
-            "belief": final_belief,
-            "evidence": final_evidence,
-            "confidence": abs(final_belief),
-            "total_weight": float(total_weight),
-            "total_support": float(total_support),
+            "positive_score": total_pos,
+            "negative_score": total_neg,
+            "unknown_score": total_unk,
+            "belief": total_belief,
+            "evidence": total_evidence,
+            "confidence": abs(total_belief),
             "ego_only": ego_only,
             "per_sensor_details": per_sensor_details,
-            "per_sender_aggregated": per_sender_aggregated,
+            "answer": final_answer
         }
 
     # =========================================================
@@ -980,7 +1191,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             return None
 
         tf = actor.get_transform()      # TODO：这里应该用msg中的pos吧
-        received_age_steps = max(int(self._time_step) - int(msg.deliver_step), 0)
+        received_age_steps = max(int(self._time_step) - int(msg.created_step), 0)
         received_age_s = received_age_steps * self._get_fixed_dt()
 
         return {
@@ -1000,7 +1211,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             if image_np is None:
                 continue
             image = Image.fromarray(image_np).convert("RGB")
-            scene_description = self._compute_single_image_description(image)
+            scene_description = self._compute_single_image_description(image, self.feature_size)
             info = self._make_shared_info_from_actor(veh, image)
             info["scene_description"] = scene_description
             shared_infos.append(info)
@@ -1120,8 +1331,22 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             scene_description = str(sensor_info.get("scene_description", "")).strip()
             if not scene_description:
                 continue
-
-            scoring = self._score_question_from_language_evidence(question_cfg, scene_description)
+            
+            if sensor_info.get("is_ego"):
+                converted_question_cfg = None
+                scoring = self._score_question_from_language_evidence(question_cfg, scene_description)
+            else:
+                converted = compute_query_direction_from_observer(ego_pose=ego_pose, observer_pose=sensor_info.get("pose"),
+                                                                  question_id=question_cfg["id"])
+                converted_question_cfg = {
+                    "id": question_cfg["id"],
+                    "type": question_cfg["type"],
+                    "query": converted.query,
+                    "positive": converted.positive,
+                    "negative": converted.negative,
+                }
+                scoring = self._score_question_from_language_evidence(converted_question_cfg, scene_description)
+                
             per_sensor_instance_scores.append({
                 "sender_id": int(sensor_info["sender_id"]),
                 "sensor_name": str(sensor_info["sensor_name"]),
@@ -1129,6 +1354,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
                 "received_age_s": float(sensor_info.get("received_age_s", 0.0)),
                 "pose": dict(sensor_info.get("pose", {})),
                 "sensor_yaw_rad": float(sensor_info.get("sensor_yaw_rad", 0.0)),
+                "converted_query": converted_question_cfg["query"] if converted_question_cfg else None,
                 "scene_description": scene_description,
                 "language_evidence": scene_description,
                 **scoring,
@@ -1136,31 +1362,31 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
 
         sensor_mean_scores = self._aggregate_sensor_scores(per_sensor_instance_scores)
         importance_maps = self._compute_sensor_importance_maps(question_cfg, sensor_mean_scores, ego_pose)
-        importance_penalty = self._compute_importance_penalty(sensor_mean_scores, importance_maps)
+        information_level = self._compute_information(sensor_mean_scores, importance_maps)  #TODO： 目前penalty没用
         aggregated = self._weighted_confidence_aggregate(sensor_mean_scores, importance_maps)
         ego_score = aggregated["ego_only"]
 
-        fused_lines: List[str] = []
-        for sensor_key in sorted(sensor_mean_scores.keys()):
-            s = sensor_mean_scores[sensor_key]
-            region = "ego" if bool(s.get("is_ego", False)) else f"sender_{int(s.get('sender_id', -1))}"
-            desc = str(s.get("scene_description", "")).strip()
-            if desc:
-                fused_lines.append(f"[{region}] {desc}")
-        fused_evidence = "\n\n".join(fused_lines)
-        fused_reasoning = self._score_question_from_language_evidence(question_cfg, fused_evidence) if fused_evidence else {
-            "positive_score": 0.0,
-            "negative_score": 0.0,
-            "unknown_score": 1.0,
-            "uncertainty": 1.0,
-            "answer": "uncertain",
-            "reason": "",
-            "belief": 0.0,
-            "evidence": 0.0,
-            "ambiguity": 1.0,
-            "confidence": 0.0,
-            "raw_text": "",
-        }
+        # fused_lines: List[str] = []       # TODO: fused 当前有问题，至少缺少视角转换
+        # for sensor_key in sorted(sensor_mean_scores.keys()):
+        #     s = sensor_mean_scores[sensor_key]
+        #     region = "ego" if bool(s.get("is_ego", False)) else f"sender_{int(s.get('sender_id', -1))}"
+        #     desc = str(s.get("scene_description", "")).strip()
+        #     if desc:
+        #         fused_lines.append(f"[{region}] {desc}")
+        # fused_evidence = "\n\n".join(fused_lines)
+        # fused_reasoning = self._score_question_from_language_evidence(question_cfg, fused_evidence) if fused_evidence else {
+        #     "positive_score": 0.0,
+        #     "negative_score": 0.0,
+        #     "unknown_score": 1.0,
+        #     "uncertainty": 1.0,
+        #     "answer": "uncertain",
+        #     "reason": "",
+        #     "belief": 0.0,
+        #     "evidence": 0.0,
+        #     "ambiguity": 1.0,
+        #     "confidence": 0.0,
+        #     "raw_text": "",
+        # }
 
         per_sensor_scores_out: List[Dict[str, Any]] = []
         for sensor_key in sorted(sensor_mean_scores.keys()):
@@ -1169,7 +1395,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             per_sensor_scores_out.append({
                 **sensor_score,
                 **imp,
-                "penalty_term": float(importance_penalty["per_sensor_penalty"].get(sensor_key, 0.0)),
+                "information_term": float(information_level["per_sensor_information"].get(sensor_key, 0.0)),
             })
 
         return {
@@ -1184,8 +1410,8 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             "query_text": query_text,
             "positive_text": positive_text,
             "negative_text": negative_text,
-            "fused_language_evidence": fused_evidence,
-            "fused_reasoning": fused_reasoning,
+            # "fused_language_evidence": fused_evidence,
+            # "fused_reasoning": fused_reasoning,
             "per_sensor_scores": per_sensor_scores_out,
             "sender_importance_positive": importance_maps.get("per_sender_positive", {}),
             "sender_importance_negative": importance_maps.get("per_sender_negative", {}),
@@ -1197,16 +1423,15 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
                 "belief": aggregated["belief"],
                 "evidence": aggregated["evidence"],
                 "confidence": aggregated["confidence"],
+                "answer": aggregated["answer"],
             },
             "aggregated_details": {
-                "total_weight": aggregated["total_weight"],
-                "total_support": aggregated["total_support"],
                 "per_sensor": aggregated["per_sensor_details"],
-                "per_sender": aggregated["per_sender_aggregated"],
             },
             "sc_part1": float(aggregated["confidence"]),
-            "sc_part2_penalty": float(importance_penalty["weighted_penalty"]),
-            "sc_part2_details": importance_penalty,
+            "sc_part2_information": float(information_level["weighted_information"]),
+            "sc_part2_details": information_level,
+            "confidecen_with_part2": aggregated["confidence"] + float(information_level["weighted_information"]),
             "confidence_gain": float(aggregated["confidence"] - ego_score.get("confidence", 0.0)),
         }
 

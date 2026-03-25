@@ -209,56 +209,56 @@ DEFAULT_QUERY_SPECS: Dict[str, QueryRegionSpec] = {
         offset_x_m=8.0,
         offset_y_m=3.5,
         canonical_label="left-front",
-        query_template="Is there a vehicle in the left-front region of the ego vehicle?",
+        query_template="Is there a vehicle in the left-front region of the vehicle?",
     ),
     "clg_right_front_vehicle": QueryRegionSpec(
         question_id="clg_right_front_vehicle",
         offset_x_m=8.0,
         offset_y_m=-3.5,
         canonical_label="right-front",
-        query_template="Is there a vehicle in the right-front region of the ego vehicle?",
+        query_template="Is there a vehicle in the right-front region of the vehicle?",
     ),
     "clg_left_rear_vehicle": QueryRegionSpec(
         question_id="clg_left_rear_vehicle",
         offset_x_m=-8.0,
         offset_y_m=3.5,
         canonical_label="left-rear",
-        query_template="Is there a vehicle in the left-rear region of the ego vehicle?",
+        query_template="Is there a vehicle in the left-rear region of the vehicle?",
     ),
     "clg_right_rear_vehicle": QueryRegionSpec(
         question_id="clg_right_rear_vehicle",
         offset_x_m=-8.0,
         offset_y_m=-3.5,
         canonical_label="right-rear",
-        query_template="Is there a vehicle in the right-rear region of the ego vehicle?",
+        query_template="Is there a vehicle in the right-rear region of the vehicle?",
     ),
     "clg_front_vehicle": QueryRegionSpec(
         question_id="clg_front_vehicle",
         offset_x_m=8.0,
         offset_y_m=0.0,
         canonical_label="front",
-        query_template="Is there a vehicle in the front region of the ego vehicle?",
+        query_template="Is there a vehicle in the front region of the vehicle?",
     ),
     "clg_rear_vehicle": QueryRegionSpec(
         question_id="clg_rear_vehicle",
         offset_x_m=-8.0,
         offset_y_m=0.0,
         canonical_label="rear",
-        query_template="Is there a vehicle in the rear region of the ego vehicle?",
+        query_template="Is there a vehicle in the rear region of the vehicle?",
     ),
     "clg_left_vehicle": QueryRegionSpec(
         question_id="clg_left_vehicle",
         offset_x_m=0.0,
         offset_y_m=3.5,
         canonical_label="left",
-        query_template="Is there a vehicle in the left region of the ego vehicle?",
+        query_template="Is there a vehicle in the left region of the vehicle?",
     ),
     "clg_right_vehicle": QueryRegionSpec(
         question_id="clg_right_vehicle",
         offset_x_m=0.0,
         offset_y_m=-3.5,
         canonical_label="right",
-        query_template="Is there a vehicle in the right region of the ego vehicle?",
+        query_template="Is there a vehicle in the right region of the vehicle?",
     ),
 }
 
@@ -301,8 +301,9 @@ class ConvertedQuery:
     observer_to_ego_distance_m: float
     target_offset_from_ego_local_xy: Tuple[float, float]
     target_offset_from_ego_view_label: str
-    prompt: str
-    short_prompt: str
+    query: str
+    positive: str
+    negative: str
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -375,12 +376,12 @@ def compute_query_direction_from_observer(
     observer_to_target_distance_m = math.hypot(target_local_xy[0], target_local_xy[1])
     observer_to_ego_distance_m = math.hypot(obs_x - ego_x, obs_y - ego_y)
 
-    prompt = build_member_view_prompt(
-        original_query=spec.query_template,
-        converted_direction=converted_direction,
-        canonical_label=spec.canonical_label,
-    )
-    short_prompt = build_member_view_short_query(converted_direction)
+    # prompt = build_member_view_prompt(
+    #     original_query=spec.query_template,
+    #     converted_direction=converted_direction,
+    #     canonical_label=spec.canonical_label,
+    # )
+    converted_ques = build_member_view_short_query(converted_direction)
 
     return ConvertedQuery(
         question_id=question_id,
@@ -399,8 +400,7 @@ def compute_query_direction_from_observer(
         observer_to_ego_distance_m=float(observer_to_ego_distance_m),
         target_offset_from_ego_local_xy=(float(off_x), float(off_y)),
         target_offset_from_ego_view_label=offset_label,
-        prompt=prompt,
-        short_prompt=short_prompt,
+        **converted_ques
     )
 
 
@@ -429,24 +429,28 @@ def build_member_view_prompt(
 ) -> str:
     dir_phrase = DIRECTION_PHRASE.get(converted_direction, converted_direction)
     return (
-        "This image is captured by a neighboring vehicle, not by the ego vehicle. "
-        "The question is still about the ego vehicle. "
-        f"From this camera's viewpoint, the queried region around the ego vehicle lies approximately in the {dir_phrase} direction. "
-        f"The original ego-centered region is the {canonical_label} region of the ego vehicle. "
-        "Answer only about that queried region around the ego vehicle. "
-        "If the ego vehicle or the queried region cannot be determined from this image, answer unknown. "
-        f"Question: {original_query}"
+        f"Is there a vehicle in the {dir_phrase} region of the vehicle?"
     )
+    
+    # return (
+    #     "This image is captured by a neighboring vehicle, not by the ego vehicle. "
+    #     "The question is still about the ego vehicle. "
+    #     f"From this camera's viewpoint, the queried region around the ego vehicle lies approximately in the {dir_phrase} direction. "
+    #     f"The original ego-centered region is the {canonical_label} region of the ego vehicle. "
+    #     "Answer only about that queried region around the ego vehicle. "
+    #     "If the ego vehicle or the queried region cannot be determined from this image, answer unknown. "
+    #     f"Question: {original_query}"
+    # )
 
 
 
 def build_member_view_short_query(converted_direction: str) -> str:
     dir_phrase = DIRECTION_PHRASE.get(converted_direction, converted_direction)
-    return (
-        "The question is still about the ego vehicle. "
-        f"From this camera's viewpoint, the queried region around the ego vehicle lies approximately in the {dir_phrase} direction. "
-        "Is there a vehicle in that queried region around the ego vehicle?"
-    )
+    return {
+        "query": f"Is there a vehicle in the {dir_phrase} region of the vehicle?",
+        "negative": f"There is no vehicle in the {dir_phrase} region of the vehicle.",
+        "positive": f"There is a vehicle in the {dir_phrase} region of the vehicle."
+    }
 
 
 

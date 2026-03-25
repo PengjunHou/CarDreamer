@@ -198,7 +198,7 @@ def payload_fn_llm(sender, obs, feature_size, *args, image_proc_fn=None, **kwarg
 
     if has_image and image_proc_fn is not None:
         try:
-            proc_out = image_proc_fn(img)
+            proc_out = image_proc_fn(img, feature_size) # feature_size 就是token size
 
             # 情况1：返回字符串 -> 当作 scene_description
             if isinstance(proc_out, str):
@@ -229,7 +229,7 @@ def payload_fn_llm(sender, obs, feature_size, *args, image_proc_fn=None, **kwarg
     return {
         "feat_dim": feature_size,       # TODO: 暂时没用
         "has_image": has_image,
-        "img_emb": feat,
+        "img_emb": None, #feat,
         "text": merged_text,
         "scene_description": scene_description,
     }
