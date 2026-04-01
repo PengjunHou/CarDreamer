@@ -39,26 +39,51 @@ def _safe_nbytes(payload: Any) -> int:
 # Feature-only size accounting
 # -----------------------------
 
+from typing import Any
+import numpy as np
+import torch
+
+
 def _feature_nbytes(payload: Any) -> int:
     if payload is None:
         return 0
+
     if isinstance(payload, np.ndarray):
         return int(payload.nbytes)
+
+    if isinstance(payload, torch.Tensor):
+        return int(payload.element_size() * payload.numel())
+
     if isinstance(payload, str):
         return len(payload.encode("utf-8"))
+
     if isinstance(payload, dict):
         if "scene_description" in payload and payload["scene_description"] is not None:
             return _feature_nbytes(payload["scene_description"])
-        if "feat" in payload and isinstance(payload["feat"], np.ndarray):
-            return int(payload["feat"].nbytes)
-        if "data" in payload and isinstance(payload["data"], np.ndarray):
-            return int(payload["data"].nbytes)
+
+        if "feat" in payload:
+            if isinstance(payload["feat"], np.ndarray):
+                print(f"size of feat: {payload['feat'].shape} with nbytes {payload['feat'].nbytes}")
+                return int(payload["feat"].nbytes)
+            if isinstance(payload["feat"], torch.Tensor):
+                nbytes = payload["feat"].element_size() * payload["feat"].numel()
+                print(f"size of feat: {tuple(payload['feat'].shape)} with nbytes {nbytes}")
+                return int(nbytes)
+
+        if "data" in payload:
+            if isinstance(payload["data"], np.ndarray):
+                return int(payload["data"].nbytes)
+            if isinstance(payload["data"], torch.Tensor):
+                return int(payload["data"].element_size() * payload["data"].numel())
+
         total = 0
         for v in payload.values():
             total += _feature_nbytes(v)
         return int(total)
+
     if isinstance(payload, (list, tuple)):
         return int(sum(_feature_nbytes(x) for x in payload))
+
     return 0
 
 def _tx_bytes_for_latency(payload: Any, overhead_bytes: int) -> int:

@@ -233,3 +233,18 @@ def payload_fn_llm(sender, obs, feature_size, *args, image_proc_fn=None, **kwarg
         "text": merged_text,
         "scene_description": scene_description,
     }
+    
+def payload_fn_cnn(sender, obs, feature_size, image_embed_fn):
+    img = obs.get("camera", None)
+    raw_message = obs.get("message", "")
+    raw_message_text = _safe_to_text(raw_message)
+
+    has_image = bool(img is not None)
+
+    if has_image and image_embed_fn is not None:
+        print("Extracting CNN features from image...")
+        feat = image_embed_fn(img) # feature_size 就是token size
+    else:
+        feat = img
+
+    return {"feat": feat, "feat_dim": feature_size, "has_image": True, "text": raw_message}

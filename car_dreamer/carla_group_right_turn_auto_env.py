@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import os
 import traceback
 from PIL import Image
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 import carla
 from agents.navigation.basic_agent import BasicAgent
@@ -78,7 +78,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         self._veh_net_res: Dict[int, NetResource] = {}
 
         # feature size
-        self.feature_size = int(getattr(self._config, "feature_size", 1024))
+        self.feature_size = int(getattr(self._config, "feature_size", 64))
 
         # graph builder
         graph_cfg = getattr(self._config, "graph", None)
@@ -97,7 +97,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         vlm_cfg = getattr(self._config, "vlm", None)
         self._vlm_enabled = bool(getattr(vlm_cfg, "enabled", True))
         # Default to Qwen2-VL; can be overridden in config
-        self._vlm_model_name = str(getattr(vlm_cfg, "model_name", "Qwen/Qwen2-VL-2B-Instruct"))
+        self._vlm_model_name = str(getattr(vlm_cfg, "model_name", "Qwen/Qwen2.5-VL-3B-Instruct"))
         # image_template is kept for config compatibility
         self._vlm_image_template = str(getattr(vlm_cfg, "image_template", "Analyze the driving scene."))
         self._vlm_eval_period = int(getattr(vlm_cfg, "eval_period", 1))
@@ -141,7 +141,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         self._vlm_top_p = float(getattr(vlm_cfg, "top_p", 0.9))
 
         # Qwen2-VL model and processor
-        self._vlm_model: Optional[Qwen2VLForConditionalGeneration] = None
+        self._vlm_model  = None
         self._vlm_processor: Optional[AutoProcessor] = None
 
         self._vlm_records: List[Dict[str, Any]] = []
@@ -159,7 +159,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         """Load Qwen2-VL model and processor."""
         print(f"[Qwen2-VL] Loading model: {self._vlm_model_name}")
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        self._vlm_model = Qwen2VLForConditionalGeneration.from_pretrained(
+        self._vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             self._vlm_model_name,
             torch_dtype=dtype,
             local_files_only=self._vlm_local_files_only,
@@ -171,7 +171,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._vlm_model = self._vlm_model.to(device)
         self._vlm_model.eval()
-        print(f"[Qwen2-VL] Model loaded on {device}.")
+
 
     def _build_vlm_questions(self) -> List[Dict[str, Any]]:
         return [
@@ -327,8 +327,8 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         """
         qid = str(question_cfg.get("id", "")).lower()
 
-        front_d = 8.0
-        side_d = 3.5
+        front_d = 4.0
+        side_d = 1.5
 
         if "left_rear" in qid:
             return (-front_d, -side_d)
@@ -401,22 +401,29 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         image = np.asarray(image)
         return Image.fromarray(image).convert("RGB")
 
-    def _build_scene_description_prompt(self) -> str:
+    def _build_scene_description_prompt(self, detail_level: str = "medium") -> str:
+        if detail_level == "short":
+            region_rule = "Use one short factual clause each row."
+        elif detail_level == "long":
+            region_rule = "Use four short factual clauses each row"
+        else:
+            region_rule = "Use two short factual clause each row."
+
         return (
-            "You are analyzing a single driving image for cooperative perception. "
-            "Describe only safety-relevant facts visible in the image. "
-            "Focus on regions relative to the vehicle: front, rear, left-front, right-front, left-rear, right-rear. "
-            "Mention vehicles, pedestrians, cyclists, lane occupancy, and visibility quality such as visible / partially visible / occluded / unclear / absent. "
-            "Use short factual sentences only. Do not speculate.\n\n"
-            "Return exactly this format:\n"
+            "This is a photograph captured by the vehicle's forward-facing camera, which is capable of capturing images only of the area directly in front of the vehicle.a view which includes the vehicle's own front end.\n"
+            "Descirbe the driving image. Describe only safety-relevant facts, especially other vehicles.\n"
+            "Use words [likely], [unknown], [certain], or [uncertain] to express the degree of certainty in your description.\n"
+
+            "Focus on these regions relative to the vehicle in the image:\n"
+            "front, left-front, right-front, rear, left-rear, right-rear.\n\n"
+
+            f"Return exactly this format.{region_rule}:\n"
             "Front: ...\n"
-            "Rear: ...\n"
             "Left-front: ...\n"
-            "Right-front: ...\n"
+            "Right-front: =...\n"
+            "Rear: ...\n"
             "Left-rear: ...\n"
             "Right-rear: ...\n"
-            "Visibility: ...\n"
-            "Key evidence: ..."
         )
 
     def _build_language_scoring_prompt(
@@ -429,6 +436,9 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         query = str(question_cfg.get("query", "")).strip()
         positive = str(question_cfg.get("positive", "")).strip()
         negative = str(question_cfg.get("negative", "")).strip()
+
+        evidence_text = fused_evidence if fused_evidence else "No textual evidence provided."
+
         return (
             "You are evaluating cooperative driving evidence for one binary question.\n"
             f"Question ID: {question_id}\n"
@@ -436,22 +446,127 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             f"Query: {query}\n"
             f"Positive statement: {positive}\n"
             f"Negative statement: {negative}\n\n"
-            "Evidence is provided below. Some evidence may be partial, occluded, or uncertain. "
-            "Use only the provided evidence. Do not assume unseen facts.\n\n"
-            f"EVIDENCE:\n{fused_evidence if fused_evidence else 'No textual evidence provided.'}\n\n"
-            "Return JSON only, with this schema:\n"
+            "Use only the provided evidence. Do not assume unseen facts.\n"
+            "Some evidence may be partial, occluded, weak, indirect, or conflicting.\n"
+            "If the evidence does not clearly support either side, do not guess.\n\n"
+            f"EVIDENCE:\n{evidence_text}\n\n"
+            "Return JSON only with this schema:\n"
             "{\n"
-            '  "positive_score": float in [0, 1],\n'
-            '  "negative_score": float in [0, 1],\n'
-            '  "uncertainty": float in [0, 1],\n'
-            '  "answer": "positive" or "negative" or "uncertain",\n'
+            '  "support_direction": "positive" or "negative" or "mixed" or "insufficient",\n'
+            '  "support_strength": "none" or "weak" or "moderate" or "strong",\n'
+            '  "visibility": "clear" or "partial" or "weak" or "insufficient",\n'
             '  "reason": "one short sentence"\n'
             "}\n\n"
-            "positive_score should be high only if the evidence supports the positive statement. "
-            "negative_score should be high only if the evidence supports the negative statement. "
-            "Use uncertainty for occlusion, ambiguity, weak evidence, or conflicting evidence."
+            "Scoring rubric:\n"
+            "- support_direction=positive: the evidence supports the positive statement more than the negative statement.\n"
+            "- support_direction=negative: the evidence supports the negative statement more than the positive statement.\n"
+            "- support_direction=mixed: there is support for both sides or conflicting evidence.\n"
+            "- support_direction=insufficient: the evidence is not enough to support either side.\n"
+            "- support_strength=strong: explicit, direct, and consistent evidence.\n"
+            "- support_strength=moderate: meaningful but incomplete evidence.\n"
+            "- support_strength=weak: slight indication only.\n"
+            "- support_strength=none: no meaningful support.\n"
+            "- visibility=clear: the relevant region/status is clearly described.\n"
+            "- visibility=partial: partially visible or partially described.\n"
+            "- visibility=weak: weakly described, vague, or low-quality evidence.\n"
+            "- visibility=insufficient: cannot reliably determine from the evidence.\n\n"
+            "Important rules:\n"
+            "- Do not use 'strong' unless the evidence is explicit and unambiguous.\n"
+            "- If evidence is partial, indirect, occluded, vague, or inferred, use at most 'moderate'.\n"
+            "- If the evidence cannot reliably determine the answer, use support_direction='insufficient'.\n"
+            "- Return JSON only."
         )
 
+    def _extract_first_json_object(self, text: str) -> Optional[Dict[str, Any]]:
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return None
+
+    def _run_qwen_generation(
+        self,
+        prompt: str,
+        image: Optional[Image.Image] = None,
+        max_new_tokens: Optional[int] = None,
+    ) -> str:
+        if self._vlm_model is None or self._vlm_processor is None:
+            raise RuntimeError("Qwen2-VL model is not initialized.")
+
+        model_device = next(self._vlm_model.parameters()).device
+
+        if image is not None:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            text = self._vlm_processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            inputs = self._vlm_processor(
+                text=[text],
+                images=[image],
+                padding=True,
+                return_tensors="pt",
+            )
+        else:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            text = self._vlm_processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            inputs = self._vlm_processor(
+                text=[text],
+                padding=True,
+                return_tensors="pt",
+            )
+
+        inputs = {k: v.to(model_device) if hasattr(v, "to") else v for k, v in inputs.items()}
+
+        gen_kwargs = {
+            "max_new_tokens": int(max_new_tokens),
+            "do_sample": bool(self._vlm_do_sample),
+        }
+        if bool(self._vlm_do_sample):
+            gen_kwargs["temperature"] = float(self._vlm_temperature)
+            gen_kwargs["top_p"] = float(self._vlm_top_p)
+
+        with torch.no_grad():
+            generated_ids = self._vlm_model.generate(**inputs, **gen_kwargs)
+
+        prompt_len = int(inputs["input_ids"].shape[1]) if "input_ids" in inputs else 0
+        generated_only = generated_ids[:, prompt_len:] if prompt_len > 0 else generated_ids
+        raw_text = self._vlm_processor.batch_decode(
+            generated_only,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        )[0]
+        return raw_text.strip()
+    
     def _extract_first_json_object(self, text: str) -> Optional[Dict[str, Any]]:
         text = text.strip()
         if not text:
@@ -556,6 +671,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             raise ValueError("img_np cannot be converted to PIL image")
         return self._compute_single_image_description(image, token_size)
 
+
     def _parse_language_scores(self, raw_text: str) -> Dict[str, Any]:
         parsed = self._extract_first_json_object(raw_text) or {}
 
@@ -565,29 +681,103 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             except Exception:
                 return float(default)
 
-        pos = _clip01(parsed.get("positive_score", 0.0), 0.0)
-        neg = _clip01(parsed.get("negative_score", 0.0), 0.0)
-        unc = _clip01(parsed.get("uncertainty", 1.0), 1.0)
-        total = pos + neg + unc
-        if total > 1e-8:
-            pos /= total
-            neg /= total
-            unc /= total
-        else:
-            pos, neg, unc = 0.0, 0.0, 1.0
-        answer = str(parsed.get("answer", "uncertain")).strip().lower()
-        if answer not in {"positive", "negative", "uncertain"}:
-            if pos > neg and pos > unc:
-                answer = "positive"
-            elif neg > pos and neg > unc:
-                answer = "negative"
+        def _norm_answer(ans: Any) -> str:
+            s = str(ans).strip().lower()
+            if s in {"positive", "negative", "uncertain"}:
+                return s
+            return "uncertain"
+
+        # ------------------------------------------------------------------
+        # New structured output path:
+        # {
+        #   "support_direction": "positive" | "negative" | "mixed" | "insufficient",
+        #   "support_strength": "none" | "weak" | "moderate" | "strong",
+        #   "visibility": "clear" | "partial" | "weak" | "insufficient",
+        #   "reason": "..."
+        # }
+        # ------------------------------------------------------------------
+        support_direction = str(parsed.get("support_direction", "")).strip().lower()
+        support_strength = str(parsed.get("support_strength", "")).strip().lower()
+        visibility = str(parsed.get("visibility", "")).strip().lower()
+        reason = str(parsed.get("reason", "")).strip()
+
+        has_new_schema = (
+            support_direction in {"positive", "negative", "mixed", "insufficient"}
+            or support_strength in {"none", "weak", "moderate", "strong"}
+            or visibility in {"clear", "partial", "weak", "insufficient"}
+        )
+
+        if has_new_schema:
+            strength_map = {
+                "none": 0.0,
+                "weak": 0.35,
+                "moderate": 0.75,
+                "strong": 0.95,
+            }
+            visibility_map = {
+                "clear": 1.00,
+                "partial": 0.70,
+                "weak": 0.40,
+                "insufficient": 0.15,
+            }
+
+            base = float(strength_map.get(support_strength, 0.0))
+            vis = float(visibility_map.get(visibility, 0.15))
+
+            # Base uncertainty comes primarily from visibility.
+            unc = 1.0 - vis
+
+            if support_direction == "positive":
+                pos = base * vis
+                neg = 0.0
+            elif support_direction == "negative":
+                pos = 0.0
+                neg = base * vis
+            elif support_direction == "mixed":
+                # Conflicting evidence: split support and keep uncertainty non-trivial.
+                pos = 0.5 * base * vis
+                neg = 0.5 * base * vis
+                unc = max(unc, 0.35)
+            else:  # insufficient
+                pos = 0.0
+                neg = 0.0
+                unc = max(unc, 0.85)
+
+            if support_direction == "positive":
+                answer = "positive" if pos >= neg else "uncertain"
+            elif support_direction == "negative":
+                answer = "negative" if neg >= pos else "uncertain"
             else:
                 answer = "uncertain"
-        reason = str(parsed.get("reason", "")).strip()
+
+        else:
+            # ------------------------------------------------------------------
+            # Backward-compatible old schema path:
+            # {
+            #   "positive_score": float,
+            #   "negative_score": float,
+            #   "uncertainty": float,
+            #   "answer": ...
+            # }
+            # ------------------------------------------------------------------
+            pos = _clip01(parsed.get("positive_score", 0.0), 0.0)
+            neg = _clip01(parsed.get("negative_score", 0.0), 0.0)
+            unc = _clip01(parsed.get("uncertainty", 1.0), 1.0)
+
+            answer = _norm_answer(parsed.get("answer", "uncertain"))
+            if answer not in {"positive", "negative", "uncertain"}:
+                if pos > neg and pos > unc:
+                    answer = "positive"
+                elif neg > pos and neg > unc:
+                    answer = "negative"
+                else:
+                    answer = "uncertain"
+
         belief = float(pos - neg)
         evidence = float(1.0 - unc)
         ambiguity = float(1.0 - abs(pos - neg))
         confidence = float(abs(belief) * evidence)
+
         return {
             "positive_score": float(pos),
             "negative_score": float(neg),
@@ -601,6 +791,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
             "confidence": confidence,
             "raw_text": raw_text,
         }
+
 
     def _score_question_from_language_evidence(
         self,
@@ -689,6 +880,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
                 "raw_outputs": [str(x.get("raw_text", "")) for x in items],
                 "scene_description": str(items[-1].get("scene_description", "")),
                 "language_evidence": str(items[-1].get("language_evidence", "")),
+                "converted_query": str(items[-1].get("converted_query", ""))
             }
         return aggregated
 
