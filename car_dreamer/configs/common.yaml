@@ -183,3 +183,14 @@ env:
     min_rate_factor: 0.2      # minimum rate factor (prevents rate from dropping to zero)
     jitter_s: 0.0             # random jitter added to latency (seconds, 0 = disabled)
     overhead_bytes: 64        # fixed protocol overhead per message (bytes)
+
+runtime_logging:
+  enabled: True
+  level: DEBUG
+  console_level: INFO
+  file_level: DEBUG
+  console: True
+  file: True
+  console_key_only: True
+  step_debug_interval: 1
+  driver_debug_shapes: False

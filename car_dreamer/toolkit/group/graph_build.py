@@ -29,6 +29,8 @@ class GraphBuildConfig:
 
 
 def _pad_feat(feat: np.ndarray, feat_dim_max: int) -> np.ndarray:
+    if feat is None:
+        return np.zeros((feat_dim_max,), dtype=np.float32)
     feat = np.asarray(feat, dtype=np.float32).reshape(-1)
     out = np.zeros((feat_dim_max,), dtype=np.float32)
     d = min(len(feat), feat_dim_max)
@@ -163,7 +165,8 @@ class VehicleNodeGraphBuilder:
                 feat = payload.get("feat", None)
                 feat_dim = int(payload.get("feat_dim", cfg.feat_dim_max))
                 if feat is None:
-                    continue
+                    feat = np.zeros((cfg.feat_dim_max,), dtype=np.float32)
+                    feat_dim = 0
 
                 sender_tf = sender_actor.get_transform()
                 rel_pose = _rel_pose_ego_frame(ego_tf, sender_tf)
@@ -378,4 +381,3 @@ class VehicleNodeGraphBuilder:
             out[e, 1] = dy
             out[e, 2] = dist
         return out
-

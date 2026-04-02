@@ -1,4 +1,5 @@
 import datetime
+import logging
 import warnings
 
 import embodied
@@ -6,6 +7,13 @@ import ruamel.yaml as yaml
 
 import car_dreamer
 import dreamerv3
+from runtime_logging import (
+    DEFAULT_RUNTIME_LOGGING_CONFIG,
+    configure_runtime_logging,
+    get_runtime_logger,
+    log_key_event,
+)
+from train_config_merge import diff_explicit_config_overrides
 
 warnings.filterwarnings("ignore", ".*truncated to dtype int32.*")
 
@@ -44,18 +52,74 @@ def main(argv=None):
     model_configs = yaml.YAML(typ="safe").load((embodied.Path(__file__).parent / "dreamerv3.yaml").read())
     config = embodied.Config({"dreamerv3": model_configs["defaults"]})
     config = config.update({"dreamerv3": model_configs["small"]})
+    config = config.update({"runtime_logging": DEFAULT_RUNTIME_LOGGING_CONFIG})
+    bootstrap_dreamerv3_base = dict(config.dreamerv3)
+    bootstrap_runtime_logging_base = dict(config.runtime_logging)
 
-    parsed, other = embodied.Flags(task=["carla_group_right_turn_auto"]).parse_known(argv)
-    for name in parsed.task:
-        print("Using task: ", name)
+    bootstrap_cfg, other = embodied.Flags(
+        config,
+        task=["carla_group_right_turn_auto"],
+    ).parse_known(argv)
+    cli_overrides = {
+        "dreamerv3": diff_explicit_config_overrides(
+            bootstrap_cfg.dreamerv3,
+            bootstrap_dreamerv3_base,
+        ),
+        "runtime_logging": diff_explicit_config_overrides(
+            bootstrap_cfg.runtime_logging,
+            bootstrap_runtime_logging_base,
+        ),
+    }
+
+    bootstrap_settings = configure_runtime_logging(
+        bootstrap_cfg.runtime_logging,
+        logdir=bootstrap_cfg.dreamerv3.logdir,
+    )
+    train_logger = get_runtime_logger("dreamerv3.train")
+    log_key_event(
+        train_logger,
+        logging.INFO,
+        "Bootstrapped runtime logging with level=%s console=%s file=%s logdir=%s",
+        bootstrap_settings["level"],
+        bootstrap_settings["console"],
+        bootstrap_settings["file"],
+        bootstrap_cfg.dreamerv3.logdir,
+    )
+
+    task_names = tuple(bootstrap_cfg.task)
+    for name in task_names:
+        log_key_event(train_logger, logging.INFO, "Using task '%s'", name)
         env, env_config = car_dreamer.create_task(name, argv)
         config = config.update(env_config)
+    if cli_overrides["dreamerv3"]:
+        config = config.update({"dreamerv3": cli_overrides["dreamerv3"]})
+    if cli_overrides["runtime_logging"]:
+        config = config.update({"runtime_logging": cli_overrides["runtime_logging"]})
     config = embodied.Flags(config).parse(other)
-    # print(config)
 
     logdir = embodied.Path(config.dreamerv3.logdir)
+    logdir.mkdirs()
     step = embodied.Counter()
     dreamerv3_config = config.dreamerv3
+    runtime_settings = configure_runtime_logging(config.runtime_logging, logdir=logdir)
+    log_key_event(
+        train_logger,
+        logging.INFO,
+        "Resolved runtime logging level=%s console_level=%s file_level=%s step_debug_interval=%s",
+        runtime_settings["level"],
+        runtime_settings["console_level"],
+        runtime_settings["file_level"],
+        runtime_settings["step_debug_interval"],
+    )
+    log_key_event(
+        train_logger,
+        logging.INFO,
+        "Starting training run task=%s seed=%s logdir=%s runtime_log=%s",
+        ",".join(task_names),
+        dreamerv3_config.seed,
+        logdir,
+        logdir / "runtime.log",
+    )
 
     # --- Build logger outputs ---
     log_outputs = [
@@ -76,7 +140,12 @@ def main(argv=None):
                 resume=getattr(wandb_cfg, "resume", False),
             )
         )
-        print(f"[WandB] Logging to project '{getattr(wandb_cfg, 'project', 'CarDreamer')}', run '{run_name}'")
+        train_logger.info(
+            "WandB enabled project=%s run_name=%s entity=%s",
+            getattr(wandb_cfg, "project", "CarDreamer"),
+            run_name,
+            getattr(wandb_cfg, "entity", ""),
+        )
 
     logger = embodied.Logger(step, log_outputs)
 
@@ -85,11 +154,16 @@ def main(argv=None):
     env = from_gym.FromGym(env)
     env = wrap_env(env, dreamerv3_config)
     env = embodied.BatchEnv([env], parallel=False)
+    train_logger.info(
+        "Environment ready obs_keys=%s act_keys=%s",
+        sorted(env.obs_space.keys()),
+        sorted(env.act_space.keys()),
+    )
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     config_filename = f"config_{timestamp}.yaml"
     config.save(str(logdir / config_filename))
-    print(f"[Train] Config saved to {logdir / config_filename}")
+    train_logger.info("Config saved to %s", logdir / config_filename)
 
     # agent = dreamerv3.Agent(env.obs_space, env.act_space, step, dreamerv3_config)
     # agent = dreamerv3.CoopSACAgent(env.obs_space, env.act_space, step, dreamerv3_config)
@@ -101,9 +175,15 @@ def main(argv=None):
         batch_steps=dreamerv3_config.batch_size * dreamerv3_config.batch_length,
         actor_dist_disc=dreamerv3_config.actor_dist_disc,
     )
+    train_logger.info(
+        "Agent and replay initialized agent=%s replay_size=%s batch_steps=%s runtime_level=%s",
+        type(agent).__name__,
+        dreamerv3_config.replay_size,
+        args.batch_steps,
+        runtime_settings["level"],
+    )
     embodied.run.train(agent, env, replay, logger, args)
-    
-    print(f"testing agent...")
+    log_key_event(train_logger, logging.INFO, "Training loop finished.")
 
 
 if __name__ == "__main__":

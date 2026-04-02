@@ -4,9 +4,13 @@ from typing import Callable, Dict, List, Union
 
 import carla
 import numpy as np
+from runtime_logging import get_runtime_logger
 
 from .utils import ActorActionDict, ActorPolygonDict, ActorTransformDict, Command
 from .vehicle_manager import VehicleManager
+
+
+WORLD_LOGGER = get_runtime_logger("car_dreamer.world")
 
 
 def cached_step_wise(func):
@@ -34,12 +38,12 @@ class WorldManager:
         self._config = env_config.world
         self._env_config = env_config
 
-        print(f"[CARLA] Connecting to Carla server at {self._config.carla_port}...")
+        WORLD_LOGGER.info("Connecting to Carla server at port=%s", self._config.carla_port)
         self._client = carla.Client("127.0.0.1", self._config.carla_port)
         self._client.set_timeout(20.0)
         self._world = self._client.load_world(self._config.town)
         self._map = self._world.get_map()
-        print(f"[CARLA] Map {self._config.town} loaded")
+        WORLD_LOGGER.info("Loaded CARLA map town=%s", self._config.town)
 
         settings = self._world.get_settings()
         settings.synchronous_mode = False
@@ -174,7 +178,7 @@ class WorldManager:
         actor = self.try_spawn_actor(transform, blueprint)
         try_time = 0
         while actor is None and (max_try_time is None or try_time < max_try_time):
-            print("[CARLA] Failed to spawn actor, retrying...")
+            WORLD_LOGGER.warning("Failed to spawn actor, retrying attempt=%d", try_time + 1)
             time.sleep(0.1)
             actor = self.try_spawn_actor(transform, blueprint)
             try_time += 1
@@ -225,7 +229,7 @@ class WorldManager:
             batch.append(carla.command.SpawnActor(bp, transform).then(carla.command.SetAutopilot(carla.command.FutureActor, True, self._tm_port)))
         for response in self._client.apply_batch_sync(batch, False):
             if response.error:
-                print("[CARLA]", response.error)
+                WORLD_LOGGER.warning("Batch spawn response error: %s", response.error)
             else:
                 actor = self._world.get_actor(response.actor_id)
                 actor_list.append(actor)

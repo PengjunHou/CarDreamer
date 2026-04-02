@@ -63,11 +63,9 @@ def _feature_nbytes(payload: Any) -> int:
 
         if "feat" in payload:
             if isinstance(payload["feat"], np.ndarray):
-                print(f"size of feat: {payload['feat'].shape} with nbytes {payload['feat'].nbytes}")
                 return int(payload["feat"].nbytes)
             if isinstance(payload["feat"], torch.Tensor):
                 nbytes = payload["feat"].element_size() * payload["feat"].numel()
-                print(f"size of feat: {tuple(payload['feat'].shape)} with nbytes {nbytes}")
                 return int(nbytes)
 
         if "data" in payload:

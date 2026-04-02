@@ -3,6 +3,16 @@ import collections
 import numpy as np
 
 from .basics import convert
+from runtime_logging import (
+    get_runtime_logger,
+    get_runtime_logging_config,
+    should_log_periodic,
+    summarize_array_mapping,
+    summarize_keys,
+)
+
+
+DRIVER_LOGGER = get_runtime_logger("dreamerv3.driver")
 
 
 class Driver:
@@ -42,10 +52,28 @@ class Driver:
     def _step(self, policy, step, episode):
         assert all(len(x) == len(self._env) for x in self._acts.values())
         acts = {k: v for k, v in self._acts.items() if not k.startswith("log_")}
-        # print(f"[Driver] Taking step {step}, episode {episode}, with actions: {acts}")
         obs, info = self._env.step(acts)
         obs = {k: convert(v) for k, v in obs.items()}
         info = {k: convert(v) for k, v in info.items()}
+        runtime_cfg = get_runtime_logging_config()
+        log_debug = should_log_periodic(
+            int(step),
+            int(runtime_cfg["step_debug_interval"]),
+            logger=DRIVER_LOGGER,
+        )
+        if log_debug:
+            DRIVER_LOGGER.debug(
+                "Driver step=%d episode=%d obs_keys=[%s] info_keys=[%s] is_first=%s is_last=%s",
+                step,
+                episode,
+                summarize_keys(obs),
+                summarize_keys(info),
+                obs.get("is_first"),
+                obs.get("is_last"),
+            )
+            if runtime_cfg["driver_debug_shapes"]:
+                DRIVER_LOGGER.debug("Driver obs summary: %s", summarize_array_mapping(obs))
+                DRIVER_LOGGER.debug("Driver info summary: %s", summarize_array_mapping(info))
         assert all(len(x) == len(self._env) for x in obs.values()), obs
         acts, self._state = policy(obs, self._state, **self._kwargs)
         acts = {k: convert(v) for k, v in acts.items()}
@@ -63,12 +91,13 @@ class Driver:
         for i in range(len(self._env)):
             trn = {k: v[i] for k, v in trns.items()}
             inf = {k: v[i] for k, v in info.items()}
-            # print(f"Step {step}, Episode {episode}, Agent {i}, Transition keys: {trn.keys()}, Info keys: {inf.keys()}")
             [self._eps[i][k].append(v) for k, v in trn.items()]
             [self._eps_info[i][k].append(v) for k, v in inf.items()]
             [fn(trn, inf, i, **self._kwargs) for fn in self._on_steps]
             step += 1
         if obs["is_last"].any():
+            done_indices = [i for i, done in enumerate(obs["is_last"]) if done]
+            DRIVER_LOGGER.debug("Driver episode boundary at step=%d done_env_indices=%s", step, done_indices)
             for i, done in enumerate(obs["is_last"]):
                 if done:
                     ep = {k: convert(v) for k, v in self._eps[i].items()}

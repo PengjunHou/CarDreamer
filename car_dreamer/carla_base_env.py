@@ -5,8 +5,12 @@ import carla
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
+from runtime_logging import get_runtime_logger, get_runtime_logging_config, should_log_periodic, summarize_keys
 
 from .toolkit import EnvMonitorOpenCV, Observer, WorldManager
+
+
+ENV_LOGGER = get_runtime_logger("car_dreamer.env")
 
 
 class CarlaBaseEnv(gym.Env):
@@ -95,7 +99,7 @@ class CarlaBaseEnv(gym.Env):
 
         Returns (obs, info).
         """
-        print("[CARLA] Reset environment")
+        ENV_LOGGER.info("Reset environment start seed=%s", seed)
         super().reset(seed=seed)
 
         # Keep behavior unchanged: seed is accepted but not applied here.
@@ -106,6 +110,12 @@ class CarlaBaseEnv(gym.Env):
         self._time_step = 0
 
         self.obs, info = self._ego_observer.get_observation(self.get_state())
+        ENV_LOGGER.info(
+            "Reset environment complete ego_id=%s obs_keys=[%s] info_keys=[%s]",
+            getattr(self.get_ego_vehicle(), "id", None),
+            summarize_keys(self.obs),
+            summarize_keys(info),
+        )
         return self.obs, info
 
     def get_vehicle_control(self, action):
@@ -130,7 +140,16 @@ class CarlaBaseEnv(gym.Env):
         # throttle（油门）: 0 to 1, where 0 means no throttle and 1 means full throttle.
         # steer（转向）: -1 to 1, where -1 means full
         # brake（刹车）: 0 to 1, where 0 means no brake and 1 means full brake.
-        print(f"[CARLA] Step {self._time_step}: Action: {action}, Throttle: {throttle}, Steer: {steer}, Brake: {brake}")    
+        runtime_cfg = get_runtime_logging_config()
+        if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=ENV_LOGGER):
+            ENV_LOGGER.debug(
+                "Control conversion step=%d action=%s throttle=%.3f steer=%.3f brake=%.3f",
+                self._time_step,
+                action,
+                throttle,
+                steer,
+                brake,
+            )
         return carla.VehicleControl(throttle=float(throttle), steer=float(-steer), brake=float(brake))
 
     def _is_terminal(self):
@@ -138,7 +157,7 @@ class CarlaBaseEnv(gym.Env):
         terminal = False
         for k, v in terminal_conds.items():
             if v:
-                print(f"[CARLA] Terminal condition triggered: {k}")
+                ENV_LOGGER.info("Terminal condition triggered step=%d condition=%s", self._time_step, k)
                 terminal = True
             terminal_conds[k] = np.array([v], dtype=np.bool_)
         if terminal:
@@ -147,6 +166,9 @@ class CarlaBaseEnv(gym.Env):
         return terminal, terminal_conds
 
     def step(self, action):
+        runtime_cfg = get_runtime_logging_config()
+        if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=ENV_LOGGER):
+            ENV_LOGGER.debug("Env step start step=%d action=%s", self._time_step, action)
         self.apply_control(action)
         self._world.step()
         self._time_step += 1
@@ -174,6 +196,15 @@ class CarlaBaseEnv(gym.Env):
         # truncated: episode was cut short (time limit, etc.)
         terminated = is_terminal
         truncated = False  # CarDreamer doesn't use truncated separately
+        if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=ENV_LOGGER):
+            ENV_LOGGER.debug(
+                "Env step complete step=%d reward=%.4f terminated=%s truncated=%s info_keys=[%s]",
+                self._time_step,
+                reward,
+                terminated,
+                truncated,
+                summarize_keys(info),
+            )
         return self.obs, reward, terminated, truncated, info
 
     def is_collision(self):

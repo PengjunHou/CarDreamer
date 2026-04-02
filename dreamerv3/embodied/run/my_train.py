@@ -1,14 +1,20 @@
 import re
+import logging
 
 import embodied
 # import jax
 import numpy as np
 
+from runtime_logging import get_runtime_logger, log_key_event
+
+
+TRAIN_LOGGER = get_runtime_logger("dreamerv3.train")
+
 
 def train(agent, env, replay, logger, args):
     logdir = embodied.Path(args.logdir)
     logdir.mkdirs()
-    print("Logdir", logdir)
+    TRAIN_LOGGER.info("Train loop initialized logdir=%s", logdir)
     should_expl = embodied.when.Until(args.expl_until)
     should_train = embodied.when.Ratio(args.train_ratio / args.batch_steps)
     should_log = embodied.when.Clock(args.log_every)
@@ -17,8 +23,8 @@ def train(agent, env, replay, logger, args):
     step = logger.step
     updates = embodied.Counter()
     metrics = embodied.Metrics()
-    print("Observation space:", embodied.format(env.obs_space), sep="\n")
-    print("Action space:", embodied.format(env.act_space), sep="\n")
+    TRAIN_LOGGER.info("Observation space:\n%s", embodied.format(env.obs_space))
+    TRAIN_LOGGER.info("Action space:\n%s", embodied.format(env.act_space))
 
     timer = embodied.Timer()
     # timer.wrap("agent", agent, ["policy", "train", "report", "save"])
@@ -42,7 +48,20 @@ def train(agent, env, replay, logger, args):
             },
             prefix="episode",
         )
-        print(f"Episode has {length} steps and return {score:.1f}, r_waypoints {ep['r_waypoints'].sum():.1f}, r_speed {ep['r_speed'].sum():.1f}, r_collision {ep['r_collision'].sum():.1f}, r_out_of_lane {ep['r_out_of_lane'].sum():.1f}, r_destination {ep['r_destination'].sum():.1f}, time_penalty {ep['time_penalty'].sum():.1f}")
+        log_key_event(
+            TRAIN_LOGGER,
+            logging.INFO,
+            "Episode finished length=%d score=%.1f r_waypoints=%.1f r_speed=%.1f "
+            "r_collision=%.1f r_out_of_lane=%.1f r_destination=%.1f time_penalty=%.1f",
+            length,
+            score,
+            ep["r_waypoints"].sum(),
+            ep["r_speed"].sum(),
+            ep["r_collision"].sum(),
+            ep["r_out_of_lane"].sum(),
+            ep["r_destination"].sum(),
+            ep["time_penalty"].sum(),
+        )
         stats = {}
         for key in args.log_keys_video:
             if key in ep:
@@ -64,13 +83,25 @@ def train(agent, env, replay, logger, args):
     driver.on_step(lambda _, __, ___: step.increment())
     driver.on_step(lambda tran, _, worker: replay.add(tran, worker))
 
-    print("Prefill train dataset.")
+    log_key_event(
+        TRAIN_LOGGER,
+        logging.INFO,
+        "Prefill train dataset start replay_length=%d target=%d",
+        len(replay),
+        max(args.batch_steps, args.train_fill),
+    )
     random_agent = embodied.RandomAgent(env.act_space, args.actor_dist_disc)
-    print(f"[Carla] collecting experience with random policy, batch_steps {args.batch_steps}, train_fill {args.train_fill}")
+    TRAIN_LOGGER.info(
+        "Collecting experience with random policy batch_steps=%s train_fill=%s",
+        args.batch_steps,
+        args.train_fill,
+    )
     while len(replay) < max(args.batch_steps, args.train_fill):
         driver(random_agent.policy, steps=100)
+    log_key_event(TRAIN_LOGGER, logging.INFO, "Prefill complete replay_length=%d", len(replay))
     logger.add(metrics.result())
     logger.write()
+    TRAIN_LOGGER.debug("Initial metrics written after prefill.")
 
     # dataset = agent.dataset(replay.dataset)
     state = [None]  # To be writable from train step function below.
@@ -111,16 +142,28 @@ def train(agent, env, replay, logger, args):
     # checkpoint.agent = agent
     checkpoint.replay = replay
     if args.from_checkpoint:
+        log_key_event(TRAIN_LOGGER, logging.INFO, "Loading checkpoint from %s", args.from_checkpoint)
         checkpoint.load(args.from_checkpoint)
     checkpoint.load_or_save()
     should_save(step)  # Register that we jused saved.
+    TRAIN_LOGGER.info("Checkpoint initialized at %s", logdir / "checkpoint.ckpt")
 
-    print("Start training loop.")
+    log_key_event(
+        TRAIN_LOGGER,
+        logging.INFO,
+        "Start training loop total_steps=%s train_ratio=%s",
+        args.steps,
+        args.train_ratio,
+    )
     driver._state = None
     # policy = lambda *args: agent.policy(*args, mode="explore" if should_expl(step) else "train")
     policy = lambda *args: random_agent.policy(*args)
     while step < args.steps:
         driver(policy, steps=100)
         if should_save(step):
+            log_key_event(TRAIN_LOGGER, logging.INFO, "Saving checkpoint at env_step=%s", step.value)
             checkpoint.save()
+        if should_log(step):
+            TRAIN_LOGGER.debug("Periodic log tick env_step=%s updates=%s", step.value, updates.value)
     logger.write()
+    log_key_event(TRAIN_LOGGER, logging.INFO, "Training loop complete final_step=%s", step.value)

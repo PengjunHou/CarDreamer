@@ -1,3 +1,9 @@
+from runtime_logging import get_runtime_logger
+
+
+WORLD_LOGGER = get_runtime_logger("car_dreamer.world")
+
+
 class VehicleManager:
     def __init__(self, client, tm_port, traffic_config):
         self._client = client
@@ -8,7 +14,7 @@ class VehicleManager:
         self._tm.set_respawn_dormant_vehicles(True)
         self._tm.set_boundaries_respawn_dormant_vehicles(40, 100)
         self._tm.set_random_device_seed(traffic_config.tm_seed)
-        print("[CARLA] Traffic Manager Port:", self._tm.get_port())
+        WORLD_LOGGER.info("Traffic manager initialized port=%s", self._tm.get_port())
 
     def set_synchronous_mode(self, sync=True):
         self._tm.set_synchronous_mode(sync)
