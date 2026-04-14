@@ -48,6 +48,12 @@ from .training import (
     train_one_epoch,
     evaluate_emulation_model,
 )
+from .visualization import (
+    SUPPORTED_METRICS,
+    main as visualization_main,
+    render_ground_truth_topology_sequences,
+    render_prediction_comparison_sequences,
+)
 
 __all__ = [
     "CanonicalEmulationDataset",
@@ -93,4 +99,8 @@ __all__ = [
     "training_main",
     "torch_is_available",
     "validate_episode_record",
+    "SUPPORTED_METRICS",
+    "render_ground_truth_topology_sequences",
+    "render_prediction_comparison_sequences",
+    "visualization_main",
 ]
