@@ -154,8 +154,31 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
             getattr(self._config, "dump_vlm_records_on_episode_end", True)
         )
         self._vlm_dump_dir = str(getattr(self._config, "vlm_dump_dir", "data"))
-        self._episode_dumped = False
+        self._dump_emulation_records_on_episode_end = bool(
+            getattr(self._config, "dump_emulation_records_on_episode_end", True)
+        )
+        self._emulation_dump_dir = str(
+            getattr(self._config, "emulation_dump_dir", self._vlm_dump_dir)
+        )
+        self._vlm_episode_dumped = False
+        self._emulation_episode_dumped = False
+        self._emulation_episode_steps: List[Any] = []
+        self._emulation_step_counter = 0
+        self._emulation_episode_index = 0
+        self._emulation_scene_type = "right_turn"
+        self._emulation_scene_id = str(getattr(self._config, "scene_id", "right_turn_scene"))
+        self._emulation_episode_id = ""
         self.agent = None
+
+    def _begin_emulation_logging_episode(self) -> None:
+        self._emulation_episode_index += 1
+        self._emulation_episode_id = (
+            f"{self._emulation_scene_type}_episode_{self._emulation_episode_index:06d}"
+        )
+        self._emulation_episode_steps = []
+        self._emulation_step_counter = 0
+        self._vlm_episode_dumped = False
+        self._emulation_episode_dumped = False
 
     # =========================================================
     # Environment overrides
@@ -163,6 +186,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
 
     def on_reset(self) -> None:
         self._reset_group_runtime_state()
+        self._begin_emulation_logging_episode()
         self._destroy_group_observers()
         self._configure_traffic_lights()
         super().on_reset()
@@ -241,3 +265,27 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
     def dump_vlm_records(self, path: str) -> None:
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(self._vlm_records, handle, ensure_ascii=False, indent=2)
+
+    def dump_emulation_episode(self, path: str) -> None:
+        from .toolkit.emulation import episode_to_dict, validate_episode_record
+        from .toolkit.vlm.right_turn_auto_predictor_logging import (
+            build_runtime_emulation_episode,
+        )
+
+        if not self._emulation_episode_steps:
+            raise ValueError("No predictor-ready emulation steps are available for dumping.")
+        episode = build_runtime_emulation_episode(
+            scene_id=str(self._emulation_scene_id),
+            episode_id=str(self._emulation_episode_id),
+            scene_type=str(self._emulation_scene_type),
+            dt=float(self._config.world.fixed_delta_seconds),
+            steps=self._emulation_episode_steps,
+            metadata={
+                "source": "right_turn_auto_runtime_logging",
+                "env_step_final": int(self._time_step),
+                "vlm_record_count": int(len(self._vlm_records)),
+            },
+        )
+        validate_episode_record(episode)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(episode_to_dict(episode), handle, ensure_ascii=False, indent=2)

@@ -25,6 +25,7 @@ class RightTurnAutoVLMRefactorSmokeTest(unittest.TestCase):
             REPO_ROOT / "car_dreamer" / "toolkit" / "vlm" / "right_turn_auto_prompts.py",
             REPO_ROOT / "car_dreamer" / "toolkit" / "vlm" / "right_turn_auto_context.py",
             REPO_ROOT / "car_dreamer" / "toolkit" / "vlm" / "right_turn_auto_scoring.py",
+            REPO_ROOT / "car_dreamer" / "toolkit" / "vlm" / "right_turn_auto_predictor_logging.py",
             REPO_ROOT / "car_dreamer" / "toolkit" / "vlm" / "right_turn_auto_mixin.py",
             REPO_ROOT / "car_dreamer" / "right_turn_auto_runtime.py",
             REPO_ROOT / "car_dreamer" / "carla_group_right_turn_auto_env.py",

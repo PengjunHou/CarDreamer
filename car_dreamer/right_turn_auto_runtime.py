@@ -55,8 +55,12 @@ class RightTurnAutoRuntimeMixin:
         self._in_flight = []
         self._received = defaultdict(lambda: deque(maxlen=RECEIVED_BUFFER_SIZE))
         self._veh_net_res = {}
+        self._vlm_records = []
         self._vlm_last_eval = {}
-        self._episode_dumped = False
+        self._vlm_episode_dumped = False
+        self._emulation_episode_dumped = False
+        self._emulation_episode_steps = []
+        self._emulation_step_counter = 0
         RUNTIME_LOGGER.debug("Group runtime state reset.")
 
     def _destroy_group_observers(self) -> None:
@@ -370,27 +374,49 @@ class RightTurnAutoRuntimeMixin:
         return shared_data
 
     def _maybe_dump_vlm_records(self, suffix: str) -> Optional[str]:
-        if not self._dump_vlm_records_on_episode_end or self._episode_dumped:
+        if not self._dump_vlm_records_on_episode_end or self._vlm_episode_dumped:
             return None
         os.makedirs(self._vlm_dump_dir, exist_ok=True)
         filename = f"vlm_records_{suffix}_step_{int(self._time_step)}.json"
         path = os.path.join(self._vlm_dump_dir, filename)
         self.dump_vlm_records(path)
-        self._episode_dumped = True
+        self._vlm_episode_dumped = True
+        return path
+
+    def _maybe_dump_emulation_episode(self, suffix: str) -> Optional[str]:
+        if (
+            not getattr(self, "_dump_emulation_records_on_episode_end", False)
+            or getattr(self, "_emulation_episode_dumped", False)
+            or not getattr(self, "_emulation_episode_steps", [])
+        ):
+            return None
+        os.makedirs(self._emulation_dump_dir, exist_ok=True)
+        filename = f"emulation_episode_{suffix}_step_{int(self._time_step)}.json"
+        path = os.path.join(self._emulation_dump_dir, filename)
+        self.dump_emulation_episode(path)
+        self._emulation_episode_dumped = True
         return path
 
     def _handle_episode_end(self, terminated: bool, truncated: bool, info: Dict[str, Any]) -> Dict[str, Any]:
         if terminated or truncated:
-            dump_path = self._maybe_dump_vlm_records(
-                "terminated" if terminated else "truncated"
-            )
-            if dump_path is not None:
-                info["vlm_dump_path"] = dump_path
+            suffix = "terminated" if terminated else "truncated"
+            vlm_dump_path = self._maybe_dump_vlm_records(suffix)
+            if vlm_dump_path is not None:
+                info["vlm_dump_path"] = vlm_dump_path
                 RUNTIME_LOGGER.info(
                     "Episode end dump created step=%d path=%s records=%d",
                     self._time_step,
-                    dump_path,
+                    vlm_dump_path,
                     len(getattr(self, "_vlm_records", [])),
+                )
+            emulation_dump_path = self._maybe_dump_emulation_episode(suffix)
+            if emulation_dump_path is not None:
+                info["emulation_dump_path"] = emulation_dump_path
+                RUNTIME_LOGGER.info(
+                    "Predictor-ready episode dump created step=%d path=%s canonical_steps=%d",
+                    self._time_step,
+                    emulation_dump_path,
+                    len(getattr(self, "_emulation_episode_steps", [])),
                 )
         return info
 

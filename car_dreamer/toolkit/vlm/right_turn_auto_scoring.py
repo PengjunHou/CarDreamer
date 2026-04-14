@@ -15,6 +15,146 @@ VLM_SCORING_LOGGER = get_runtime_logger("car_dreamer.vlm.scoring")
 
 
 class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
+    def _runtime_message_to_predictor_dict(self, msg: Any) -> Dict[str, Any]:
+        fixed_dt = float(self._config.world.fixed_delta_seconds)
+        received_age_steps = max(int(self._time_step) - int(getattr(msg, "created_step", self._time_step)), 0)
+        return {
+            "sender_id": int(getattr(msg, "sender_id", -1)),
+            "receiver_id": int(getattr(msg, "receiver_id", -1)),
+            "created_step": int(getattr(msg, "created_step", self._time_step)),
+            "deliver_step": int(getattr(msg, "deliver_step", self._time_step)),
+            "received_age_s": float(received_age_steps * fixed_dt),
+            "latency_s": float(getattr(msg, "latency_s", 0.0)),
+            "payload_bytes": float(getattr(msg, "payload_bytes", 0.0)),
+            "distance_m": float(getattr(msg, "distance_m", 0.0)),
+        }
+
+    def _build_predictor_candidate_vehicle_states(
+        self,
+        shared_infos: List[Dict[str, Any]],
+        shared_meta: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        selected_infos_by_sender: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        for info in shared_infos:
+            sender_id = int(info.get("sender_id", -1))
+            if sender_id >= 0:
+                selected_infos_by_sender[sender_id].append(info)
+
+        shared_source = str(shared_meta.get("shared_source", self._vlm_shared_source))
+        window_messages_by_sender: Dict[int, List[Dict[str, Any]]] = {}
+        if shared_source == "received_feat" and getattr(self, "ego", None) is not None:
+            receiver_id = int(self.ego.id)
+            window_msgs = self._get_received_messages_in_window(receiver_id, self._vlm_received_window_s)
+            grouped = self._group_messages_by_sender(window_msgs)
+            for sender_id, msgs in grouped.items():
+                ordered = sorted(msgs, key=lambda msg: (int(msg.deliver_step), int(msg.created_step)))
+                window_messages_by_sender[int(sender_id)] = [
+                    self._runtime_message_to_predictor_dict(msg) for msg in ordered
+                ]
+
+        candidate_vehicle_states: List[Dict[str, Any]] = []
+        for actor in self.group_vehs:
+            transform = actor.get_transform()
+            velocity = actor.get_velocity()
+            actor_id = int(actor.id)
+            candidate_vehicle_states.append(
+                {
+                    "vehicle_id": actor_id,
+                    "pose": {
+                        "x": float(transform.location.x),
+                        "y": float(transform.location.y),
+                        "yaw": float(transform.rotation.yaw),
+                        "yaw_rad": math.radians(float(transform.rotation.yaw)),
+                    },
+                    "velocity": {
+                        "vx": float(velocity.x),
+                        "vy": float(velocity.y),
+                    },
+                    "selected_infos": list(selected_infos_by_sender.get(actor_id, [])),
+                    "window_messages": list(window_messages_by_sender.get(actor_id, [])),
+                    "shared_source": shared_source,
+                }
+            )
+        return candidate_vehicle_states
+
+    def _maybe_record_emulation_step(
+        self,
+        eval_result: Dict[str, Any],
+        shared_infos: List[Dict[str, Any]],
+        shared_meta: Dict[str, Any],
+    ) -> None:
+        if not hasattr(self, "_emulation_episode_steps") or not hasattr(self, "_emulation_step_counter"):
+            return
+        if str(eval_result.get("status", "")) != "ok":
+            return
+
+        ordered_question_ids = [str(question_cfg["id"]) for question_cfg in self._vlm_questions]
+        question_results = eval_result.get("questions", {})
+        if any(
+            question_id not in question_results
+            or "error" in dict(question_results.get(question_id, {}))
+            for question_id in ordered_question_ids
+        ):
+            return
+
+        from .right_turn_auto_predictor_logging import build_runtime_emulation_step
+
+        ego_transform = self.ego.get_transform()
+        ego_velocity_actor = self.ego.get_velocity()
+        step_record = build_runtime_emulation_step(
+            scene_id=str(getattr(self, "_emulation_scene_id", "right_turn_scene")),
+            episode_id=str(getattr(self, "_emulation_episode_id", "right_turn_episode")),
+            scene_type=str(getattr(self, "_emulation_scene_type", "right_turn")),
+            predictor_step=int(self._emulation_step_counter),
+            env_step=int(self._time_step),
+            dt=float(self._config.world.fixed_delta_seconds),
+            ego_pose={
+                "x": float(ego_transform.location.x),
+                "y": float(ego_transform.location.y),
+                "yaw": float(ego_transform.rotation.yaw),
+                "yaw_rad": math.radians(float(ego_transform.rotation.yaw)),
+            },
+            ego_velocity={
+                "vx": float(ego_velocity_actor.x),
+                "vy": float(ego_velocity_actor.y),
+            },
+            candidate_vehicle_states=self._build_predictor_candidate_vehicle_states(
+                shared_infos,
+                shared_meta,
+            ),
+            question_results=question_results,
+            question_ids=ordered_question_ids,
+            feature_size=int(self.feature_size),
+        )
+        self._emulation_episode_steps.append(step_record)
+        self._emulation_step_counter += 1
+
+    def _is_rear_question(self, question_cfg: Dict[str, Any]) -> bool:
+        qid = str(question_cfg.get("id", "")).lower()
+        return "left_rear" in qid or "right_rear" in qid
+
+    def _compose_language_evidence(self, sensor_info: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        scene_description = str(sensor_info.get("scene_description", "")).strip()
+        text = str(sensor_info.get("text", "")).strip()
+        if scene_description:
+            parts.append(f"scene_description:\n{scene_description}")
+        if text:
+            parts.append(f"message_text:\n{text}")
+        return "\n\n".join(parts)
+
+    def _should_use_sensor_for_question(
+        self,
+        question_cfg: Dict[str, Any],
+        sensor_info: Dict[str, Any],
+        scoring: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        if sensor_info.get("is_ego") and self._is_rear_question(question_cfg):
+            return False, "ego_forward_camera_not_expected_to_cover_rear_region"
+        if str(scoring.get("question_answerability", "")) == "not_answerable":
+            return False, "question_not_answerable_from_sensor_view"
+        return True, ""
+
     def _compute_fov_alignment(
         self,
         sensor_yaw_rad: float,
@@ -156,6 +296,16 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 "scene_description": str(items[-1].get("scene_description", "")),
                 "language_evidence": str(items[-1].get("language_evidence", "")),
                 "converted_query": str(items[-1].get("converted_query", "")),
+                "evaluation_mode": str(items[-1].get("evaluation_mode", "")),
+                "visibility_status": str(items[-1].get("visibility_status", "partial")),
+                "question_answerability": str(
+                    items[-1].get("question_answerability", "partially_answerable")
+                ),
+                "answerability_score": float(items[-1].get("answerability_score", 0.0)),
+                "used_for_aggregation": bool(items[-1].get("used_for_aggregation", True)),
+                "skip_reason": str(items[-1].get("skip_reason", "")),
+                "image_available": bool(items[-1].get("image_available", False)),
+                "raw_vlm_json": items[-1].get("raw_vlm_json", {}),
             }
         return aggregated
 
@@ -289,9 +439,10 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             multiplier = float(imp.get("importance_weight", 0.0)) * sender_weight
             s_pos = float(sensor_score.get("positive_score", 0.0))
             s_neg = float(sensor_score.get("negative_score", 0.0))
-            s_unk = float(sensor_score.get("unknown_score", 0.0))
+            evidence = float(sensor_score.get("evidence", 0.0))
             information = multiplier * (
-                math.log1p(s_pos) + math.log1p(s_neg) + math.log1p(s_unk)
+                math.log1p(max(s_pos, 0.0) + max(s_neg, 0.0))
+                + 0.5 * math.log1p(max(evidence, 0.0))
             )
             per_sensor_information[sensor_key] = float(information)
             total_information += float(information)
@@ -319,15 +470,32 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
         per_sensor_importance = importance_maps.get("per_sensor", {})
         per_sensor_details: List[Dict[str, Any]] = []
         total_pos = total_neg = total_unk = total_evidence = total_belief = 0.0
+        total_effective_weight = 0.0
+        total_coverage_weight = 0.0
         ego_only = {
             "positive_score": 0.0,
             "negative_score": 0.0,
-            "unknown_score": 1.0,
+            "unknown_score": 0.1,
             "belief": 0.0,
             "evidence": 0.0,
             "confidence": 0.0,
             "answer": "uncertain",
         }
+
+        if not sensor_mean_scores:
+            return {
+                "positive_score": 0.0,
+                "negative_score": 0.0,
+                "unknown_score": 0.1,
+                "belief": 0.0,
+                "evidence": 0.0,
+                "confidence": 0.0,
+                "coverage_weight": 0.0,
+                "effective_weight": 0.0,
+                "ego_only": ego_only,
+                "per_sensor_details": per_sensor_details,
+                "answer": "uncertain",
+            }
 
         for sensor_key in sorted(sensor_mean_scores.keys()):
             sensor_score = sensor_mean_scores[sensor_key]
@@ -342,22 +510,28 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
 
             s_pos = float(sensor_score.get("positive_score", 0.0))
             s_neg = float(sensor_score.get("negative_score", 0.0))
-            s_unk = float(sensor_score.get("unknown_score", 1.0))
+            s_unk = float(sensor_score.get("unknown_score", 0.1))
             belief = float(sensor_score.get("belief", s_pos - s_neg))
             evidence = float(sensor_score.get("evidence", 1.0 - s_unk))
-            weight = sensor_weight * evidence
+            answerability_score = float(sensor_score.get("answerability_score", 1.0))
+            coverage_weight = sensor_weight * answerability_score
+            effective_weight = coverage_weight * max(evidence, 0.0)
 
-            total_pos += sensor_weight * s_pos
-            total_neg += sensor_weight * s_neg
+            total_pos += effective_weight * s_pos
+            total_neg += effective_weight * s_neg
             total_unk += sensor_weight * s_unk
-            total_evidence += sensor_weight * evidence
-            total_belief += weight * belief
+            total_evidence += effective_weight
+            total_belief += effective_weight * belief
+            total_coverage_weight += coverage_weight
+            total_effective_weight += effective_weight
 
             sensor_detail = {
                 "sensor_key": sensor_key,
                 "sender_id": sender_id,
                 "is_ego": is_ego,
                 "sensor_weight": sensor_weight,
+                "coverage_weight": coverage_weight,
+                "answerability_score": answerability_score,
                 "positive_score": s_pos,
                 "negative_score": s_neg,
                 "unknown_score": s_unk,
@@ -366,28 +540,41 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 "timeliness": timeliness,
                 "importance_weight": importance_weight,
                 "sender_weight": sender_weight,
-                "weight": weight,
-                "confidence": abs(belief) * weight,
+                "weight": effective_weight,
+                "confidence": abs(belief) * effective_weight,
                 "answer": str(sensor_score.get("answer", "uncertain")),
+                "visibility_status": str(sensor_score.get("visibility_status", "partial")),
+                "question_answerability": str(
+                    sensor_score.get("question_answerability", "partially_answerable")
+                ),
             }
             per_sensor_details.append(sensor_detail)
             if is_ego:
                 ego_only = dict(sensor_detail)
 
-        if total_pos > total_neg and total_pos > total_unk:
+        if total_effective_weight <= 1e-6 or total_coverage_weight <= 1e-6:
+            final_answer = "uncertain"
+        elif total_belief > 0.02:
             final_answer = "positive"
-        elif total_neg > total_pos and total_neg > total_unk:
+        elif total_belief < -0.02:
             final_answer = "negative"
         else:
             final_answer = "uncertain"
 
+        norm = max(total_effective_weight, 1e-6)
+        coverage_norm = max(total_coverage_weight, 1e-6)
+        avg_belief = total_belief / norm if total_effective_weight > 1e-6 else 0.0
+        confidence = abs(avg_belief) * min(1.0, total_effective_weight)
+
         return {
-            "positive_score": total_pos,
-            "negative_score": total_neg,
-            "unknown_score": total_unk,
+            "positive_score": total_pos / norm,
+            "negative_score": total_neg / norm,
+            "unknown_score": min(total_unk / coverage_norm, 1.0),
             "belief": total_belief,
-            "evidence": total_evidence,
-            "confidence": abs(total_belief),
+            "evidence": min(total_effective_weight / coverage_norm, 1.0),
+            "confidence": confidence,
+            "coverage_weight": total_coverage_weight,
+            "effective_weight": total_effective_weight,
             "ego_only": ego_only,
             "per_sensor_details": per_sensor_details,
             "answer": final_answer,
@@ -403,8 +590,10 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
         return [{
             "sender_id": int(self.ego.id),
             "sensor_name": "cam0",
+            "image": ego_image,
             "img_emb": None,
             "scene_description": scene_description,
+            "text": "",
             "pose": {
                 "x": float(tf.location.x),
                 "y": float(tf.location.y),
@@ -422,8 +611,10 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             sensor_infos.append({
                 "sender_id": int(info["sender_id"]),
                 "sensor_name": str(info.get("sensor_name", "cam0")),
+                "image": info.get("image"),
                 "img_emb": info.get("img_emb"),
                 "scene_description": str(info.get("scene_description", "")).strip(),
+                "text": str(info.get("text", "")).strip(),
                 "pose": pose,
                 "sensor_yaw_rad": math.radians(float(pose["yaw"])),
                 "received_age_s": float(info.get("received_age_s", 0.0)),
@@ -435,8 +626,12 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
         self,
         sensor_info: Dict[str, Any],
         scene_description: str,
+        language_evidence: str,
         scoring: Dict[str, Any],
         converted_question_cfg: Optional[Dict[str, Any]],
+        evaluation_mode: str,
+        used_for_aggregation: bool,
+        skip_reason: str,
     ) -> Dict[str, Any]:
         return {
             "sender_id": int(sensor_info["sender_id"]),
@@ -447,7 +642,11 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             "sensor_yaw_rad": float(sensor_info.get("sensor_yaw_rad", 0.0)),
             "converted_query": converted_question_cfg["query"] if converted_question_cfg else None,
             "scene_description": scene_description,
-            "language_evidence": scene_description,
+            "language_evidence": language_evidence,
+            "evaluation_mode": evaluation_mode,
+            "image_available": bool(sensor_info.get("image") is not None),
+            "used_for_aggregation": bool(used_for_aggregation),
+            "skip_reason": str(skip_reason),
             **scoring,
         }
 
@@ -473,11 +672,11 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
 
         for sensor_info in all_sensor_infos:
             scene_description = str(sensor_info.get("scene_description", "")).strip()
-            if not scene_description:
-                continue
+            language_evidence = self._compose_language_evidence(sensor_info)
             converted_question_cfg = None
+            question_for_sensor = question_cfg
             if sensor_info.get("is_ego"):
-                scoring = self._score_question_from_language_evidence(question_cfg, scene_description)
+                pass
             else:
                 converted = compute_query_direction_from_observer(
                     ego_pose=ego_pose,
@@ -491,27 +690,69 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                     "positive": converted.positive,
                     "negative": converted.negative,
                 }
+                question_for_sensor = converted_question_cfg
+
+            image = sensor_info.get("image")
+            if image is not None:
+                scoring = self._score_question_from_visual_evidence(question_for_sensor, image)
+                evaluation_mode = "visual_question"
+            elif language_evidence:
                 scoring = self._score_question_from_language_evidence(
-                    converted_question_cfg, scene_description
+                    question_for_sensor,
+                    language_evidence,
                 )
+                evaluation_mode = "language_fallback"
+            else:
+                scoring = {
+                    "positive_score": 0.0,
+                    "negative_score": 0.0,
+                    "unknown_score": 0.1,
+                    "uncertainty": 0.1,
+                    "answer": "uncertain",
+                    "reason": "No image or textual evidence available for this sensor.",
+                    "belief": 0.0,
+                    "evidence": 0.0,
+                    "ambiguity": 1.0,
+                    "confidence": 0.0,
+                    "visibility_status": "not_visible",
+                    "question_answerability": "not_answerable",
+                    "answerability_score": 0.0,
+                    "raw_vlm_json": {},
+                    "raw_text": "",
+                }
+                evaluation_mode = "empty_evidence"
+
+            used_for_aggregation, skip_reason = self._should_use_sensor_for_question(
+                question_cfg,
+                sensor_info,
+                scoring,
+            )
             per_sensor_instance_scores.append(
                 self._build_sensor_score_record(
                     sensor_info,
                     scene_description,
+                    language_evidence,
                     scoring,
                     converted_question_cfg,
+                    evaluation_mode,
+                    used_for_aggregation,
+                    skip_reason,
                 )
             )
 
-        sensor_mean_scores = self._aggregate_sensor_scores(per_sensor_instance_scores)
-        importance_maps = self._compute_sensor_importance_maps(question_cfg, sensor_mean_scores, ego_pose)
-        information_level = self._compute_information(sensor_mean_scores, importance_maps)
-        aggregated = self._weighted_confidence_aggregate(sensor_mean_scores, importance_maps)
+        sensor_mean_scores_all = self._aggregate_sensor_scores(per_sensor_instance_scores)
+        usable_instance_scores = [
+            item for item in per_sensor_instance_scores if bool(item.get("used_for_aggregation", True))
+        ]
+        sensor_mean_scores_used = self._aggregate_sensor_scores(usable_instance_scores)
+        importance_maps = self._compute_sensor_importance_maps(question_cfg, sensor_mean_scores_used, ego_pose)
+        information_level = self._compute_information(sensor_mean_scores_used, importance_maps)
+        aggregated = self._weighted_confidence_aggregate(sensor_mean_scores_used, importance_maps)
         ego_score = aggregated["ego_only"]
 
         per_sensor_scores_out: List[Dict[str, Any]] = []
-        for sensor_key in sorted(sensor_mean_scores.keys()):
-            sensor_score = sensor_mean_scores[sensor_key]
+        for sensor_key in sorted(sensor_mean_scores_all.keys()):
+            sensor_score = sensor_mean_scores_all[sensor_key]
             imp = importance_maps.get("per_sensor", {}).get(sensor_key, {})
             per_sensor_scores_out.append(
                 {
@@ -549,6 +790,19 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 "evidence": aggregated["evidence"],
                 "confidence": aggregated["confidence"],
                 "answer": aggregated["answer"],
+                "coverage_weight": aggregated.get("coverage_weight", 0.0),
+                "effective_weight": aggregated.get("effective_weight", 0.0),
+            },
+            "weighted_fused": {
+                "positive_score": aggregated["positive_score"],
+                "negative_score": aggregated["negative_score"],
+                "unknown_score": aggregated["unknown_score"],
+                "belief": aggregated["belief"],
+                "evidence": aggregated["evidence"],
+                "confidence": aggregated["confidence"],
+                "answer": aggregated["answer"],
+                "coverage_weight": aggregated.get("coverage_weight", 0.0),
+                "effective_weight": aggregated.get("effective_weight", 0.0),
             },
             "aggregated_details": {"per_sensor": aggregated["per_sensor_details"]},
             "sc_part1": float(aggregated["confidence"]),
@@ -616,6 +870,13 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 }
 
         self._vlm_last_eval = eval_result
+        try:
+            self._maybe_record_emulation_step(eval_result, shared_infos, shared_meta)
+        except Exception:
+            VLM_SCORING_LOGGER.exception(
+                "Predictor-ready canonical logging failed step=%d",
+                int(self._time_step),
+            )
         VLM_SCORING_LOGGER.debug(
             "Completed VLM evaluation step=%d questions=%d",
             int(self._time_step),

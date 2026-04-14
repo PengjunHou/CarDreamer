@@ -87,8 +87,9 @@ class RightTurnAutoVLMPromptMixin:
         )
         return (
             "This is a photograph captured by the vehicle's forward-facing camera. "
-            "Describe only safety-relevant facts, especially nearby vehicles.\n"
-            "Use words [likely], [unknown], [certain], or [uncertain] to express certainty.\n"
+            "Describe only safety-relevant facts that are actually visible in the image, especially nearby vehicles.\n"
+            "Do not infer anything about regions that are outside the camera view.\n"
+            "If a region is not visible in the image, write exactly 'not_visible' for that row.\n"
             "Focus on these regions relative to the vehicle in the image: front, left-front, "
             "right-front, rear, left-rear, right-rear.\n\n"
             f"Return exactly this format. {region_rule}\n"
@@ -98,6 +99,38 @@ class RightTurnAutoVLMPromptMixin:
             "Rear: ...\n"
             "Left-rear: ...\n"
             "Right-rear: ...\n"
+        )
+
+    def _build_visual_question_prompt(
+        self,
+        question_cfg: Dict[str, Any],
+    ) -> str:
+        question_id = str(question_cfg.get("id", "unknown_question"))
+        query = str(question_cfg.get("query", "")).strip()
+        positive = str(question_cfg.get("positive", "")).strip()
+        negative = str(question_cfg.get("negative", "")).strip()
+        return (
+            "You are answering one cooperative-driving question from a single camera image.\n"
+            f"Question ID: {question_id}\n"
+            f"Query: {query}\n"
+            f"Positive statement: {positive}\n"
+            f"Negative statement: {negative}\n\n"
+            "Use only what is visible in this image.\n"
+            "Do not infer from scene context if the queried region is outside the camera view.\n"
+            "If the queried region is not visible or too ambiguous, answer 'insufficient'.\n\n"
+            "Return JSON only with this schema:\n"
+            "{\n"
+            '  "answer": "positive" or "negative" or "insufficient",\n'
+            '  "visibility_status": "visible" or "partial" or "not_visible",\n'
+            '  "question_answerability": "answerable" or "partially_answerable" or "not_answerable",\n'
+            '  "support_strength": "none" or "weak" or "moderate" or "strong",\n'
+            '  "reason": "one short sentence"\n'
+            "}\n\n"
+            "Important rules:\n"
+            "- Use 'negative' only if the queried region is visible enough and no vehicle is present there.\n"
+            "- Use 'positive' only if a vehicle is actually supported by the visible evidence.\n"
+            "- Use 'insufficient' if the queried region is not visible or too ambiguous.\n"
+            "- Return JSON only."
         )
 
     def _build_language_scoring_prompt(
@@ -112,27 +145,28 @@ class RightTurnAutoVLMPromptMixin:
         negative = str(question_cfg.get("negative", "")).strip()
         evidence_text = fused_evidence if fused_evidence else "No textual evidence provided."
         return (
-            "You are evaluating cooperative driving evidence for one binary question.\n"
+            "You are evaluating textual cooperative-driving evidence for one binary question.\n"
             f"Question ID: {question_id}\n"
             f"Question type: {question_type}\n"
             f"Query: {query}\n"
             f"Positive statement: {positive}\n"
             f"Negative statement: {negative}\n\n"
             "Use only the provided evidence. Do not assume unseen facts.\n"
-            "Some evidence may be partial, occluded, weak, indirect, or conflicting.\n"
+            "Treat text like 'not_visible' or missing region evidence as lack of visibility, not as proof of absence.\n"
             "If the evidence does not clearly support either side, do not guess.\n\n"
             f"EVIDENCE:\n{evidence_text}\n\n"
             "Return JSON only with this schema:\n"
             "{\n"
-            '  "support_direction": "positive" or "negative" or "mixed" or "insufficient",\n'
+            '  "answer": "positive" or "negative" or "insufficient",\n'
+            '  "visibility_status": "visible" or "partial" or "not_visible",\n'
+            '  "question_answerability": "answerable" or "partially_answerable" or "not_answerable",\n'
             '  "support_strength": "none" or "weak" or "moderate" or "strong",\n'
-            '  "visibility": "clear" or "partial" or "weak" or "insufficient",\n'
             '  "reason": "one short sentence"\n'
             "}\n\n"
             "Important rules:\n"
             "- Do not use 'strong' unless the evidence is explicit and unambiguous.\n"
-            "- If evidence is partial, indirect, occluded, vague, or inferred, use at most 'moderate'.\n"
-            "- If the evidence cannot reliably determine the answer, use support_direction='insufficient'.\n"
+            "- If evidence is partial, indirect, vague, or inferred, use at most 'moderate'.\n"
+            "- If the evidence cannot reliably determine the answer, use answer='insufficient'.\n"
             "- Return JSON only."
         )
 
@@ -228,6 +262,30 @@ class RightTurnAutoVLMPromptMixin:
             raise ValueError("img_np cannot be converted to PIL image")
         return self._compute_single_image_description(image, token_size)
 
+    def _normalize_visibility_status(self, visibility: Any) -> str:
+        normalized = str(visibility).strip().lower()
+        if normalized in {"visible", "clear"}:
+            return "visible"
+        if normalized in {"partial", "partially_visible", "weak"}:
+            return "partial"
+        if normalized in {"not_visible", "not visible", "insufficient", "occluded", "unseen"}:
+            return "not_visible"
+        return "partial"
+
+    def _normalize_question_answerability(self, answerability: Any, visibility_status: str) -> str:
+        normalized = str(answerability).strip().lower()
+        if normalized in {"answerable", "yes"}:
+            return "answerable"
+        if normalized in {"partially_answerable", "partial", "limited"}:
+            return "partially_answerable"
+        if normalized in {"not_answerable", "no", "insufficient"}:
+            return "not_answerable"
+        if visibility_status == "visible":
+            return "answerable"
+        if visibility_status == "partial":
+            return "partially_answerable"
+        return "not_answerable"
+
     def _parse_language_scores(self, raw_text: str) -> Dict[str, Any]:
         parsed = self._extract_first_json_object(raw_text) or {}
 
@@ -239,50 +297,64 @@ class RightTurnAutoVLMPromptMixin:
 
         def _norm_answer(answer: Any) -> str:
             normalized = str(answer).strip().lower()
-            if normalized in {"positive", "negative", "uncertain"}:
+            if normalized in {"positive", "negative", "uncertain", "insufficient"}:
                 return normalized
             return "uncertain"
 
-        support_direction = str(parsed.get("support_direction", "")).strip().lower()
+        answer_raw = _norm_answer(parsed.get("answer", parsed.get("support_direction", "uncertain")))
+        support_direction = str(parsed.get("support_direction", answer_raw)).strip().lower()
         support_strength = str(parsed.get("support_strength", "")).strip().lower()
-        visibility = str(parsed.get("visibility", "")).strip().lower()
+        visibility = self._normalize_visibility_status(
+            parsed.get("visibility_status", parsed.get("visibility", "partial"))
+        )
+        question_answerability = self._normalize_question_answerability(
+            parsed.get("question_answerability", parsed.get("answerability", "")),
+            visibility,
+        )
         reason = str(parsed.get("reason", "")).strip()
 
         has_new_schema = (
-            support_direction in {"positive", "negative", "mixed", "insufficient"}
+            answer_raw in {"positive", "negative", "insufficient"}
+            or support_direction in {"positive", "negative", "mixed", "insufficient"}
             or support_strength in {"none", "weak", "moderate", "strong"}
-            or visibility in {"clear", "partial", "weak", "insufficient"}
+            or visibility in {"visible", "partial", "not_visible"}
         )
 
         if has_new_schema:
-            strength_map = {"none": 0.0, "weak": 0.35, "moderate": 0.75, "strong": 0.95}
-            visibility_map = {
-                "clear": 1.0,
-                "partial": 0.7,
-                "weak": 0.4,
-                "insufficient": 0.15,
+            strength_map = {"none": 0.0, "weak": 0.3, "moderate": 0.65, "strong": 0.9}
+            visibility_map = {"visible": 1.0, "partial": 0.6, "not_visible": 0.0}
+            answerability_map = {
+                "answerable": 1.0,
+                "partially_answerable": 0.5,
+                "not_answerable": 0.0,
             }
+
+            normalized_answer = answer_raw
+            if normalized_answer not in {"positive", "negative", "insufficient"}:
+                if support_direction in {"positive", "negative"}:
+                    normalized_answer = support_direction
+                else:
+                    normalized_answer = "insufficient"
+
             base = float(strength_map.get(support_strength, 0.0))
-            vis = float(visibility_map.get(visibility, 0.15))
-            unc = 1.0 - vis
-            if support_direction == "positive":
-                pos, neg = base * vis, 0.0
-            elif support_direction == "negative":
-                pos, neg = 0.0, base * vis
-            elif support_direction == "mixed":
-                pos = 0.5 * base * vis
-                neg = 0.5 * base * vis
-                unc = max(unc, 0.35)
+            vis = float(visibility_map.get(visibility, 0.0))
+            answerability_score = float(answerability_map.get(question_answerability, 0.0))
+
+            if normalized_answer == "positive":
+                evidence = base * max(vis, 0.35) * max(answerability_score, 0.5)
+                pos, neg = evidence, 0.0
+                unc = max(0.0, 1.0 - max(vis, answerability_score))
+                answer = "positive"
+            elif normalized_answer == "negative":
+                evidence = base * max(vis, 0.35) * max(answerability_score, 0.5)
+                pos, neg = 0.0, evidence
+                unc = max(0.0, 1.0 - max(vis, answerability_score))
+                answer = "negative"
             else:
                 pos = 0.0
                 neg = 0.0
-                unc = max(unc, 0.85)
-
-            if support_direction == "positive":
-                answer = "positive" if pos >= neg else "uncertain"
-            elif support_direction == "negative":
-                answer = "negative" if neg >= pos else "uncertain"
-            else:
+                unc = 0.1 if question_answerability == "not_answerable" else 0.25
+                evidence = 0.0
                 answer = "uncertain"
         else:
             pos = _clip01(parsed.get("positive_score", 0.0), 0.0)
@@ -294,9 +366,11 @@ class RightTurnAutoVLMPromptMixin:
                     answer = "positive"
                 elif neg > pos and neg > unc:
                     answer = "negative"
+            if visibility == "partial" and unc >= 0.9:
+                question_answerability = "not_answerable"
+            evidence = float(1.0 - unc)
 
         belief = float(pos - neg)
-        evidence = float(1.0 - unc)
         ambiguity = float(1.0 - abs(pos - neg))
         confidence = float(abs(belief) * evidence)
         return {
@@ -310,8 +384,29 @@ class RightTurnAutoVLMPromptMixin:
             "evidence": evidence,
             "ambiguity": ambiguity,
             "confidence": confidence,
+            "visibility_status": visibility,
+            "question_answerability": question_answerability,
+            "answerability_score": {
+                "answerable": 1.0,
+                "partially_answerable": 0.5,
+                "not_answerable": 0.0,
+            }.get(question_answerability, 0.0),
+            "raw_vlm_json": parsed,
             "raw_text": raw_text,
         }
+
+    def _score_question_from_visual_evidence(
+        self,
+        question_cfg: Dict[str, Any],
+        image: Image.Image,
+    ) -> Dict[str, Any]:
+        prompt = self._build_visual_question_prompt(question_cfg)
+        raw_text = self._run_qwen_generation(
+            prompt=prompt,
+            image=image,
+            max_new_tokens=self._vlm_score_max_new_tokens,
+        )
+        return self._parse_language_scores(raw_text)
 
     def _score_question_from_language_evidence(
         self,
