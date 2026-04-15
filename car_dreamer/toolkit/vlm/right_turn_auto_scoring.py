@@ -143,6 +143,138 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             parts.append(f"message_text:\n{text}")
         return "\n\n".join(parts)
 
+    def _get_converted_question_cfg(
+        self,
+        question_cfg: Dict[str, Any],
+        sensor_info: Dict[str, Any],
+        ego_pose: Dict[str, float],
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        if sensor_info.get("is_ego"):
+            return None, question_cfg
+        sender_id = int(sensor_info.get("sender_id", -1))
+        question_id = str(question_cfg.get("id", "unknown_question"))
+        bucket = self._get_vlm_step_cache_bucket("converted_queries")
+        cache_key = (sender_id, question_id)
+        if bucket is not None and cache_key in bucket:
+            converted_question_cfg = dict(bucket[cache_key])
+        else:
+            converted = compute_query_direction_from_observer(
+                ego_pose=ego_pose,
+                observer_pose=sensor_info.get("pose"),
+                question_id=question_id,
+            )
+            converted_question_cfg = {
+                "id": question_id,
+                "type": question_cfg["type"],
+                "query": converted.query,
+                "positive": converted.positive,
+                "negative": converted.negative,
+            }
+            if bucket is not None:
+                bucket[cache_key] = dict(converted_question_cfg)
+        return converted_question_cfg, converted_question_cfg
+
+    def _get_question_cfgs_for_sensor(
+        self,
+        question_cfgs: List[Dict[str, Any]],
+        sensor_info: Dict[str, Any],
+        ego_pose: Dict[str, float],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Optional[Dict[str, Any]]]]:
+        sensor_question_cfgs: List[Dict[str, Any]] = []
+        converted_by_id: Dict[str, Optional[Dict[str, Any]]] = {}
+        for question_cfg in question_cfgs:
+            converted_question_cfg, question_for_sensor = self._get_converted_question_cfg(
+                question_cfg,
+                sensor_info,
+                ego_pose,
+            )
+            question_id = str(question_cfg["id"])
+            sensor_question_cfgs.append(question_for_sensor)
+            converted_by_id[question_id] = converted_question_cfg
+        return sensor_question_cfgs, converted_by_id
+
+    def _evaluate_sensor_questions(
+        self,
+        sensor_info: Dict[str, Any],
+        question_cfgs: List[Dict[str, Any]],
+        ego_pose: Dict[str, float],
+    ) -> Dict[str, Dict[str, Any]]:
+        sensor_question_cfgs, converted_by_id = self._get_question_cfgs_for_sensor(
+            question_cfgs,
+            sensor_info,
+            ego_pose,
+        )
+        scene_description = str(sensor_info.get("scene_description", "")).strip()
+        language_evidence = self._compose_language_evidence(sensor_info)
+        image = sensor_info.get("image")
+
+        if image is not None:
+            if bool(getattr(self, "_vlm_enable_multi_query_scoring", True)):
+                scores_by_id = self._score_multi_questions_from_visual_evidence(
+                    image,
+                    sensor_question_cfgs,
+                )
+                evaluation_mode = "visual_multi_query"
+            else:
+                scores_by_id = {
+                    str(question_cfg["id"]): self._score_question_from_visual_evidence(
+                        question_cfg,
+                        image,
+                    )
+                    for question_cfg in sensor_question_cfgs
+                }
+                evaluation_mode = "visual_question"
+        elif language_evidence:
+            if bool(getattr(self, "_vlm_enable_multi_query_scoring", True)):
+                scores_by_id = self._score_multi_questions_from_language_evidence(
+                    language_evidence,
+                    sensor_question_cfgs,
+                )
+                evaluation_mode = "language_multi_query"
+            else:
+                scores_by_id = {
+                    str(question_cfg["id"]): self._score_question_from_language_evidence(
+                        question_cfg,
+                        language_evidence,
+                    )
+                    for question_cfg in sensor_question_cfgs
+                }
+                evaluation_mode = "language_fallback"
+        else:
+            scores_by_id = {
+                str(question_cfg["id"]): self._default_question_score(
+                    reason="No image or textual evidence available for this sensor.",
+                )
+                for question_cfg in sensor_question_cfgs
+            }
+            evaluation_mode = "empty_evidence"
+
+        sensor_records: Dict[str, Dict[str, Any]] = {}
+        for question_cfg in question_cfgs:
+            question_id = str(question_cfg["id"])
+            scoring = dict(
+                scores_by_id.get(question_id)
+                or self._default_question_score(
+                    reason=f"Missing score for question_id={question_id}.",
+                )
+            )
+            used_for_aggregation, skip_reason = self._should_use_sensor_for_question(
+                question_cfg,
+                sensor_info,
+                scoring,
+            )
+            sensor_records[question_id] = self._build_sensor_score_record(
+                sensor_info,
+                scene_description,
+                language_evidence,
+                scoring,
+                converted_by_id.get(question_id),
+                evaluation_mode,
+                used_for_aggregation,
+                skip_reason,
+            )
+        return sensor_records
+
     def _should_use_sensor_for_question(
         self,
         question_cfg: Dict[str, Any],
@@ -588,7 +720,10 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
 
     def _build_ego_sensor_instances(self, ego_image: Image.Image) -> List[Dict[str, Any]]:
         tf = self.ego.get_transform()
-        scene_description = self._compute_single_image_description(ego_image, token_size=self.feature_size)
+        scene_description = self._compute_single_image_description(
+            ego_image,
+            cache_key=("scene_description", int(self.ego.id)),
+        )
         return [{
             "sender_id": int(self.ego.id),
             "sensor_name": "cam0",
@@ -624,124 +759,14 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             })
         return sensor_infos
 
-    def _build_sensor_score_record(
-        self,
-        sensor_info: Dict[str, Any],
-        scene_description: str,
-        language_evidence: str,
-        scoring: Dict[str, Any],
-        converted_question_cfg: Optional[Dict[str, Any]],
-        evaluation_mode: str,
-        used_for_aggregation: bool,
-        skip_reason: str,
-    ) -> Dict[str, Any]:
-        return {
-            "sender_id": int(sensor_info["sender_id"]),
-            "sensor_name": str(sensor_info["sensor_name"]),
-            "is_ego": bool(sensor_info.get("is_ego", False)),
-            "received_age_s": float(sensor_info.get("received_age_s", 0.0)),
-            "pose": dict(sensor_info.get("pose", {})),
-            "sensor_yaw_rad": float(sensor_info.get("sensor_yaw_rad", 0.0)),
-            "converted_query": converted_question_cfg["query"] if converted_question_cfg else None,
-            "scene_description": scene_description,
-            "language_evidence": language_evidence,
-            "evaluation_mode": evaluation_mode,
-            "image_available": bool(sensor_info.get("image") is not None),
-            "used_for_aggregation": bool(used_for_aggregation),
-            "skip_reason": str(skip_reason),
-            **scoring,
-        }
-
-    def _evaluate_single_question(
+    def _build_question_result_from_sensor_records(
         self,
         question_cfg: Dict[str, Any],
-        ego_image: Image.Image,
+        per_sensor_instance_scores: List[Dict[str, Any]],
         shared_images: List[Image.Image],
-        shared_infos: List[Dict[str, Any]],
         shared_meta: Dict[str, Any],
+        ego_pose: Dict[str, float],
     ) -> Dict[str, Any]:
-        ego_sensor_infos = self._build_ego_sensor_instances(ego_image)
-        shared_sensor_infos = self._build_shared_sensor_instances(shared_infos)
-        all_sensor_infos = ego_sensor_infos + shared_sensor_infos
-
-        ego_tf = self.ego.get_transform()
-        ego_pose = {
-            "x": float(ego_tf.location.x),
-            "y": float(ego_tf.location.y),
-            "yaw": float(ego_tf.rotation.yaw),
-        }
-        per_sensor_instance_scores: List[Dict[str, Any]] = []
-
-        for sensor_info in all_sensor_infos:
-            scene_description = str(sensor_info.get("scene_description", "")).strip()
-            language_evidence = self._compose_language_evidence(sensor_info)
-            converted_question_cfg = None
-            question_for_sensor = question_cfg
-            if sensor_info.get("is_ego"):
-                pass
-            else:
-                converted = compute_query_direction_from_observer(
-                    ego_pose=ego_pose,
-                    observer_pose=sensor_info.get("pose"),
-                    question_id=question_cfg["id"],
-                )
-                converted_question_cfg = {
-                    "id": question_cfg["id"],
-                    "type": question_cfg["type"],
-                    "query": converted.query,
-                    "positive": converted.positive,
-                    "negative": converted.negative,
-                }
-                question_for_sensor = converted_question_cfg
-
-            image = sensor_info.get("image")
-            if image is not None:
-                scoring = self._score_question_from_visual_evidence(question_for_sensor, image)
-                evaluation_mode = "visual_question"
-            elif language_evidence:
-                scoring = self._score_question_from_language_evidence(
-                    question_for_sensor,
-                    language_evidence,
-                )
-                evaluation_mode = "language_fallback"
-            else:
-                scoring = {
-                    "positive_score": 0.0,
-                    "negative_score": 0.0,
-                    "unknown_score": 0.1,
-                    "uncertainty": 0.1,
-                    "answer": "uncertain",
-                    "reason": "No image or textual evidence available for this sensor.",
-                    "belief": 0.0,
-                    "evidence": 0.0,
-                    "ambiguity": 1.0,
-                    "confidence": 0.0,
-                    "visibility_status": "not_visible",
-                    "question_answerability": "not_answerable",
-                    "answerability_score": 0.0,
-                    "raw_vlm_json": {},
-                    "raw_text": "",
-                }
-                evaluation_mode = "empty_evidence"
-
-            used_for_aggregation, skip_reason = self._should_use_sensor_for_question(
-                question_cfg,
-                sensor_info,
-                scoring,
-            )
-            per_sensor_instance_scores.append(
-                self._build_sensor_score_record(
-                    sensor_info,
-                    scene_description,
-                    language_evidence,
-                    scoring,
-                    converted_question_cfg,
-                    evaluation_mode,
-                    used_for_aggregation,
-                    skip_reason,
-                )
-            )
-
         sensor_mean_scores_all = self._aggregate_sensor_scores(per_sensor_instance_scores)
         usable_instance_scores = [
             item for item in per_sensor_instance_scores if bool(item.get("used_for_aggregation", True))
@@ -815,6 +840,102 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             "confidence_gain": float(aggregated["confidence"] - ego_score.get("confidence", 0.0)),
         }
 
+    def _build_sensor_score_record(
+        self,
+        sensor_info: Dict[str, Any],
+        scene_description: str,
+        language_evidence: str,
+        scoring: Dict[str, Any],
+        converted_question_cfg: Optional[Dict[str, Any]],
+        evaluation_mode: str,
+        used_for_aggregation: bool,
+        skip_reason: str,
+    ) -> Dict[str, Any]:
+        return {
+            "sender_id": int(sensor_info["sender_id"]),
+            "sensor_name": str(sensor_info["sensor_name"]),
+            "is_ego": bool(sensor_info.get("is_ego", False)),
+            "received_age_s": float(sensor_info.get("received_age_s", 0.0)),
+            "pose": dict(sensor_info.get("pose", {})),
+            "sensor_yaw_rad": float(sensor_info.get("sensor_yaw_rad", 0.0)),
+            "converted_query": converted_question_cfg["query"] if converted_question_cfg else None,
+            "scene_description": scene_description,
+            "language_evidence": language_evidence,
+            "evaluation_mode": evaluation_mode,
+            "image_available": bool(sensor_info.get("image") is not None),
+            "used_for_aggregation": bool(used_for_aggregation),
+            "skip_reason": str(skip_reason),
+            **scoring,
+        }
+
+    def _evaluate_single_question(
+        self,
+        question_cfg: Dict[str, Any],
+        ego_image: Image.Image,
+        shared_images: List[Image.Image],
+        shared_infos: List[Dict[str, Any]],
+        shared_meta: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        ego_sensor_infos = self._build_ego_sensor_instances(ego_image)
+        shared_sensor_infos = self._build_shared_sensor_instances(shared_infos)
+        all_sensor_infos = ego_sensor_infos + shared_sensor_infos
+
+        ego_tf = self.ego.get_transform()
+        ego_pose = {
+            "x": float(ego_tf.location.x),
+            "y": float(ego_tf.location.y),
+            "yaw": float(ego_tf.rotation.yaw),
+        }
+        per_sensor_instance_scores: List[Dict[str, Any]] = []
+
+        for sensor_info in all_sensor_infos:
+            sensor_records = self._evaluate_sensor_questions(sensor_info, [question_cfg], ego_pose)
+            per_sensor_instance_scores.append(sensor_records[str(question_cfg["id"])])
+
+        return self._build_question_result_from_sensor_records(
+            question_cfg,
+            per_sensor_instance_scores,
+            shared_images,
+            shared_meta,
+            ego_pose,
+        )
+
+    def _evaluate_all_questions_multi(
+        self,
+        question_cfgs: List[Dict[str, Any]],
+        ego_image: Image.Image,
+        shared_images: List[Image.Image],
+        shared_infos: List[Dict[str, Any]],
+        shared_meta: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        ego_sensor_infos = self._build_ego_sensor_instances(ego_image)
+        shared_sensor_infos = self._build_shared_sensor_instances(shared_infos)
+        all_sensor_infos = ego_sensor_infos + shared_sensor_infos
+
+        ego_tf = self.ego.get_transform()
+        ego_pose = {
+            "x": float(ego_tf.location.x),
+            "y": float(ego_tf.location.y),
+            "yaw": float(ego_tf.rotation.yaw),
+        }
+        per_question_scores: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for sensor_info in all_sensor_infos:
+            sensor_records = self._evaluate_sensor_questions(sensor_info, question_cfgs, ego_pose)
+            for question_cfg in question_cfgs:
+                question_id = str(question_cfg["id"])
+                per_question_scores[question_id].append(sensor_records[question_id])
+
+        return {
+            str(question_cfg["id"]): self._build_question_result_from_sensor_records(
+                question_cfg,
+                per_question_scores[str(question_cfg["id"])],
+                shared_images,
+                shared_meta,
+                ego_pose,
+            )
+            for question_cfg in question_cfgs
+        }
+
     def _evaluate_vlm_questions(self) -> Dict[str, Any]:
         if not self._vlm_enabled:
             VLM_SCORING_LOGGER.debug("VLM evaluation skipped because VLM is disabled.")
@@ -848,7 +969,37 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             "questions": {},
         }
 
-        for qcfg in self._vlm_questions:
+        if bool(getattr(self, "_vlm_enable_multi_query_scoring", True)):
+            try:
+                question_results = self._evaluate_all_questions_multi(
+                    self._vlm_questions,
+                    ego_image,
+                    shared_images,
+                    shared_infos,
+                    shared_meta,
+                )
+            except Exception as exc:
+                VLM_SCORING_LOGGER.exception(
+                    "VLM multi-query evaluation failed step=%d; falling back to per-question mode.",
+                    int(self._time_step),
+                )
+                question_results = {}
+                eval_result["fallback_used"] = True
+                eval_result["fallback_error"] = str(exc)
+            for qcfg in self._vlm_questions:
+                question_id = str(qcfg["id"])
+                qres = question_results.get(question_id)
+                if qres is not None:
+                    eval_result["questions"][question_id] = qres
+                    self._vlm_records.append({"step": int(self._time_step), **qres})
+
+        missing_question_ids = [
+            str(qcfg["id"])
+            for qcfg in self._vlm_questions
+            if str(qcfg["id"]) not in eval_result["questions"]
+        ]
+        for question_id in missing_question_ids:
+            qcfg = next(q for q in self._vlm_questions if str(q["id"]) == question_id)
             try:
                 qres = self._evaluate_single_question(
                     qcfg,
@@ -857,7 +1008,7 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                     shared_infos,
                     shared_meta,
                 )
-                eval_result["questions"][qcfg["id"]] = qres
+                eval_result["questions"][question_id] = qres
                 self._vlm_records.append({"step": int(self._time_step), **qres})
             except Exception as exc:
                 VLM_SCORING_LOGGER.exception(
@@ -865,7 +1016,7 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                     int(self._time_step),
                     qcfg["id"],
                 )
-                eval_result["questions"][qcfg["id"]] = {
+                eval_result["questions"][question_id] = {
                     "question_id": qcfg["id"],
                     "question_type": qcfg["type"],
                     "error": str(exc),

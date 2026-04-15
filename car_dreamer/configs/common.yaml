@@ -172,6 +172,13 @@ env:
     continuous_steer: [-1.0, 1.0] # continuous value of steering angles
     n_commands: 3 # number of text commands for message handler
 
+  speed_preset: ""
+
+  vlm:
+    scene_description_max_new_tokens: 96
+    enable_step_cache: True
+    enable_multi_query_scoring: True
+
   communication: # V2V communication global default settings
     group_update_period: 20   # how often to recompute groups (steps)
     comm_period: 1            # how often to trigger intra-group communication (steps)

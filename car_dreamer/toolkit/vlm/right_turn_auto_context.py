@@ -146,7 +146,8 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
                 continue
             info = self._make_shared_info_from_actor(actor, image)
             info["scene_description"] = self._compute_single_image_description(
-                image, self.feature_size
+                image,
+                cache_key=("scene_description", int(actor.id)),
             )
             shared_infos.append(info)
             if len(shared_infos) >= self._vlm_max_total_shared_images:
@@ -203,10 +204,9 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
             "window_s": self._vlm_received_window_s,
             "sampling_strategy": self._vlm_sampling_strategy,
         }
-        runtime_cfg = get_runtime_logging_config()
         if should_log_periodic(
             int(self._time_step),
-            int(runtime_cfg["step_debug_interval"]),
+            int(self._get_runtime_debug_interval()),
             logger=VLM_CONTEXT_LOGGER,
         ):
             per_sender_counts = {sid: len(items) for sid, items in per_sender_infos.items()}

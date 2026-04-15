@@ -37,6 +37,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
 
     def __init__(self, config):
         super().__init__(config)
+        self._apply_speed_preset()
         self._init_group_state()
         self._init_communication_config()
         self._init_graph_builder()
@@ -48,6 +49,30 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
     # =========================================================
     # Initialization helpers
     # =========================================================
+
+    def _apply_speed_preset(self) -> None:
+        self._runtime_step_debug_interval_override = 0
+        preset = str(getattr(self._config, "speed_preset", "")).strip().lower()
+        self._speed_preset = preset
+        if not preset or preset in {"default", "none"}:
+            return
+        if preset != "fast_episode":
+            AUTO_ENV_LOGGER.warning("Unknown speed preset '%s'; ignoring.", preset)
+            return
+        self._config = self._config.update(
+            {
+                "communication.comm_period": 2,
+                "vlm.eval_period": 3,
+                "vlm.max_images_per_sender_for_inference": 2,
+                "vlm.max_total_shared_images": 6,
+                "vlm.max_msgs_per_sender": 6,
+            }
+        )
+        self._runtime_step_debug_interval_override = 50
+        AUTO_ENV_LOGGER.info(
+            "Applied speed preset '%s' with faster VLM/communication settings.",
+            preset,
+        )
 
     def _init_group_state(self) -> None:
         self.groups: Dict[int, set[int]] = {}
@@ -140,13 +165,21 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
 
         self._vlm_do_sample = bool(getattr(vlm_cfg, "do_sample", False))
         self._vlm_score_max_new_tokens = int(getattr(vlm_cfg, "score_max_new_tokens", 128))
+        self._vlm_scene_description_max_new_tokens = int(
+            getattr(vlm_cfg, "scene_description_max_new_tokens", 96)
+        )
         self._vlm_temperature = float(getattr(vlm_cfg, "temperature", 0.0))
         self._vlm_top_p = float(getattr(vlm_cfg, "top_p", 0.9))
+        self._vlm_enable_step_cache = bool(getattr(vlm_cfg, "enable_step_cache", True))
+        self._vlm_enable_multi_query_scoring = bool(
+            getattr(vlm_cfg, "enable_multi_query_scoring", True)
+        )
 
         self._vlm_model = None
         self._vlm_processor: Optional[AutoProcessor] = None
         self._vlm_records: List[Dict[str, Any]] = []
         self._vlm_last_eval: Dict[str, Any] = {}
+        self._vlm_step_cache: Dict[str, Any] = {}
         self._vlm_questions = self._build_vlm_questions()
 
     def _init_runtime_flags(self) -> None:
@@ -217,9 +250,11 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
                     "error": str(exc),
                 }
         self._cleanup_actor_flow()
-        runtime_cfg = get_runtime_logging_config()
-        print(f"Step {self._time_step}: in_flight={len(self._in_flight)} received_for_ego={len(self._received.get(int(self.ego.id), []))}")
-        if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=AUTO_ENV_LOGGER):
+        if should_log_periodic(
+            int(self._time_step),
+            int(self._get_runtime_debug_interval()),
+            logger=AUTO_ENV_LOGGER,
+        ):
             AUTO_ENV_LOGGER.debug(
                 "Right-turn auto step=%d in_flight=%d received_for_ego=%d",
                 self._time_step,

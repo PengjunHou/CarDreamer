@@ -21,6 +21,14 @@ RUNTIME_LOGGER = get_runtime_logger("car_dreamer.runtime")
 
 
 class RightTurnAutoRuntimeMixin:
+    def _get_runtime_debug_interval(self) -> int:
+        runtime_cfg = get_runtime_logging_config()
+        base_interval = int(runtime_cfg["step_debug_interval"])
+        override = int(getattr(self, "_runtime_step_debug_interval_override", 0) or 0)
+        if override > 0:
+            return max(base_interval, override)
+        return base_interval
+
     def _cache_actor(self, actor: Optional[carla.Actor]) -> None:
         if actor is not None:
             self._actor_cache[int(actor.id)] = actor
@@ -57,6 +65,7 @@ class RightTurnAutoRuntimeMixin:
         self._veh_net_res = {}
         self._vlm_records = []
         self._vlm_last_eval = {}
+        self._vlm_step_cache = {}
         self._vlm_episode_dumped = False
         self._emulation_episode_dumped = False
         self._emulation_episode_steps = []
@@ -131,11 +140,15 @@ class RightTurnAutoRuntimeMixin:
         obs = self.obs if int(sender.id) == int(self.ego.id) else self.group_obs.get(int(sender.id), {})
         payload: Dict[str, Any] = {}
         if self.payload_fn is not None:
+            sender_id = int(sender.id)
             payload = self.payload_fn(
                 sender,
                 obs,
                 self.feature_size,
-                image_proc_fn=self._compute_single_image_description_from_array,
+                image_proc_fn=lambda img, _unused, sid=sender_id: self._compute_single_image_description_from_array(
+                    img,
+                    cache_key=("scene_description", sid),
+                ),
             )
 
         tf = sender.get_transform()
@@ -252,9 +265,11 @@ class RightTurnAutoRuntimeMixin:
                     )
                     enqueued_count += 1
                     total_payload_bytes += int(payload_bytes)
-        print(f"Group communication run step={self._time_step} sender_ids={sorted(sender_ids)} enqueued_count={enqueued_count} total_payload_bytes={total_payload_bytes}")
-        runtime_cfg = get_runtime_logging_config()
-        if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=RUNTIME_LOGGER):
+        if should_log_periodic(
+            int(self._time_step),
+            int(self._get_runtime_debug_interval()),
+            logger=RUNTIME_LOGGER,
+        ):
             RUNTIME_LOGGER.debug(
                 "Communication round step=%d senders=%s enqueued=%d in_flight=%d payload_bytes=%d",
                 self._time_step,
@@ -277,8 +292,11 @@ class RightTurnAutoRuntimeMixin:
             else:
                 remaining.append(msg)
         self._in_flight = remaining
-        runtime_cfg = get_runtime_logging_config()
-        if should_log_periodic(current_step, int(runtime_cfg["step_debug_interval"]), logger=RUNTIME_LOGGER):
+        if should_log_periodic(
+            current_step,
+            int(self._get_runtime_debug_interval()),
+            logger=RUNTIME_LOGGER,
+        ):
             RUNTIME_LOGGER.debug(
                 "Delivered messages step=%d delivered=%d remaining_in_flight=%d ego_received=%d",
                 current_step,
@@ -296,7 +314,7 @@ class RightTurnAutoRuntimeMixin:
             self.ego,
             self.obs,
             self.feature_size,
-            image_proc_fn=self._compute_single_image_description_from_array,
+            image_proc_fn=None,
         )
         msgs = self._received.get(int(self.ego.id), deque())
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -330,8 +348,11 @@ class RightTurnAutoRuntimeMixin:
         reward_info["ego_x"] = self.ego.get_transform().location.x
         reward_info["ego_y"] = self.ego.get_transform().location.y
         shared_data.update(reward_info)
-        runtime_cfg = get_runtime_logging_config()
-        if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=RUNTIME_LOGGER):
+        if should_log_periodic(
+            int(self._time_step),
+            int(self._get_runtime_debug_interval()),
+            logger=RUNTIME_LOGGER,
+        ):
             valid_nodes = int(np.asarray(shared_data.get("node_mask", np.zeros(0))).sum())
             edge_index = np.asarray(shared_data.get("edge_index", np.zeros((2, 0))))
             msg_count = len(self._received.get(int(self.ego.id), deque()))

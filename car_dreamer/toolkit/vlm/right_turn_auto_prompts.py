@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -18,6 +18,30 @@ SCENE_DESCRIPTION_REGION_PROMPTS = {
 
 
 class RightTurnAutoVLMPromptMixin:
+    def _ensure_vlm_step_cache(self) -> Optional[Dict[str, Any]]:
+        if not bool(getattr(self, "_vlm_enable_step_cache", False)):
+            return None
+        current_step = int(getattr(self, "_time_step", -1))
+        cache = getattr(self, "_vlm_step_cache", None)
+        if not isinstance(cache, dict) or int(cache.get("step", -2)) != current_step:
+            cache = {
+                "step": current_step,
+                "scene_descriptions": {},
+                "converted_queries": {},
+            }
+            self._vlm_step_cache = cache
+        return cache
+
+    def _get_vlm_step_cache_bucket(self, bucket_name: str) -> Optional[Dict[Any, Any]]:
+        cache = self._ensure_vlm_step_cache()
+        if cache is None:
+            return None
+        bucket = cache.get(bucket_name)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            cache[bucket_name] = bucket
+        return bucket
+
     def _init_vlm(self) -> None:
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         self._vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -184,6 +208,89 @@ class RightTurnAutoVLMPromptMixin:
             "- Return JSON only."
         )
 
+    def _format_multi_query_block(
+        self,
+        question_cfgs: Sequence[Dict[str, Any]],
+    ) -> str:
+        rows: List[str] = []
+        for question_cfg in question_cfgs:
+            rows.append(
+                "\n".join(
+                    [
+                        f"- {str(question_cfg.get('id', 'unknown_question'))}",
+                        f"  query: {str(question_cfg.get('query', '')).strip()}",
+                        f"  positive: {str(question_cfg.get('positive', '')).strip()}",
+                        f"  negative: {str(question_cfg.get('negative', '')).strip()}",
+                    ]
+                )
+            )
+        return "\n".join(rows)
+
+    def _build_multi_query_visual_prompt(
+        self,
+        question_cfgs: Sequence[Dict[str, Any]],
+    ) -> str:
+        question_block = self._format_multi_query_block(question_cfgs)
+        return (
+            "You are answering multiple cooperative-driving questions from a single camera image.\n"
+            "Use only what is visible in this image.\n"
+            "Do not infer from scene context if the queried region is outside the camera view.\n"
+            "If a queried region is not visible or too ambiguous, answer 'insufficient' for that question.\n\n"
+            f"Questions:\n{question_block}\n\n"
+            "Return JSON only with this schema:\n"
+            "{\n"
+            '  "results": {\n'
+            '    "<question_id>": {\n'
+            '      "answer": "positive" or "negative" or "insufficient",\n'
+            '      "visibility_status": "visible" or "partial" or "not_visible",\n'
+            '      "question_answerability": "answerable" or "partially_answerable" or "not_answerable",\n'
+            '      "support_strength": "none" or "weak" or "moderate" or "strong",\n'
+            '      "reason": "one short sentence"\n'
+            "    }\n"
+            "  }\n"
+            "}\n\n"
+            "Important rules:\n"
+            "- Include every provided question_id exactly once under results.\n"
+            "- Use 'negative' only if the queried region is visible enough and no vehicle is present there.\n"
+            "- Use 'positive' only if a vehicle is actually supported by visible evidence.\n"
+            "- Use 'insufficient' if the queried region is not visible or too ambiguous.\n"
+            "- Return JSON only."
+        )
+
+    def _build_multi_query_language_scoring_prompt(
+        self,
+        question_cfgs: Sequence[Dict[str, Any]],
+        fused_evidence: str,
+    ) -> str:
+        question_block = self._format_multi_query_block(question_cfgs)
+        evidence_text = fused_evidence if fused_evidence else "No textual evidence provided."
+        return (
+            "You are evaluating textual cooperative-driving evidence for multiple binary questions.\n"
+            "Use only the provided evidence. Do not assume unseen facts.\n"
+            "Treat text like 'not_visible' or missing region evidence as lack of visibility, not as proof of absence.\n"
+            "If the evidence does not clearly support either side for a question, do not guess.\n\n"
+            f"Questions:\n{question_block}\n\n"
+            f"EVIDENCE:\n{evidence_text}\n\n"
+            "Return JSON only with this schema:\n"
+            "{\n"
+            '  "results": {\n'
+            '    "<question_id>": {\n'
+            '      "answer": "positive" or "negative" or "insufficient",\n'
+            '      "visibility_status": "visible" or "partial" or "not_visible",\n'
+            '      "question_answerability": "answerable" or "partially_answerable" or "not_answerable",\n'
+            '      "support_strength": "none" or "weak" or "moderate" or "strong",\n'
+            '      "reason": "one short sentence"\n'
+            "    }\n"
+            "  }\n"
+            "}\n\n"
+            "Important rules:\n"
+            "- Include every provided question_id exactly once under results.\n"
+            "- Do not use 'strong' unless the evidence is explicit and unambiguous.\n"
+            "- If evidence is partial, indirect, vague, or inferred, use at most 'moderate'.\n"
+            "- If the evidence cannot reliably determine the answer for a question, use answer='insufficient'.\n"
+            "- Return JSON only."
+        )
+
     def _extract_first_json_object(self, text: str) -> Optional[Dict[str, Any]]:
         text = text.strip()
         if not text:
@@ -264,17 +371,45 @@ class RightTurnAutoVLMPromptMixin:
             "Use _compute_single_image_description instead."
         )
 
-    def _compute_single_image_description(self, image: Image.Image, token_size: int) -> str:
+    def _compute_single_image_description(
+        self,
+        image: Image.Image,
+        token_size: Optional[int] = None,
+        *,
+        cache_key: Any = None,
+    ) -> str:
         if image is None:
             raise ValueError("Image cannot be converted to PIL for Qwen2-VL captioning.")
+        bucket = self._get_vlm_step_cache_bucket("scene_descriptions")
+        if cache_key is not None and bucket is not None and cache_key in bucket:
+            return str(bucket[cache_key])
         prompt = self._build_scene_description_prompt()
-        return self._run_qwen_generation(prompt=prompt, image=image, max_new_tokens=token_size)
+        del token_size
+        max_new_tokens = int(getattr(self, "_vlm_scene_description_max_new_tokens", 96))
+        result = self._run_qwen_generation(
+            prompt=prompt,
+            image=image,
+            max_new_tokens=max(max_new_tokens, 1),
+        )
+        if cache_key is not None and bucket is not None:
+            bucket[cache_key] = str(result)
+        return str(result)
 
-    def _compute_single_image_description_from_array(self, img_np, token_size: int):
+    def _compute_single_image_description_from_array(
+        self,
+        img_np,
+        token_size: Optional[int] = None,
+        *,
+        cache_key: Any = None,
+    ):
         image = self._coerce_to_pil_image(img_np)
         if image is None:
             raise ValueError("img_np cannot be converted to PIL image")
-        return self._compute_single_image_description(image, token_size)
+        return self._compute_single_image_description(
+            image,
+            token_size=token_size,
+            cache_key=cache_key,
+        )
 
     def _normalize_visibility_status(self, visibility: Any) -> str:
         normalized = str(visibility).strip().lower()
@@ -409,6 +544,56 @@ class RightTurnAutoVLMPromptMixin:
             "raw_text": raw_text,
         }
 
+    def _default_question_score(
+        self,
+        *,
+        reason: str,
+        raw_text: str = "",
+        raw_vlm_json: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "positive_score": 0.0,
+            "negative_score": 0.0,
+            "unknown_score": 0.1,
+            "uncertainty": 0.1,
+            "answer": "uncertain",
+            "reason": str(reason),
+            "belief": 0.0,
+            "evidence": 0.0,
+            "ambiguity": 1.0,
+            "confidence": 0.0,
+            "visibility_status": "not_visible",
+            "question_answerability": "not_answerable",
+            "answerability_score": 0.0,
+            "raw_vlm_json": dict(raw_vlm_json or {}),
+            "raw_text": str(raw_text),
+        }
+
+    def _parse_multi_query_scores(
+        self,
+        raw_text: str,
+        question_cfgs: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        parsed = self._extract_first_json_object(raw_text) or {}
+        raw_results = parsed.get("results", parsed)
+        if not isinstance(raw_results, dict):
+            raw_results = {}
+        parsed_scores: Dict[str, Dict[str, Any]] = {}
+        for question_cfg in question_cfgs:
+            question_id = str(question_cfg.get("id", "unknown_question"))
+            item = raw_results.get(question_id)
+            if isinstance(item, dict):
+                parsed_scores[question_id] = self._parse_language_scores(
+                    json.dumps(item, ensure_ascii=False)
+                )
+            else:
+                parsed_scores[question_id] = self._default_question_score(
+                    reason=f"Missing multi-query result for question_id={question_id}.",
+                    raw_text=raw_text,
+                    raw_vlm_json=parsed if isinstance(parsed, dict) else {},
+                )
+        return parsed_scores
+
     def _score_question_from_visual_evidence(
         self,
         question_cfg: Dict[str, Any],
@@ -434,6 +619,32 @@ class RightTurnAutoVLMPromptMixin:
             max_new_tokens=self._vlm_score_max_new_tokens,
         )
         return self._parse_language_scores(raw_text)
+
+    def _score_multi_questions_from_visual_evidence(
+        self,
+        image: Image.Image,
+        question_cfgs: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        prompt = self._build_multi_query_visual_prompt(question_cfgs)
+        raw_text = self._run_qwen_generation(
+            prompt=prompt,
+            image=image,
+            max_new_tokens=self._vlm_score_max_new_tokens,
+        )
+        return self._parse_multi_query_scores(raw_text, question_cfgs)
+
+    def _score_multi_questions_from_language_evidence(
+        self,
+        fused_evidence: str,
+        question_cfgs: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        prompt = self._build_multi_query_language_scoring_prompt(question_cfgs, fused_evidence)
+        raw_text = self._run_qwen_generation(
+            prompt=prompt,
+            image=None,
+            max_new_tokens=self._vlm_score_max_new_tokens,
+        )
+        return self._parse_multi_query_scores(raw_text, question_cfgs)
 
     # =========================================================
     # Geometric utilities and aggregation
