@@ -104,12 +104,12 @@ class EmulationGraphGRUTest(unittest.TestCase):
         sample = dataset[9]
 
         self.assertEqual(sample["node_features"].shape, (8, 3, 28))
-        self.assertEqual(sample["task_relevance"].shape, (8, 3, 4))
-        self.assertEqual(sample["target_sender_collab"].shape, (5, 3, 4))
-        self.assertEqual(sample["target_sender_gain"].shape, (5, 3, 4))
-        self.assertEqual(sample["target_ego_sc"].shape, (5, 4))
+        self.assertEqual(sample["task_relevance"].shape, (8, 3, 6))
+        self.assertEqual(sample["target_sender_collab"].shape, (5, 3, 6))
+        self.assertEqual(sample["target_sender_gain"].shape, (5, 3, 6))
+        self.assertEqual(sample["target_ego_sc"].shape, (5, 6))
         self.assertEqual(sample["future_node_mask"].shape, (5, 3))
-        self.assertEqual(sample["query_mask"].sum(), 4.0)
+        self.assertEqual(sample["query_mask"].sum(), 6.0)
         self.assertEqual(sample["node_mask"].shape, (8, 3))
         self.assertTrue(np.any(sample["task_relevance"] > 0.0))
 
@@ -135,9 +135,9 @@ class EmulationGraphGRUTest(unittest.TestCase):
         net = MODEL.GraphGRUEmulationModel(config)
         outputs = net(sample)
 
-        self.assertEqual(tuple(outputs["sender_collab"].shape), (1, 3, 4, 4))
-        self.assertEqual(tuple(outputs["sender_gain"].shape), (1, 3, 4, 4))
-        self.assertEqual(tuple(outputs["ego_sc"].shape), (1, 3, 4))
+        self.assertEqual(tuple(outputs["sender_collab"].shape), (1, 3, 4, 6))
+        self.assertEqual(tuple(outputs["sender_gain"].shape), (1, 3, 4, 6))
+        self.assertEqual(tuple(outputs["ego_sc"].shape), (1, 3, 6))
 
         diff = torch.abs(outputs["sender_collab"][0, :, 0, 0] - outputs["sender_collab"][0, :, 0, 1]).sum()
         self.assertGreater(float(diff), 1e-8)

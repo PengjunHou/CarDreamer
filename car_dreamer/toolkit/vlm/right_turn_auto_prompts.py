@@ -63,6 +63,20 @@ class RightTurnAutoVLMPromptMixin:
                 "positive": "There is a vehicle in the left-front region of the vehicle.",
                 "negative": "There is no vehicle in the left-front region of the vehicle.",
             },
+            {
+                "id": "clg_front_vehicle",
+                "type": "clg",
+                "query": "Is there a vehicle in the front region of the vehicle?",
+                "positive": "There is a vehicle in the front region of the vehicle.",
+                "negative": "There is no vehicle in the front region of the vehicle.",
+            },
+            {
+                "id": "clg_rear_vehicle",
+                "type": "clg",
+                "query": "Is there a vehicle in the rear region of the vehicle?",
+                "positive": "There is a vehicle in the rear region of the vehicle.",
+                "negative": "There is no vehicle in the rear region of the vehicle.",
+            },
         ]
 
     def _masked_mean_pool(self, hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:

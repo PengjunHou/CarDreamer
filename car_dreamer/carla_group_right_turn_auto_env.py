@@ -82,7 +82,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
             overhead_bytes=overhead_bytes,
         )
         self.payload_fn = payload_fn_llm
-        self.trans_msg_type = str(getattr(self._config, "trans_msg_type", "image"))
+        self.trans_msg_type = str(getattr(self._config, "trans_msg_type", "image")) # "image_emb"
         self._in_flight: List[V2VMessage] = []
         self._received: Dict[int, Deque[V2VMessage]] = defaultdict(
             lambda: deque(maxlen=RECEIVED_BUFFER_SIZE)
@@ -104,7 +104,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
     def _init_vlm_config(self) -> None:
         vlm_cfg = getattr(self._config, "vlm", None)
         self._vlm_enabled = bool(getattr(vlm_cfg, "enabled", True))
-        self._vlm_model_name = str(getattr(vlm_cfg, "model_name", "Qwen/Qwen2.5-VL-3B-Instruct"))
+        self._vlm_model_name = str(getattr(vlm_cfg, "model_name", "Qwen/Qwen2.5-VL-7B-Instruct"))
         self._vlm_image_template = str(getattr(vlm_cfg, "image_template", "Analyze the driving scene."))
         self._vlm_eval_period = int(getattr(vlm_cfg, "eval_period", 1))
         self._vlm_image_obs_key = str(getattr(vlm_cfg, "image_obs_key", "camera"))
@@ -130,7 +130,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
             except Exception:
                 self._vlm_shared_conf_weights = {}
 
-        self._vlm_importance_distance_tau = float(getattr(vlm_cfg, "importance_distance_tau", 20.0))
+        self._vlm_importance_distance_tau = float(getattr(vlm_cfg, "importance_distance_tau", 1.0))
         self._vlm_importance_region_weight = float(getattr(vlm_cfg, "importance_region_weight", 1.0))
         self._vlm_importance_facing_weight = float(getattr(vlm_cfg, "importance_facing_weight", 1.0))
         self._vlm_importance_distance_weight = float(getattr(vlm_cfg, "importance_distance_weight", 1.0))

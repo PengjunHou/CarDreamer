@@ -131,7 +131,7 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
 
     def _is_rear_question(self, question_cfg: Dict[str, Any]) -> bool:
         qid = str(question_cfg.get("id", "")).lower()
-        return "left_rear" in qid or "right_rear" in qid
+        return "rear" in qid and "front" not in qid
 
     def _compose_language_evidence(self, sensor_info: Dict[str, Any]) -> str:
         parts: List[str] = []
@@ -182,6 +182,8 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             return (front_d, side_d)
         if "left_front" in qid:
             return (front_d, -side_d)
+        if "rear" in qid:
+            return (-front_d, 0.0)
         if "left_vehicle_speed" in qid or "left_side" in qid:
             return (0.0, -side_d)
         return (front_d, 0.0)

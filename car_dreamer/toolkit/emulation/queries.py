@@ -12,12 +12,16 @@ _DEFAULT_QUERY_IDS: Dict[str, List[str]] = {
         "clg_right_rear_vehicle",
         "clg_right_front_vehicle",
         "clg_left_front_vehicle",
+        "clg_front_vehicle",
+        "clg_rear_vehicle",
     ],
     "left_turn": [
         "clg_left_rear_vehicle",
         "clg_right_rear_vehicle",
         "clg_right_front_vehicle",
         "clg_left_front_vehicle",
+        "clg_front_vehicle",
+        "clg_rear_vehicle",
     ],
     "lane_change": [
         "target_lane_rear_vehicle",
@@ -75,7 +79,9 @@ def make_required_region(scene_type: str, query_id: str) -> RegionBox:
         return RegionBox(center=(10.0, 3.0), size=(12.0, 4.0), yaw=0.0)
     if "left_front" in qid:
         return RegionBox(center=(10.0, -3.0), size=(12.0, 4.0), yaw=0.0)
-    if "forward" in qid:
+    if "rear" in qid:
+        return RegionBox(center=(-8.0, 0.0), size=(10.0, 4.5), yaw=0.0)
+    if "front" in qid or "forward" in qid:
         return RegionBox(center=(14.0, 0.0), size=(18.0, 5.0), yaw=0.0)
     return RegionBox(center=(8.0, 0.0), size=(12.0, 4.0), yaw=0.0)
 

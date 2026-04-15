@@ -13,6 +13,8 @@ DEFAULT_QUESTION_ORDER: Tuple[str, ...] = (
     "clg_right_rear_vehicle",
     "clg_right_front_vehicle",
     "clg_left_front_vehicle",
+    "clg_front_vehicle",
+    "clg_rear_vehicle",
 )
 
 
