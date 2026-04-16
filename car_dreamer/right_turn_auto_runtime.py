@@ -394,6 +394,13 @@ class RightTurnAutoRuntimeMixin:
         )
         return shared_data
 
+    def _maybe_dump_vlm_records_step(self) -> None:
+        if not getattr(self, "_dump_vlm_records_each_step", False):
+            return
+        os.makedirs(self._vlm_dump_dir, exist_ok=True)
+        path = os.path.join(self._vlm_dump_dir, "vlm_records_live.json")
+        self.dump_vlm_records(path)
+
     def _maybe_dump_vlm_records(self, suffix: str) -> Optional[str]:
         if not self._dump_vlm_records_on_episode_end or self._vlm_episode_dumped:
             return None

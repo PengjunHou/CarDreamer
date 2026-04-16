@@ -159,6 +159,28 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
         }
         return shared_images, shared_infos, meta
 
+    def _merge_sender_infos(self, infos: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if len(infos) == 1:
+            return infos[0]
+        sorted_infos = sorted(infos, key=lambda x: float(x.get("received_age_s", 0.0)), reverse=True)
+        latest = sorted_infos[-1]
+        parts: List[str] = []
+        prev_desc: Optional[str] = None
+        for info in sorted_infos:
+            desc = str(info.get("scene_description", "")).strip()
+            if not desc or desc == prev_desc:
+                continue
+            prev_desc = desc
+            age = float(info.get("received_age_s", 0.0))
+            label = "[latest]" if age < 0.01 else f"[age={age:.2f}s]"
+            parts.append(f"{label}\n{desc}")
+        texts = [str(info.get("text", "")).strip() for info in sorted_infos if str(info.get("text", "")).strip()]
+        return {
+            **latest,
+            "scene_description": "\n\n".join(parts),
+            "text": texts[-1] if texts else "",
+        }
+
     def _get_received_shared_images_info(
         self,
     ) -> Tuple[List[Image.Image], List[Dict[str, Any]], Dict[str, Any]]:
@@ -184,7 +206,7 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
                 if info.get("scene_description") or info.get("img_emb") is not None or info.get("text"):
                     infos.append(info)
             if infos:
-                per_sender_infos[int(sender_id)] = infos
+                per_sender_infos[int(sender_id)] = [self._merge_sender_infos(infos)]
 
         per_sender_infos = self._cap_total_shared_infos(
             per_sender_infos, self._vlm_max_total_shared_images

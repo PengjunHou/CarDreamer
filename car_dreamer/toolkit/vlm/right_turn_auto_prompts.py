@@ -232,8 +232,13 @@ class RightTurnAutoVLMPromptMixin:
     ) -> str:
         question_block = self._format_multi_query_block(question_cfgs)
         evidence_text = fused_evidence if fused_evidence else "No textual evidence provided."
+        temporal_hint = (
+            "The evidence contains multiple temporal snapshots labeled [age=Xs] (oldest) to [latest]. "
+            "Treat [latest] as most authoritative; older snapshots provide supporting context.\n"
+        ) if "[age=" in evidence_text else ""
         return (
             "You are evaluating textual cooperative-driving evidence for multiple binary questions.\n"
+            + temporal_hint +
             "Use only the provided evidence. Do not assume unseen facts.\n"
             "Treat text like 'not_visible' or missing region evidence as lack of visibility, not as proof of absence.\n"
             "If the evidence does not clearly support either side for a question, do not guess.\n\n"

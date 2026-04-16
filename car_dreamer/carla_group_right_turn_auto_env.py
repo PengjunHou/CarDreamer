@@ -187,6 +187,9 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
             getattr(self._config, "dump_vlm_records_on_episode_end", True)
         )
         self._vlm_dump_dir = str(getattr(self._config, "vlm_dump_dir", "data"))
+        self._dump_vlm_records_each_step = bool(
+            getattr(self._config, "dump_vlm_records_each_step", False)
+        )
         self._dump_emulation_records_on_episode_end = bool(
             getattr(self._config, "dump_emulation_records_on_episode_end", True)
         )
@@ -242,6 +245,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
                 AUTO_ENV_LOGGER.debug("Starting VLM evaluation at step=%d", self._time_step)
                 self._evaluate_vlm_questions()
                 AUTO_ENV_LOGGER.debug("Completed VLM evaluation at step=%d", self._time_step)
+                self._maybe_dump_vlm_records_step()
             except Exception as exc:
                 AUTO_ENV_LOGGER.exception("VLM evaluation failed at step=%d", self._time_step)
                 self._vlm_last_eval = {
