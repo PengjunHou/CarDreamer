@@ -145,10 +145,6 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
             if image is None:
                 continue
             info = self._make_shared_info_from_actor(actor, image)
-            info["scene_description"] = self._compute_single_image_description(
-                image,
-                cache_key=("scene_description", int(actor.id)),
-            )
             shared_infos.append(info)
             if len(shared_infos) >= self._vlm_max_total_shared_images:
                 break

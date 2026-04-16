@@ -143,6 +143,12 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             parts.append(f"message_text:\n{text}")
         return "\n\n".join(parts)
 
+    def _compose_caption_only_evidence(self, scene_description: str) -> str:
+        scene_description = str(scene_description).strip()
+        if not scene_description:
+            return ""
+        return f"scene_description:\n{scene_description}"
+
     def _get_converted_question_cfg(
         self,
         question_cfg: Dict[str, Any],
@@ -207,23 +213,43 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
         scene_description = str(sensor_info.get("scene_description", "")).strip()
         language_evidence = self._compose_language_evidence(sensor_info)
         image = sensor_info.get("image")
+        sender_id = int(sensor_info.get("sender_id", -1))
 
         if image is not None:
-            if bool(getattr(self, "_vlm_enable_multi_query_scoring", True)):
-                scores_by_id = self._score_multi_questions_from_visual_evidence(
-                    image,
+            if not scene_description:
+                try:
+                    scene_description = self._compute_single_image_description(
+                        image,
+                        cache_key=("scene_description", sender_id),
+                    )
+                except Exception as exc:
+                    failure_reason = (
+                        f"scene_description generation failed for sender_id={sender_id}: {exc}"
+                    )
+                    scores_by_id = {
+                        str(question_cfg["id"]): self._default_question_score(
+                            reason=failure_reason,
+                            raw_text="",
+                            raw_vlm_json={"caption_error": str(exc)},
+                        )
+                        for question_cfg in sensor_question_cfgs
+                    }
+                    evaluation_mode = "caption_failure_safe_default"
+                    language_evidence = ""
+                else:
+                    language_evidence = self._compose_caption_only_evidence(scene_description)
+                    scores_by_id = self._score_multi_questions_from_language_evidence(
+                        language_evidence,
+                        sensor_question_cfgs,
+                    )
+                    evaluation_mode = "caption_then_language_multi_query"
+            else:
+                language_evidence = self._compose_caption_only_evidence(scene_description)
+                scores_by_id = self._score_multi_questions_from_language_evidence(
+                    language_evidence,
                     sensor_question_cfgs,
                 )
-                evaluation_mode = "visual_multi_query"
-            else:
-                scores_by_id = {
-                    str(question_cfg["id"]): self._score_question_from_visual_evidence(
-                        question_cfg,
-                        image,
-                    )
-                    for question_cfg in sensor_question_cfgs
-                }
-                evaluation_mode = "visual_question"
+                evaluation_mode = "caption_then_language_multi_query"
         elif language_evidence:
             if bool(getattr(self, "_vlm_enable_multi_query_scoring", True)):
                 scores_by_id = self._score_multi_questions_from_language_evidence(
@@ -720,16 +746,12 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
 
     def _build_ego_sensor_instances(self, ego_image: Image.Image) -> List[Dict[str, Any]]:
         tf = self.ego.get_transform()
-        scene_description = self._compute_single_image_description(
-            ego_image,
-            cache_key=("scene_description", int(self.ego.id)),
-        )
         return [{
             "sender_id": int(self.ego.id),
             "sensor_name": "cam0",
             "image": ego_image,
             "img_emb": None,
-            "scene_description": scene_description,
+            "scene_description": "",
             "text": "",
             "pose": {
                 "x": float(tf.location.x),
@@ -969,29 +991,29 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             "questions": {},
         }
 
-        if bool(getattr(self, "_vlm_enable_multi_query_scoring", True)):
-            try:
-                question_results = self._evaluate_all_questions_multi(
-                    self._vlm_questions,
-                    ego_image,
-                    shared_images,
-                    shared_infos,
-                    shared_meta,
-                )
-            except Exception as exc:
-                VLM_SCORING_LOGGER.exception(
-                    "VLM multi-query evaluation failed step=%d; falling back to per-question mode.",
-                    int(self._time_step),
-                )
-                question_results = {}
-                eval_result["fallback_used"] = True
-                eval_result["fallback_error"] = str(exc)
-            for qcfg in self._vlm_questions:
-                question_id = str(qcfg["id"])
-                qres = question_results.get(question_id)
-                if qres is not None:
-                    eval_result["questions"][question_id] = qres
-                    self._vlm_records.append({"step": int(self._time_step), **qres})
+        try:
+            question_results = self._evaluate_all_questions_multi(
+                self._vlm_questions,
+                ego_image,
+                shared_images,
+                shared_infos,
+                shared_meta,
+            )
+        except Exception as exc:
+            VLM_SCORING_LOGGER.exception(
+                "VLM multi-query evaluation failed step=%d; falling back to single-question safe mode.",
+                int(self._time_step),
+            )
+            question_results = {}
+            eval_result["fallback_used"] = True
+            eval_result["fallback_error"] = str(exc)
+            eval_result["fallback_mode"] = "single_question_safe_mode"
+        for qcfg in self._vlm_questions:
+            question_id = str(qcfg["id"])
+            qres = question_results.get(question_id)
+            if qres is not None:
+                eval_result["questions"][question_id] = qres
+                self._vlm_records.append({"step": int(self._time_step), **qres})
 
         missing_question_ids = [
             str(qcfg["id"])

@@ -209,6 +209,29 @@ class RightTurnAutoVLMOptimizationTest(unittest.TestCase):
         self.assertGreater(result["clg_front_vehicle"]["confidence"], 0.2)
         self.assertEqual(result["clg_rear_vehicle"]["question_answerability"], "not_answerable")
 
+    def test_contradictory_not_visible_result_is_normalized(self):
+        prompts = _load_prompts_module()
+        parser = prompts.RightTurnAutoVLMPromptMixin()
+        result = parser._parse_multi_query_scores(
+            json.dumps(
+                {
+                    "results": {
+                        "clg_front_vehicle": {
+                            "answer": "negative",
+                            "visibility_status": "not_visible",
+                            "question_answerability": "not_answerable",
+                            "support_strength": "moderate",
+                            "reason": "The front region is not visible.",
+                        }
+                    }
+                }
+            ),
+            [{"id": "clg_front_vehicle"}],
+        )
+        self.assertEqual(result["clg_front_vehicle"]["answer"], "uncertain")
+        self.assertEqual(result["clg_front_vehicle"]["negative_score"], 0.0)
+        self.assertEqual(result["clg_front_vehicle"]["evidence"], 0.0)
+
     def test_multi_query_evaluation_reduces_generation_calls(self):
         scoring = _load_scoring_module()
 
@@ -363,6 +386,245 @@ class RightTurnAutoVLMOptimizationTest(unittest.TestCase):
         self.assertIn("sender_importance_positive", result["questions"]["clg_front_vehicle"])
         self.assertIn("ego_only", result["questions"]["clg_front_vehicle"])
         self.assertIn("confidence_gain", result["questions"]["clg_front_vehicle"])
+        self.assertEqual(
+            result["questions"]["clg_front_vehicle"]["per_sensor_scores"][0]["evaluation_mode"],
+            "caption_then_language_multi_query",
+        )
+
+    def test_visual_sensor_uses_caption_then_language_even_when_flag_disabled(self):
+        scoring = _load_scoring_module()
+
+        class _Transform:
+            def __init__(self, x: float, y: float, yaw: float):
+                self.location = types.SimpleNamespace(x=x, y=y)
+                self.rotation = types.SimpleNamespace(yaw=yaw)
+
+        class _Velocity:
+            def __init__(self, x: float, y: float):
+                self.x = x
+                self.y = y
+
+        class _Actor:
+            def __init__(self, actor_id: int, x: float, y: float, yaw: float):
+                self.id = actor_id
+                self._transform = _Transform(x, y, yaw)
+                self._velocity = _Velocity(0.0, 0.0)
+
+            def get_transform(self):
+                return self._transform
+
+            def get_velocity(self):
+                return self._velocity
+
+        class Dummy(scoring.RightTurnAutoVLMScoringMixin):
+            def __init__(self):
+                self._config = types.SimpleNamespace(
+                    world=types.SimpleNamespace(fixed_delta_seconds=0.1)
+                )
+                self._time_step = 12
+                self._vlm_enabled = True
+                self._vlm_enable_multi_query_scoring = False
+                self._vlm_enable_step_cache = True
+                self._vlm_step_cache = {}
+                self._vlm_shared_source = "received_feat"
+                self._vlm_received_window_s = 2.0
+                self._vlm_score_max_new_tokens = 32
+                self._vlm_scene_description_max_new_tokens = 16
+                self._vlm_do_sample = False
+                self._vlm_temperature = 0.0
+                self._vlm_top_p = 0.9
+                self._vlm_model = object()
+                self._vlm_processor = object()
+                self._vlm_records = []
+                self._vlm_last_eval = {}
+                self._vlm_ego_conf_weight = 1.0
+                self._vlm_default_shared_conf_weight = 1.0
+                self._vlm_shared_conf_weights = {}
+                self._vlm_importance_distance_tau = 1.0
+                self._vlm_importance_region_weight = 1.0
+                self._vlm_importance_facing_weight = 1.0
+                self._vlm_importance_distance_weight = 1.0
+                self._vlm_importance_ego_bias = 0.0
+                self._vlm_sc_beta = 1.0
+                self._vlm_sensor_fov_deg = 120.0
+                self.feature_size = 3072
+                self._emulation_episode_steps = []
+                self._emulation_step_counter = 0
+                self._vlm_questions = [
+                    {
+                        "id": "clg_front_vehicle",
+                        "type": "clg",
+                        "query": "front?",
+                        "positive": "front yes",
+                        "negative": "front no",
+                    },
+                    {
+                        "id": "clg_rear_vehicle",
+                        "type": "clg",
+                        "query": "rear?",
+                        "positive": "rear yes",
+                        "negative": "rear no",
+                    },
+                ]
+                self.ego = _Actor(1, 0.0, 0.0, 0.0)
+                self.calls = []
+
+            def _run_qwen_generation(self, prompt, image=None, max_new_tokens=None):
+                self.calls.append(
+                    {
+                        "prompt": str(prompt),
+                        "image": bool(image is not None),
+                    }
+                )
+                if "Describe only safety-relevant facts" in str(prompt):
+                    return "Front: vehicle visible\nLeft-front: visible\nRight-front: visible\nRear: not_visible\nLeft-rear: not_visible\nRight-rear: not_visible"
+                return json.dumps(
+                    {
+                        "results": {
+                            "clg_front_vehicle": {
+                                "answer": "positive",
+                                "visibility_status": "visible",
+                                "question_answerability": "answerable",
+                                "support_strength": "strong",
+                                "reason": "A vehicle is visible ahead.",
+                            },
+                            "clg_rear_vehicle": {
+                                "answer": "insufficient",
+                                "visibility_status": "not_visible",
+                                "question_answerability": "not_answerable",
+                                "support_strength": "none",
+                                "reason": "Rear is not visible.",
+                            },
+                        }
+                    }
+                )
+
+            def _get_ego_and_shared_images_info(self):
+                ego_image = Image.fromarray(np.zeros((12, 12, 3), dtype=np.uint8))
+                return ego_image, [], [], {
+                    "shared_source": "received_feat",
+                    "num_candidate_msgs": 0,
+                    "num_selected_shared_images": 0,
+                    "selected_sender_ids": [],
+                    "window_s": 2.0,
+                    "sampling_strategy": "uniform",
+                }
+
+            def _maybe_record_emulation_step(self, eval_result, shared_infos, shared_meta):
+                self._recorded_eval_result = dict(eval_result)
+
+        dummy = Dummy()
+        result = dummy._evaluate_vlm_questions()
+
+        self.assertEqual(len(dummy.calls), 2)
+        self.assertEqual(
+            result["questions"]["clg_front_vehicle"]["per_sensor_scores"][0]["evaluation_mode"],
+            "caption_then_language_multi_query",
+        )
+        self.assertEqual(
+            result["questions"]["clg_front_vehicle"]["per_sensor_scores"][0]["language_evidence"],
+            "scene_description:\nFront: vehicle visible\nLeft-front: visible\nRight-front: visible\nRear: not_visible\nLeft-rear: not_visible\nRight-rear: not_visible",
+        )
+
+    def test_caption_failure_uses_safe_default_without_visual_fallback(self):
+        scoring = _load_scoring_module()
+
+        class _Transform:
+            def __init__(self, x: float, y: float, yaw: float):
+                self.location = types.SimpleNamespace(x=x, y=y)
+                self.rotation = types.SimpleNamespace(yaw=yaw)
+
+        class _Velocity:
+            def __init__(self, x: float, y: float):
+                self.x = x
+                self.y = y
+
+        class _Actor:
+            def __init__(self, actor_id: int, x: float, y: float, yaw: float):
+                self.id = actor_id
+                self._transform = _Transform(x, y, yaw)
+                self._velocity = _Velocity(0.0, 0.0)
+
+            def get_transform(self):
+                return self._transform
+
+            def get_velocity(self):
+                return self._velocity
+
+        class Dummy(scoring.RightTurnAutoVLMScoringMixin):
+            def __init__(self):
+                self._config = types.SimpleNamespace(
+                    world=types.SimpleNamespace(fixed_delta_seconds=0.1)
+                )
+                self._time_step = 13
+                self._vlm_enabled = True
+                self._vlm_enable_multi_query_scoring = True
+                self._vlm_enable_step_cache = True
+                self._vlm_step_cache = {}
+                self._vlm_shared_source = "received_feat"
+                self._vlm_received_window_s = 2.0
+                self._vlm_score_max_new_tokens = 32
+                self._vlm_scene_description_max_new_tokens = 16
+                self._vlm_do_sample = False
+                self._vlm_temperature = 0.0
+                self._vlm_top_p = 0.9
+                self._vlm_model = object()
+                self._vlm_processor = object()
+                self._vlm_records = []
+                self._vlm_last_eval = {}
+                self._vlm_ego_conf_weight = 1.0
+                self._vlm_default_shared_conf_weight = 1.0
+                self._vlm_shared_conf_weights = {}
+                self._vlm_importance_distance_tau = 1.0
+                self._vlm_importance_region_weight = 1.0
+                self._vlm_importance_facing_weight = 1.0
+                self._vlm_importance_distance_weight = 1.0
+                self._vlm_importance_ego_bias = 0.0
+                self._vlm_sc_beta = 1.0
+                self._vlm_sensor_fov_deg = 120.0
+                self.feature_size = 3072
+                self._emulation_episode_steps = []
+                self._emulation_step_counter = 0
+                self._vlm_questions = [
+                    {
+                        "id": "clg_front_vehicle",
+                        "type": "clg",
+                        "query": "front?",
+                        "positive": "front yes",
+                        "negative": "front no",
+                    }
+                ]
+                self.ego = _Actor(1, 0.0, 0.0, 0.0)
+                self.calls = []
+
+            def _run_qwen_generation(self, prompt, image=None, max_new_tokens=None):
+                self.calls.append({"prompt": str(prompt), "image": bool(image is not None)})
+                raise RuntimeError("caption crashed")
+
+            def _get_ego_and_shared_images_info(self):
+                ego_image = Image.fromarray(np.zeros((12, 12, 3), dtype=np.uint8))
+                return ego_image, [], [], {
+                    "shared_source": "received_feat",
+                    "num_candidate_msgs": 0,
+                    "num_selected_shared_images": 0,
+                    "selected_sender_ids": [],
+                    "window_s": 2.0,
+                    "sampling_strategy": "uniform",
+                }
+
+            def _maybe_record_emulation_step(self, eval_result, shared_infos, shared_meta):
+                self._recorded_eval_result = dict(eval_result)
+
+        dummy = Dummy()
+        result = dummy._evaluate_vlm_questions()
+        sensor_record = result["questions"]["clg_front_vehicle"]["per_sensor_scores"][0]
+
+        self.assertEqual(len(dummy.calls), 1)
+        self.assertEqual(sensor_record["evaluation_mode"], "caption_failure_safe_default")
+        self.assertEqual(sensor_record["answer"], "uncertain")
+        self.assertEqual(sensor_record["question_answerability"], "not_answerable")
+        self.assertIn("scene_description generation failed", sensor_record["reason"])
+        self.assertEqual(sensor_record["language_evidence"], "")
 
 
 if __name__ == "__main__":

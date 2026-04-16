@@ -124,6 +124,22 @@ class VLMUnknownScoringTest(unittest.TestCase):
         self.assertEqual(result['confidence'], 0.0)
         self.assertLessEqual(result['unknown_score'], 0.25)
 
+    def test_parse_negative_not_visible_is_normalized_to_uncertain(self):
+        prompts = _load_prompts_module()
+        parser = prompts.RightTurnAutoVLMPromptMixin()
+        result = parser._parse_language_scores(
+            '{"answer": "negative", "visibility_status": "not_visible", '
+            '"question_answerability": "not_answerable", "support_strength": "moderate", '
+            '"reason": "The target region is not visible."}'
+        )
+        self.assertEqual(result['answer'], 'uncertain')
+        self.assertEqual(result['visibility_status'], 'not_visible')
+        self.assertEqual(result['question_answerability'], 'not_answerable')
+        self.assertEqual(result['positive_score'], 0.0)
+        self.assertEqual(result['negative_score'], 0.0)
+        self.assertEqual(result['evidence'], 0.0)
+        self.assertEqual(result['confidence'], 0.0)
+
     def test_rear_question_skips_ego_forward_camera(self):
         scoring = _load_scoring_module()
 

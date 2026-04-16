@@ -206,7 +206,7 @@ carla_group_right_turn_auto:
   env.max_flow_dist: 8
   env.lane_end_point: [-5.0, -110.3, 0.1, 90.0]
   # Group vehicles
-  env.num_group_vehs: 2
+  env.num_group_vehs: 4
   env.group_observation.enabled: [camera, collision]
   env.group_observation.camera.fov: 180
   env.grouping_strategy: "fixed"
@@ -219,7 +219,7 @@ carla_group_right_turn_auto:
   env.feature_size: 3072
   env.graph.window_s: 2.0
   env.graph.tmax: 20
-  env.graph.max_nodes: 3
+  env.graph.max_nodes: 5
   env.graph.feat_dim_max: 3072
   env.graph.star_graph: true
 

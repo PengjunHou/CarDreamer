@@ -139,38 +139,6 @@ class RightTurnAutoVLMPromptMixin:
             "Right-rear: ...\n"
         )
 
-    def _build_visual_question_prompt(
-        self,
-        question_cfg: Dict[str, Any],
-    ) -> str:
-        question_id = str(question_cfg.get("id", "unknown_question"))
-        query = str(question_cfg.get("query", "")).strip()
-        positive = str(question_cfg.get("positive", "")).strip()
-        negative = str(question_cfg.get("negative", "")).strip()
-        return (
-            "You are answering one cooperative-driving question from a single camera image.\n"
-            f"Question ID: {question_id}\n"
-            f"Query: {query}\n"
-            f"Positive statement: {positive}\n"
-            f"Negative statement: {negative}\n\n"
-            "Use only what is visible in this image.\n"
-            "Do not infer from scene context if the queried region is outside the camera view.\n"
-            "If the queried region is not visible or too ambiguous, answer 'insufficient'.\n\n"
-            "Return JSON only with this schema:\n"
-            "{\n"
-            '  "answer": "positive" or "negative" or "insufficient",\n'
-            '  "visibility_status": "visible" or "partial" or "not_visible",\n'
-            '  "question_answerability": "answerable" or "partially_answerable" or "not_answerable",\n'
-            '  "support_strength": "none" or "weak" or "moderate" or "strong",\n'
-            '  "reason": "one short sentence"\n'
-            "}\n\n"
-            "Important rules:\n"
-            "- Use 'negative' only if the queried region is visible enough and no vehicle is present there.\n"
-            "- Use 'positive' only if a vehicle is actually supported by the visible evidence.\n"
-            "- Use 'insufficient' if the queried region is not visible or too ambiguous.\n"
-            "- Return JSON only."
-        )
-
     def _build_language_scoring_prompt(
         self,
         question_cfg: Dict[str, Any],
@@ -485,6 +453,16 @@ class RightTurnAutoVLMPromptMixin:
                 else:
                     normalized_answer = "insufficient"
 
+            # Enforce structural consistency before mapping into numeric scores.
+            # If the queried region is not visible or not answerable, we should
+            # not preserve a directional positive/negative conclusion.
+            if visibility == "not_visible":
+                question_answerability = "not_answerable"
+            if question_answerability == "not_answerable":
+                normalized_answer = "insufficient"
+                support_direction = "insufficient"
+                support_strength = "none"
+
             base = float(strength_map.get(support_strength, 0.0))
             vis = float(visibility_map.get(visibility, 0.0))
             answerability_score = float(answerability_map.get(question_answerability, 0.0))
@@ -593,19 +571,6 @@ class RightTurnAutoVLMPromptMixin:
                     raw_vlm_json=parsed if isinstance(parsed, dict) else {},
                 )
         return parsed_scores
-
-    def _score_question_from_visual_evidence(
-        self,
-        question_cfg: Dict[str, Any],
-        image: Image.Image,
-    ) -> Dict[str, Any]:
-        prompt = self._build_visual_question_prompt(question_cfg)
-        raw_text = self._run_qwen_generation(
-            prompt=prompt,
-            image=image,
-            max_new_tokens=self._vlm_score_max_new_tokens,
-        )
-        return self._parse_language_scores(raw_text)
 
     def _score_question_from_language_evidence(
         self,
