@@ -10,7 +10,6 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import carla
 import numpy as np
 import torch
-from agents.navigation.basic_agent import BasicAgent
 from runtime_logging import get_runtime_logger, get_runtime_logging_config, should_log_periodic
 
 from .toolkit import (
@@ -22,6 +21,7 @@ from .toolkit import (
     get_vehicle_pos,
     payload_fn_llm,
 )
+from .toolkit.planner.agents.navigation.basic_agent import BasicAgent
 from .toolkit.emulation.features import (
     build_observable_region,
     compute_accessibility,
