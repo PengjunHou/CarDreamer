@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List
+import random
+from typing import Dict, List, Sequence
 
 import numpy as np
 
@@ -10,6 +11,14 @@ from .features import (
     compute_accessibility,
     compute_complementarity,
     compute_task_relevance,
+)
+from .policy import (
+    ALL_POLICIES,
+    POLICY_REGISTRY,
+    CollaborationAction,
+    FixedCollaborationPolicy,
+    VehicleInfo,
+    get_policy,
 )
 from .queries import make_query_records
 from .schema import (
@@ -28,7 +37,16 @@ def generate_synthetic_canonical_episode(
     num_vehicles: int = 3,
     dt: float = 0.1,
     seed: int = 0,
+    policy_id: str = "P3",
 ) -> CanonicalEpisodeRecord:
+    """Generate a synthetic canonical episode under a fixed collaboration policy.
+
+    Args:
+        policy_id: one of 'P1'..'P8'. Defaults to 'P3' (Full-High-Equal).
+                   Use 'random' to sample a different policy at each call.
+    """
+    policy = get_policy(policy_id)
+    rng_py = random.Random(seed)
     rng = np.random.default_rng(seed)
     queries = make_query_records(scene_type)
     query_ids = [query.query_id for query in queries]
@@ -57,9 +75,8 @@ def generate_synthetic_canonical_episode(
     ego_yaw = 0.0
 
     for step_index in range(num_steps):
-        vehicles: List[CandidateVehicleState] = []
-        total_gain = {query_id: 0.0 for query_id in query_ids}
-
+        # --- compute per-vehicle state (geometry + sensing) ---
+        step_vehicles_raw = []
         for item in vehicle_state:
             pos = item["pos"] + step_index * dt * item["vel"]
             vel = item["vel"]
@@ -94,31 +111,76 @@ def generate_synthetic_canonical_episode(
                 float(intent_summary[2]),
                 float(intent_summary[3]),
             ]
-            task_relevance: Dict[str, float] = {}
+
+            # s_collab scalar for policy decisions
+            task_relevance_vals: Dict[str, float] = {}
             sender_collab: Dict[str, float] = {}
             sender_gain: Dict[str, float] = {}
-
             for query in queries:
                 n_val = compute_task_relevance(sender_region, ego_region, query.required_region)
                 collab = float(complementarity * n_val * accessibility)
                 gain = float(collab * (0.5 + 0.5 * q_conf))
-                task_relevance[query.query_id] = n_val
+                task_relevance_vals[query.query_id] = n_val
                 sender_collab[query.query_id] = collab
                 sender_gain[query.query_id] = gain
-                total_gain[query.query_id] += gain
+
+            s_collab_scalar = float(np.mean(list(sender_collab.values()))) if sender_collab else 0.0
+
+            step_vehicles_raw.append({
+                "vehicle_id": int(item["vehicle_id"]),
+                "delta_pos": delta_pos,
+                "delta_vel": delta_vel,
+                "delta_yaw": delta_yaw,
+                "shared_summary_raw": shared_summary_raw,
+                "shared_summary_semantic": shared_summary_semantic,
+                "shared_confidence": q_conf,
+                "intent_summary": intent_summary,
+                "complementarity": complementarity,
+                "accessibility": accessibility,
+                "observable_region": sender_region,
+                "distance_m": distance_m,
+                "latency_s": latency_s,
+                "task_relevance": task_relevance_vals,
+                "sender_collab": sender_collab,
+                "sender_gain": sender_gain,
+                "s_collab_scalar": s_collab_scalar,
+            })
+
+        # --- apply policy to get action u_t ---
+        vehicle_infos = [
+            VehicleInfo(
+                vehicle_id=v["vehicle_id"],
+                sender_collab=v["s_collab_scalar"],
+                distance_m=v["distance_m"],
+            )
+            for v in step_vehicles_raw
+        ]
+        action: CollaborationAction = policy(vehicle_infos, rng=rng_py)
+
+        # --- build CandidateVehicleState with action fields ---
+        total_gain = {query_id: 0.0 for query_id in query_ids}
+        vehicles: List[CandidateVehicleState] = []
+        for v in step_vehicles_raw:
+            vid = v["vehicle_id"]
+            alpha = float(action.alpha.get(vid, 0.0))
+            nu = float(action.nu.get(vid, 0.0))
+            bandwidth = float(action.bandwidth.get(vid, 0.0))
+            for qid, gain in v["sender_gain"].items():
+                # only selected vehicles actually contribute gain
+                total_gain[qid] += gain * alpha
 
             vehicles.append(
                 CandidateVehicleState(
-                    vehicle_id=int(item["vehicle_id"]),
-                    delta_pos=delta_pos,
-                    delta_vel=delta_vel,
-                    delta_yaw=delta_yaw,
-                    shared_summary_raw=shared_summary_raw,
-                    shared_summary_semantic=shared_summary_semantic,
-                    shared_confidence=q_conf,
-                    intent_summary=intent_summary,
-                    complementarity=complementarity,
-                    accessibility=accessibility,
+                    vehicle_id=vid,
+                    delta_pos=v["delta_pos"],
+                    delta_vel=v["delta_vel"],
+                    delta_yaw=v["delta_yaw"],
+                    shared_summary_raw=v["shared_summary_raw"],
+                    shared_summary_semantic=v["shared_summary_semantic"],
+                    shared_confidence=v["shared_confidence"],
+                    intent_summary=v["intent_summary"],
+                    complementarity=v["complementarity"],
+                    accessibility=v["accessibility"],
                     component_valid_mask={
                         "delta_pos": True,
                         "delta_vel": True,
@@ -129,13 +191,17 @@ def generate_synthetic_canonical_episode(
                         "intent_summary": True,
                         "complementarity": True,
                         "accessibility": True,
+                        "action": True,
                     },
-                    observable_region=sender_region,
-                    communication_stats={"distance_m": distance_m, "latency_s": latency_s},
-                    query_task_relevance=task_relevance,
-                    sender_collab=sender_collab,
-                    sender_gain=sender_gain,
+                    observable_region=v["observable_region"],
+                    communication_stats={"distance_m": v["distance_m"], "latency_s": v["latency_s"]},
+                    query_task_relevance=v["task_relevance"],
+                    sender_collab=v["sender_collab"],
+                    sender_gain=v["sender_gain"],
                     metadata={"synthetic": True},
+                    alpha=alpha,
+                    nu=nu,
+                    bandwidth=bandwidth,
                 )
             )
 
@@ -160,14 +226,24 @@ def generate_synthetic_canonical_episode(
                 candidate_vehicles=vehicles,
                 queries=queries,
                 ego_sc=ego_sc,
-                communication_stats={"avg_latency_s": float(np.mean([v.communication_stats["latency_s"] for v in vehicles]))},
+                communication_stats={"avg_latency_s": float(np.mean([v["latency_s"] for v in step_vehicles_raw]))},
                 metadata={"synthetic": True},
+                policy_id=policy.policy_id,
             )
         )
-    return CanonicalEpisodeRecord(scene_id=scene_id, episode_id=episode_id, scene_type=scene_type, dt=dt, steps=steps, metadata={"synthetic": True})
+
+    return CanonicalEpisodeRecord(
+        scene_id=scene_id,
+        episode_id=episode_id,
+        scene_type=scene_type,
+        dt=dt,
+        steps=steps,
+        metadata={"synthetic": True},
+        policy_id=policy.policy_id,
+    )
 
 
-def _synthetic_intent_one_hot(scene_type: str, delta_yaw: float, delta_vel: tuple[float, float]) -> List[float]:
+def _synthetic_intent_one_hot(scene_type: str, delta_yaw: float, delta_vel: tuple) -> List[float]:
     speed = math.sqrt(float(delta_vel[0]) ** 2 + float(delta_vel[1]) ** 2)
     lane_follow = 1.0
     turn_left = 0.0

@@ -145,6 +145,7 @@ def adapt_vlm_records_to_canonical_episode(
                         "intent_summary": True,
                         "complementarity": True,
                         "accessibility": True,
+                        "action": False,
                     },
                     observable_region=sender_region,
                     communication_stats={

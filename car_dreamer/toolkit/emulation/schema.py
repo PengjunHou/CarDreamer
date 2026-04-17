@@ -46,6 +46,10 @@ class CandidateVehicleState:
     sender_collab: Dict[str, float] = field(default_factory=dict)
     sender_gain: Dict[str, float] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Policy action variables (u_t per vehicle, as defined in Section IV.B)
+    alpha: float = 0.0       # collaboration selection indicator (0 or 1)
+    nu: float = 0.0          # sharing frequency: 0.2=low, 0.5=mid, 1.0=high
+    bandwidth: float = 0.0   # allocated bandwidth (normalized, 0..1)
 
 
 @dataclass
@@ -61,6 +65,7 @@ class CanonicalStepRecord:
     ego_sc: Dict[str, float]
     communication_stats: Dict[str, float] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    policy_id: str = ""  # which fixed policy produced this step (e.g. "P1".."P8")
 
 
 @dataclass
@@ -71,6 +76,7 @@ class CanonicalEpisodeRecord:
     dt: float
     steps: List[CanonicalStepRecord]
     metadata: Dict[str, Any] = field(default_factory=dict)
+    policy_id: str = ""  # policy used for the entire episode
 
 
 def episode_to_dict(episode: CanonicalEpisodeRecord) -> Dict[str, Any]:
@@ -127,6 +133,9 @@ def episode_from_dict(payload: Dict[str, Any]) -> CanonicalEpisodeRecord:
                 sender_collab={str(k): float(v) for k, v in item.get("sender_collab", {}).items()},
                 sender_gain={str(k): float(v) for k, v in item.get("sender_gain", {}).items()},
                 metadata=dict(item.get("metadata", {})),
+                alpha=float(item.get("alpha", 0.0)),
+                nu=float(item.get("nu", 0.0)),
+                bandwidth=float(item.get("bandwidth", 0.0)),
             )
             for item in raw_step.get("candidate_vehicles", [])
         ]
@@ -143,6 +152,7 @@ def episode_from_dict(payload: Dict[str, Any]) -> CanonicalEpisodeRecord:
                 ego_sc={str(k): float(v) for k, v in raw_step.get("ego_sc", {}).items()},
                 communication_stats={str(k): float(v) for k, v in raw_step.get("communication_stats", {}).items()},
                 metadata=dict(raw_step.get("metadata", {})),
+                policy_id=str(raw_step.get("policy_id", "")),
             )
         )
     return CanonicalEpisodeRecord(
@@ -152,6 +162,7 @@ def episode_from_dict(payload: Dict[str, Any]) -> CanonicalEpisodeRecord:
         dt=float(payload["dt"]),
         steps=steps,
         metadata=dict(payload.get("metadata", {})),
+        policy_id=str(payload.get("policy_id", "")),
     )
 
 

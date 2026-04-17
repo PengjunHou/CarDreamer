@@ -78,6 +78,10 @@ class EmulationTrainingConfig:
     synthetic_num_vehicles: int = 4
     max_nodes: int | None = None
     max_queries: int | None = None
+    # Policy-aware evaluation (Section IV.H)
+    eval_mode: str = "seen"  # "seen" | "unseen" | "perturbed"
+    unseen_policy_ids: List[str] = field(default_factory=list)  # held-out policies for unseen eval
+    perturbed_nu_scale: float = 1.2  # frequency multiplier for perturbed eval
 
 
 def parse_episode_source_spec(
@@ -172,17 +176,76 @@ def split_episode_indices(num_episodes: int, val_ratio: float = 0.2, seed: int =
     return indices[val_count:], indices[:val_count]
 
 
+def split_episodes_by_policy(
+    episodes: Sequence[CanonicalEpisodeRecord],
+    unseen_policy_ids: Sequence[str],
+) -> Tuple[List[int], List[int]]:
+    """Split episode indices into train/val by policy identity.
+
+    Episodes whose policy_id is in ``unseen_policy_ids`` become the val set;
+    all others are train. Used for unseen-policy evaluation (Section IV.H).
+    """
+    unseen = set(str(p) for p in unseen_policy_ids)
+    train_indices: List[int] = []
+    val_indices: List[int] = []
+    for idx, ep in enumerate(episodes):
+        pid = str(ep.policy_id or "")
+        if pid in unseen:
+            val_indices.append(idx)
+        else:
+            train_indices.append(idx)
+    return train_indices, val_indices
+
+
+def apply_perturbed_policy(
+    episodes: Sequence[CanonicalEpisodeRecord],
+    nu_scale: float = 1.2,
+) -> List[CanonicalEpisodeRecord]:
+    """Return a new list of episodes with sharing frequencies scaled by ``nu_scale``.
+
+    Used for perturbed-policy evaluation (Section IV.H): tests whether the
+    predictor generalises to policies with modified parameter settings.
+    """
+    import copy
+    perturbed: List[CanonicalEpisodeRecord] = []
+    for ep in episodes:
+        ep2 = copy.deepcopy(ep)
+        ep2.policy_id = ep2.policy_id + "_perturbed"
+        ep2.metadata = dict(ep2.metadata)
+        ep2.metadata["perturbed_nu_scale"] = float(nu_scale)
+        for step in ep2.steps:
+            step.policy_id = step.policy_id + "_perturbed"
+            for veh in step.candidate_vehicles:
+                veh.nu = min(float(veh.nu) * float(nu_scale), 1.0)
+        perturbed.append(ep2)
+    return perturbed
+
+
 def build_dataset_splits(
     episodes: Sequence[CanonicalEpisodeRecord],
     config: EmulationTrainingConfig,
 ) -> Tuple[CanonicalEmulationDataset, CanonicalEmulationDataset | None, List[int], List[int]]:
     if not episodes:
         raise ValueError("At least one episode is required to build dataset splits.")
-    train_indices, val_indices = split_episode_indices(
-        len(episodes),
-        val_ratio=float(config.val_ratio),
-        seed=int(config.seed),
-    )
+
+    eval_mode = str(config.eval_mode).lower()
+
+    if eval_mode == "unseen" and config.unseen_policy_ids:
+        # Hold out specified policies entirely from training
+        train_indices, val_indices = split_episodes_by_policy(episodes, config.unseen_policy_ids)
+        if not train_indices:
+            raise ValueError("unseen_policy_ids covers all episodes; no training data remains.")
+    elif eval_mode == "perturbed":
+        # Train on original episodes; val on frequency-perturbed copies
+        train_indices = list(range(len(episodes)))
+        val_indices = []  # perturbed episodes built separately below
+    else:
+        # Default: seen-policy — random train/val split (original behaviour)
+        train_indices, val_indices = split_episode_indices(
+            len(episodes),
+            val_ratio=float(config.val_ratio),
+            seed=int(config.seed),
+        )
     max_nodes = int(config.max_nodes or max(len({vehicle.vehicle_id for step in ep.steps for vehicle in step.candidate_vehicles}) for ep in episodes))
     max_queries = int(config.max_queries or max(len(ep.steps[0].queries) for ep in episodes))
     train_dataset = CanonicalEmulationDataset(
@@ -193,7 +256,20 @@ def build_dataset_splits(
         max_queries=max_queries,
     )
     val_dataset = None
-    if val_indices:
+    if eval_mode == "perturbed":
+        # Build val set from perturbed copies of training episodes
+        perturbed_eps = apply_perturbed_policy(
+            [episodes[idx] for idx in train_indices],
+            nu_scale=float(config.perturbed_nu_scale),
+        )
+        val_dataset = CanonicalEmulationDataset(
+            perturbed_eps,
+            history_len=int(config.history_len),
+            horizon=int(config.horizon),
+            max_nodes=max_nodes,
+            max_queries=max_queries,
+        )
+    elif val_indices:
         val_dataset = CanonicalEmulationDataset(
             [episodes[idx] for idx in val_indices],
             history_len=int(config.history_len),
@@ -234,6 +310,7 @@ def emulation_collate_fn(samples: Sequence[Mapping[str, Any]]) -> Dict[str, Any]
     batch["episode_id"] = [str(sample["episode_id"]) for sample in samples]
     batch["scene_id"] = [str(sample["scene_id"]) for sample in samples]
     batch["scene_type"] = [str(sample["scene_type"]) for sample in samples]
+    batch["policy_id"] = [str(sample.get("policy_id", "")) for sample in samples]
     batch["query_ids"] = [list(sample["query_ids"]) for sample in samples]
     return batch
 
@@ -625,6 +702,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--synthetic-scene-type", default="right_turn")
     parser.add_argument("--synthetic-num-steps", type=int, default=24)
     parser.add_argument("--synthetic-num-vehicles", type=int, default=4)
+    parser.add_argument(
+        "--eval-mode",
+        default="seen",
+        choices=["seen", "unseen", "perturbed"],
+        help="Policy evaluation protocol: seen (random split), unseen (hold-out policies), perturbed (nu-scaled val)",
+    )
+    parser.add_argument(
+        "--unseen-policy-ids",
+        nargs="*",
+        default=[],
+        help="Policy IDs to hold out for unseen-policy evaluation (e.g. P7 P8).",
+    )
+    parser.add_argument(
+        "--perturbed-nu-scale",
+        type=float,
+        default=1.2,
+        help="Frequency multiplier applied to nu for perturbed-policy val set.",
+    )
     return parser
 
 
@@ -663,6 +758,9 @@ def main(argv: Sequence[str] | None = None) -> Dict[str, Any]:
         synthetic_scene_type=str(args.synthetic_scene_type),
         synthetic_num_steps=int(args.synthetic_num_steps),
         synthetic_num_vehicles=int(args.synthetic_num_vehicles),
+        eval_mode=str(args.eval_mode),
+        unseen_policy_ids=list(args.unseen_policy_ids),
+        perturbed_nu_scale=float(args.perturbed_nu_scale),
     )
     return fit_emulation_model(config)
 

@@ -493,13 +493,14 @@ def _compute_position_layout(
     body_height = max(float(height) - header_h - footer_h, 1.0)
     center_x = float(width) * 0.5
     center_y = header_h + body_height * 0.5
-    max_abs_x = max(abs(float(x)) for x, _ in positions) if positions else 1.0
-    max_abs_y = max(abs(float(y)) for _, y in positions) if positions else 1.0
-    max_abs_x = max(max_abs_x, 1.0)
-    max_abs_y = max(max_abs_y, 1.0)
+    # positions are (forward, left); forward maps to vertical, left maps to horizontal
+    max_forward = max(abs(float(f)) for f, _ in positions) if positions else 1.0
+    max_lateral = max(abs(float(l)) for _, l in positions) if positions else 1.0
+    max_forward = max(max_forward, 1.0)
+    max_lateral = max(max_lateral, 1.0)
     usable_w = max(float(width) - 2.0 * side_margin, 1.0)
     usable_h = max(body_height - 2.0 * side_margin, 1.0)
-    scale = min(usable_w / (2.0 * max_abs_x), usable_h / (2.0 * max_abs_y))
+    scale = min(usable_w / (2.0 * max_lateral), usable_h / (2.0 * max_forward))
     return {
         "width": float(width),
         "height": float(height),
@@ -714,10 +715,11 @@ def _project_position(
     position: Tuple[float, float],
     layout: Mapping[str, float],
 ) -> Tuple[float, float]:
-    x, y = float(position[0]), float(position[1])
+    # delta_pos[0] = forward (+x = up), delta_pos[1] = right (+y = screen right)
+    forward, right = float(position[0]), float(position[1])
     return (
-        float(layout["center_x"]) + x * float(layout["scale"]),
-        float(layout["center_y"]) - y * float(layout["scale"]),
+        float(layout["center_x"]) + right * float(layout["scale"]),
+        float(layout["center_y"]) - forward * float(layout["scale"]),
     )
 
 

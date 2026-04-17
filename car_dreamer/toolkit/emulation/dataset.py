@@ -140,10 +140,14 @@ class CanonicalEmulationDataset:
                     target_sender_collab[offset, slot, qidx] = float(vehicle.sender_collab.get(qid, 0.0))
                     target_sender_gain[offset, slot, qidx] = float(vehicle.sender_gain.get(qid, 0.0))
 
+        # policy_id for this sample — used in policy-aware evaluation splits
+        policy_id = str(episode.policy_id or episode.steps[end_step].policy_id or "")
+
         return {
             "episode_id": episode.episode_id,
             "scene_id": episode.scene_id,
             "scene_type": episode.scene_type,
+            "policy_id": policy_id,
             "step": end_step,
             "node_ids": node_ids,
             "query_ids": query_ids,
@@ -205,11 +209,10 @@ class CanonicalEmulationDataset:
     ) -> None:
         for vehicle in step.candidate_vehicles:
             slot = episode_index.node_id_to_slot.get(int(vehicle.vehicle_id))
-            if slot is None or slot >= self.max_nodes:
+            if slot is None or slot >= node_features.shape[0]:
                 continue
             node_features[slot] = pack_vehicle_node_state(vehicle)
             component_valid_mask[slot] = pack_component_valid_mask(vehicle)
             node_mask[slot] = 1.0
-            for qidx, query in enumerate(step.queries[: self.max_queries]):
+            for qidx, query in enumerate(step.queries[: task_relevance.shape[1]]):
                 task_relevance[slot, qidx] = float(vehicle.query_task_relevance.get(query.query_id, 0.0))
-

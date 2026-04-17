@@ -23,13 +23,15 @@ def get_component_valid_mask_layout() -> Tuple[str, ...]:
         "intent_summary",
         "complementarity",
         "accessibility",
+        "action",  # alpha, nu, bandwidth from policy u_t
     )
 
 
 def get_node_feature_layout(raw_dim: int, semantic_dim: int, intent_dim: int) -> Dict[str, slice]:
+    """Return named slices for each block in the packed node feature vector."""
     cursor = 0
     layout: Dict[str, slice] = {}
-    layout["x_raw"] = slice(cursor, cursor + 5)
+    layout["x_raw"] = slice(cursor, cursor + 5)        # delta_pos(2) + delta_vel(2) + delta_yaw(1)
     cursor += 5
     layout["shared_summary_raw"] = slice(cursor, cursor + raw_dim)
     cursor += raw_dim
@@ -40,7 +42,10 @@ def get_node_feature_layout(raw_dim: int, semantic_dim: int, intent_dim: int) ->
     layout["intent_summary"] = slice(cursor, cursor + intent_dim)
     cursor += intent_dim
     layout["x_shared"] = slice(layout["shared_summary_raw"].start, cursor)
-    layout["x_derived"] = slice(cursor, cursor + 2)
+    layout["x_derived"] = slice(cursor, cursor + 2)    # complementarity + accessibility
+    cursor += 2
+    layout["action"] = slice(cursor, cursor + 3)       # alpha + nu + bandwidth
+    cursor += 3
     return layout
 
 
@@ -58,6 +63,14 @@ def build_observable_region(
 
 
 def pack_vehicle_node_state(vehicle: CandidateVehicleState) -> np.ndarray:
+    """Pack all per-vehicle features into a flat float32 vector.
+
+    Layout: [x_raw(5) | shared_summary_raw | shared_summary_semantic |
+             shared_confidence(1) | intent_summary | x_derived(2) | action(3)]
+
+    The action block (alpha, nu, bandwidth) encodes the policy decision u_t
+    applied to this vehicle, enabling policy-conditioned dynamics learning.
+    """
     blocks = [
         np.asarray(
             [
@@ -74,13 +87,21 @@ def pack_vehicle_node_state(vehicle: CandidateVehicleState) -> np.ndarray:
         np.asarray([float(vehicle.shared_confidence)], dtype=np.float32),
         np.asarray(vehicle.intent_summary, dtype=np.float32).reshape(-1),
         np.asarray([float(vehicle.complementarity), float(vehicle.accessibility)], dtype=np.float32),
+        np.asarray([float(vehicle.alpha), float(vehicle.nu), float(vehicle.bandwidth)], dtype=np.float32),
     ]
     return np.concatenate(blocks, axis=0)
 
 
 def pack_component_valid_mask(vehicle: CandidateVehicleState) -> np.ndarray:
     layout = get_component_valid_mask_layout()
-    return np.asarray([1.0 if bool(vehicle.component_valid_mask.get(key, False)) else 0.0 for key in layout], dtype=np.float32)
+    mask = []
+    for key in layout:
+        if key == "action":
+            # action is always considered valid (0.0 = not selected is still a valid signal)
+            mask.append(1.0)
+        else:
+            mask.append(1.0 if bool(vehicle.component_valid_mask.get(key, False)) else 0.0)
+    return np.asarray(mask, dtype=np.float32)
 
 
 def pack_query_features(query: QueryRecord) -> np.ndarray:
