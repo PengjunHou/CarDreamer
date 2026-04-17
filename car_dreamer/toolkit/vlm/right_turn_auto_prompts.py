@@ -181,11 +181,11 @@ class RightTurnAutoVLMPromptMixin:
         question_cfgs: Sequence[Dict[str, Any]],
     ) -> str:
         rows: List[str] = []
-        for question_cfg in question_cfgs:
+        for i, question_cfg in enumerate(question_cfgs):
             rows.append(
                 "\n".join(
                     [
-                        f"- {str(question_cfg.get('id', 'unknown_question'))}",
+                        f"- question_{i}",
                         f"  query: {str(question_cfg.get('query', '')).strip()}",
                         f"  positive: {str(question_cfg.get('positive', '')).strip()}",
                         f"  negative: {str(question_cfg.get('negative', '')).strip()}",
@@ -208,7 +208,7 @@ class RightTurnAutoVLMPromptMixin:
             "Return JSON only with this schema:\n"
             "{\n"
             '  "results": {\n'
-            '    "<question_id>": {\n'
+            '    "<question_0 | question_1 | ...>": {\n'
             '      "answer": "positive" or "negative" or "insufficient",\n'
             '      "visibility_status": "visible" or "partial" or "not_visible",\n'
             '      "question_answerability": "answerable" or "partially_answerable" or "not_answerable",\n'
@@ -218,7 +218,7 @@ class RightTurnAutoVLMPromptMixin:
             "  }\n"
             "}\n\n"
             "Important rules:\n"
-            "- Include every provided question_id exactly once under results.\n"
+            "- Include every provided question key (question_0, question_1, ...) exactly once under results.\n"
             "- Use 'negative' only if the queried region is visible enough and no vehicle is present there.\n"
             "- Use 'positive' only if a vehicle is actually supported by visible evidence.\n"
             "- Use 'insufficient' if the queried region is not visible or too ambiguous.\n"
@@ -247,7 +247,7 @@ class RightTurnAutoVLMPromptMixin:
             "Return JSON only with this schema:\n"
             "{\n"
             '  "results": {\n'
-            '    "<question_id>": {\n'
+            '    "<question_0 | question_1 | ...>": {\n'
             '      "answer": "positive" or "negative" or "insufficient",\n'
             '      "visibility_status": "visible" or "partial" or "not_visible",\n'
             '      "question_answerability": "answerable" or "partially_answerable" or "not_answerable",\n'
@@ -257,7 +257,7 @@ class RightTurnAutoVLMPromptMixin:
             "  }\n"
             "}\n\n"
             "Important rules:\n"
-            "- Include every provided question_id exactly once under results.\n"
+            "- Include every provided question key (question_0, question_1, ...) exactly once under results.\n"
             "- Do not use 'strong' unless the evidence is explicit and unambiguous.\n"
             "- If evidence is partial, indirect, vague, or inferred, use at most 'moderate'.\n"
             "- If the evidence cannot reliably determine the answer for a question, use answer='insufficient'.\n"
@@ -562,16 +562,16 @@ class RightTurnAutoVLMPromptMixin:
         if not isinstance(raw_results, dict):
             raw_results = {}
         parsed_scores: Dict[str, Dict[str, Any]] = {}
-        for question_cfg in question_cfgs:
+        for i, question_cfg in enumerate(question_cfgs):
             question_id = str(question_cfg.get("id", "unknown_question"))
-            item = raw_results.get(question_id)
+            item = raw_results.get(f"question_{i}")
             if isinstance(item, dict):
                 parsed_scores[question_id] = self._parse_language_scores(
                     json.dumps(item, ensure_ascii=False)
                 )
             else:
                 parsed_scores[question_id] = self._default_question_score(
-                    reason=f"Missing multi-query result for question_id={question_id}.",
+                    reason=f"Missing multi-query result for question_{i} (id={question_id}).",
                     raw_text=raw_text,
                     raw_vlm_json=parsed if isinstance(parsed, dict) else {},
                 )
