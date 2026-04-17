@@ -28,6 +28,7 @@ def build_runtime_emulation_step(
     scene_id: str,
     episode_id: str,
     scene_type: str,
+    policy_id: str,
     predictor_step: int,
     env_step: int,
     dt: float,
@@ -60,6 +61,7 @@ def build_runtime_emulation_step(
         selected_infos = list(candidate.get("selected_infos", []))
         window_messages = list(candidate.get("window_messages", []))
         shared_source = str(candidate.get("shared_source", "received_feat"))
+        policy_action = dict(candidate.get("policy_action", {}))
 
         delta_pos = (
             float(pose.get("x", 0.0)) - float(ego_pose.get("x", 0.0)),
@@ -125,6 +127,7 @@ def build_runtime_emulation_step(
                     "intent_summary": True,
                     "complementarity": True,
                     "accessibility": True,
+                    "action": True,
                 },
                 observable_region=sender_region,
                 communication_stats={
@@ -144,7 +147,11 @@ def build_runtime_emulation_step(
                     "env_step": int(env_step),
                     "shared_source": shared_source,
                     "has_selected_evidence": has_selected_evidence,
+                    "policy_id": str(candidate.get("policy_id", policy_id)),
                 },
+                alpha=float(policy_action.get("alpha", 0.0)),
+                nu=float(policy_action.get("nu", 0.0)),
+                bandwidth=float(policy_action.get("bandwidth", 0.0)),
             )
         )
 
@@ -167,7 +174,8 @@ def build_runtime_emulation_step(
             "num_candidate_vehicles": float(len(candidate_vehicles)),
             "num_questions": float(len(ordered_question_ids)),
         },
-        metadata={"env_step": int(env_step)},
+        metadata={"env_step": int(env_step), "policy_id": str(policy_id)},
+        policy_id=str(policy_id),
     )
 
 
@@ -177,6 +185,7 @@ def build_runtime_emulation_episode(
     episode_id: str,
     scene_type: str,
     dt: float,
+    policy_id: str,
     steps: Sequence[CanonicalStepRecord],
     metadata: Mapping[str, Any] | None = None,
 ) -> CanonicalEpisodeRecord:
@@ -187,6 +196,7 @@ def build_runtime_emulation_episode(
         dt=float(dt),
         steps=list(steps),
         metadata=dict(metadata or {}),
+        policy_id=str(policy_id),
     )
 
 

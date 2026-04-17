@@ -57,6 +57,9 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             transform = actor.get_transform()
             velocity = actor.get_velocity()
             actor_id = int(actor.id)
+            policy_action = {}
+            if hasattr(self, "_get_policy_action_value"):
+                policy_action = dict(self._get_policy_action_value(actor_id))
             candidate_vehicle_states.append(
                 {
                     "vehicle_id": actor_id,
@@ -73,6 +76,8 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                     "selected_infos": list(selected_infos_by_sender.get(actor_id, [])),
                     "window_messages": list(window_messages_by_sender.get(actor_id, [])),
                     "shared_source": shared_source,
+                    "policy_action": policy_action,
+                    "policy_id": str(shared_meta.get("policy_id", getattr(self, "_collaboration_policy_id", ""))),
                 }
             )
         return candidate_vehicle_states
@@ -105,6 +110,7 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             scene_id=str(getattr(self, "_emulation_scene_id", "right_turn_scene")),
             episode_id=str(getattr(self, "_emulation_episode_id", "right_turn_episode")),
             scene_type=str(getattr(self, "_emulation_scene_type", "right_turn")),
+            policy_id=str(shared_meta.get("policy_id", getattr(self, "_collaboration_policy_id", ""))),
             predictor_step=int(self._emulation_step_counter),
             env_step=int(self._time_step),
             dt=float(self._config.world.fixed_delta_seconds),
@@ -456,6 +462,8 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 "scene_description": str(items[-1].get("scene_description", "")),
                 "language_evidence": str(items[-1].get("language_evidence", "")),
                 "converted_query": str(items[-1].get("converted_query", "")),
+                "converted_positive": str(items[-1].get("converted_positive", "")),
+                "converted_negative": str(items[-1].get("converted_negative", "")),
                 "evaluation_mode": str(items[-1].get("evaluation_mode", "")),
                 "visibility_status": str(items[-1].get("visibility_status", "partial")),
                 "question_answerability": str(
@@ -881,6 +889,8 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             "pose": dict(sensor_info.get("pose", {})),
             "sensor_yaw_rad": float(sensor_info.get("sensor_yaw_rad", 0.0)),
             "converted_query": converted_question_cfg["query"] if converted_question_cfg else None,
+            "converted_positive": converted_question_cfg["positive"] if converted_question_cfg else None,
+            "converted_negative": converted_question_cfg["negative"] if converted_question_cfg else None,
             "scene_description": scene_description,
             "language_evidence": language_evidence,
             "evaluation_mode": evaluation_mode,

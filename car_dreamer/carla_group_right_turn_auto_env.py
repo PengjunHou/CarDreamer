@@ -21,6 +21,7 @@ from .toolkit import (
     payload_fn_llm,
 )
 from .toolkit.vlm import RightTurnAutoVLMMixin
+from .toolkit.emulation.policy import get_policy
 
 
 AUTO_ENV_LOGGER = get_runtime_logger("car_dreamer.env.right_turn_auto")
@@ -42,6 +43,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self._init_communication_config()
         self._init_graph_builder()
         self._init_vlm_config()
+        self._init_collaboration_policy()
         self._init_runtime_flags()
         if self._vlm_enabled:
             self._init_vlm()
@@ -206,6 +208,20 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self._emulation_episode_id = ""
         self.agent = None
 
+    def _init_collaboration_policy(self) -> None:
+        self._collaboration_policy_id = str(getattr(self._config, "policy_id", "P3"))
+        self._collaboration_policy = get_policy(self._collaboration_policy_id)
+        self._collaboration_policy_seed = int(getattr(self._config, "policy_seed", 0))
+        self._collaboration_bandwidth_floor = float(
+            getattr(self._config, "policy_bandwidth_floor", 0.1)
+        )
+        AUTO_ENV_LOGGER.info(
+            "Configured collaboration policy policy_id=%s seed=%d bandwidth_floor=%.3f",
+            self._collaboration_policy_id,
+            self._collaboration_policy_seed,
+            self._collaboration_bandwidth_floor,
+        )
+
     def _begin_emulation_logging_episode(self) -> None:
         self._emulation_episode_index += 1
         self._emulation_episode_id = (
@@ -318,6 +334,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
             episode_id=str(self._emulation_episode_id),
             scene_type=str(self._emulation_scene_type),
             dt=float(self._config.world.fixed_delta_seconds),
+            policy_id=str(getattr(self, "_collaboration_policy_id", "")),
             steps=self._emulation_episode_steps,
             metadata={
                 "source": "right_turn_auto_runtime_logging",

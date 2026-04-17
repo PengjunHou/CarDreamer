@@ -36,6 +36,8 @@ def _load_module(module_name: str):
 TRAINING = _load_module("training")
 SCHEMA = _load_module("schema")
 SYNTHETIC = _load_module("synthetic")
+POLICY = _load_module("policy")
+POLICY_GEN = _load_module("policy_data_generator")
 
 
 class EmulationTrainingTest(unittest.TestCase):
@@ -106,6 +108,28 @@ class EmulationTrainingTest(unittest.TestCase):
         self.assertEqual(len(loaded.steps), 8)
         self.assertEqual(len(loaded.steps[0].candidate_vehicles), 2)
 
+    def test_unseen_policy_split_uses_policy_ids(self):
+        episodes = POLICY_GEN.generate_policy_dataset(
+            episodes_per_policy=1,
+            num_steps=8,
+            num_vehicles=3,
+            seed=7,
+            policy_ids=["P1", "P5", "P7"],
+        )
+        config = TRAINING.EmulationTrainingConfig(
+            history_len=4,
+            horizon=2,
+            eval_mode="unseen",
+            unseen_policy_ids=["P5", "P7"],
+        )
+        train_dataset, val_dataset, train_ids, val_ids = TRAINING.build_dataset_splits(episodes, config)
+        self.assertIsNotNone(train_dataset)
+        self.assertIsNotNone(val_dataset)
+        self.assertEqual(len(train_ids), 1)
+        self.assertEqual(len(val_ids), 2)
+        self.assertEqual(episodes[train_ids[0]].policy_id, "P1")
+        self.assertEqual(sorted(episodes[idx].policy_id for idx in val_ids), ["P5", "P7"])
+
     @unittest.skipIf(TRAINING.torch_is_available(), "This guard test only applies when torch is unavailable.")
     def test_fit_emulation_model_requires_torch(self):
         config = TRAINING.EmulationTrainingConfig(
@@ -115,6 +139,32 @@ class EmulationTrainingTest(unittest.TestCase):
         )
         with self.assertRaises(ImportError):
             TRAINING.fit_emulation_model(config)
+
+    @unittest.skipUnless(TRAINING.torch_is_available(), "PyTorch is required for the training smoke test.")
+    def test_fit_emulation_model_smoke_with_all_policy_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            episodes = POLICY_GEN.generate_policy_dataset(
+                episodes_per_policy=1,
+                num_steps=10,
+                num_vehicles=3,
+                seed=11,
+                policy_ids=POLICY.list_policy_ids(),
+            )
+            config = TRAINING.EmulationTrainingConfig(
+                history_len=4,
+                horizon=2,
+                batch_size=4,
+                max_epochs=1,
+                hidden_dim=16,
+                num_graph_layers=1,
+                save_dir=tmpdir,
+                eval_mode="unseen",
+                unseen_policy_ids=["P7", "P8"],
+                report_every=0,
+            )
+            summary = TRAINING.fit_emulation_model(config, episodes=episodes)
+            self.assertTrue(Path(summary["best_checkpoint"]).exists())
+            self.assertEqual(summary["num_episodes"], len(POLICY.list_policy_ids()))
 
 
 if __name__ == "__main__":

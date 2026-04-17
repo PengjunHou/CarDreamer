@@ -176,6 +176,9 @@ env:
 
   dump_vlm_records_each_step: True
   vlm_dump_dir: "data"
+  policy_id: "P3"
+  policy_seed: 0
+  policy_bandwidth_floor: 0.1
 
   vlm:
     scene_description_max_new_tokens: 96

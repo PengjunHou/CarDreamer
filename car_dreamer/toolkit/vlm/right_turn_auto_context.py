@@ -134,23 +134,32 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
             "text": str(payload.get("text", "")).strip(),
             "feat": payload.get("feat"),
             "feat_dim": int(payload.get("feat_dim", 0)),
+            "policy_action": dict(payload.get("policy_action", {})),
         }
 
     def _get_raw_shared_images_info(self) -> Tuple[List[Image.Image], List[Dict[str, Any]], Dict[str, Any]]:
         shared_infos: List[Dict[str, Any]] = []
         for actor in self.group_vehs:
+            policy_action = {}
+            if hasattr(self, "_get_policy_action_value"):
+                policy_action = dict(self._get_policy_action_value(int(actor.id)))
+            if policy_action and float(policy_action.get("alpha", 0.0)) <= 0.5:
+                continue
             obs = self.group_obs.get(int(actor.id), {})
             image_np = obs.get(self._vlm_image_obs_key)
             image = self._coerce_to_pil_image(image_np)
             if image is None:
                 continue
             info = self._make_shared_info_from_actor(actor, image)
+            if policy_action:
+                info["policy_action"] = policy_action
             shared_infos.append(info)
             if len(shared_infos) >= self._vlm_max_total_shared_images:
                 break
         shared_images = [info["image"] for info in shared_infos]
         meta = {
             "shared_source": "raw",
+            "policy_id": str(getattr(self, "_collaboration_policy_id", "")),
             "num_candidate_msgs": 0,
             "num_selected_shared_images": len(shared_infos),
             "selected_sender_ids": [info["sender_id"] for info in shared_infos],
@@ -216,6 +225,7 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
             shared_infos.extend(per_sender_infos[sender_id])
         meta = {
             "shared_source": "received_feat",
+            "policy_id": str(getattr(self, "_collaboration_policy_id", "")),
             "num_candidate_msgs": len(window_msgs),
             "num_selected_shared_images": len(shared_infos),
             "selected_sender_ids": [info["sender_id"] for info in shared_infos],

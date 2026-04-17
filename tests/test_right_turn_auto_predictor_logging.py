@@ -106,6 +106,24 @@ def _load_runtime_module():
     sys.modules["runtime_logging"] = runtime_logging
 
     toolkit_pkg = sys.modules["car_dreamer.toolkit"]
+    class _NetResource:
+        def __init__(
+            self,
+            uplink_bps,
+            downlink_bps,
+            bandwidth_hz=10e6,
+            tx_power_dbm=20.0,
+            noise_figure_db=9.0,
+            carrier_freq_hz=5.9e9,
+        ):
+            self.uplink_bps = uplink_bps
+            self.downlink_bps = downlink_bps
+            self.bandwidth_hz = bandwidth_hz
+            self.tx_power_dbm = tx_power_dbm
+            self.noise_figure_db = noise_figure_db
+            self.carrier_freq_hz = carrier_freq_hz
+
+    toolkit_pkg.NetResource = _NetResource
     toolkit_pkg.Observer = object
     toolkit_pkg.V2VMessage = object
     toolkit_pkg._dist_m = lambda *args, **kwargs: 0.0
@@ -164,6 +182,7 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
             scene_id="right_turn_scene",
             episode_id="right_turn_episode_000001",
             scene_type="right_turn",
+            policy_id="P5",
             predictor_step=0,
             env_step=7,
             dt=0.1,
@@ -188,6 +207,8 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                         {"received_age_s": 0.3, "latency_s": 0.12, "payload_bytes": 640, "distance_m": 8.1},
                     ],
                     "shared_source": "received_feat",
+                    "policy_action": {"alpha": 1.0, "nu": 1.0, "bandwidth": 0.7},
+                    "policy_id": "P5",
                 },
                 {
                     "vehicle_id": 202,
@@ -198,6 +219,8 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                         {"received_age_s": 0.5, "latency_s": 0.2, "payload_bytes": 256, "distance_m": 6.5},
                     ],
                     "shared_source": "received_feat",
+                    "policy_action": {"alpha": 0.0, "nu": 0.0, "bandwidth": 0.0},
+                    "policy_id": "P5",
                 },
             ],
             question_results=_make_question_results(question_ids),
@@ -211,12 +234,14 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                 episode_id="right_turn_episode_000001",
                 scene_type="right_turn",
                 dt=0.1,
+                policy_id="P5",
                 steps=[step],
             )
         )
 
         self.assertEqual(step.step, 0)
         self.assertEqual(step.metadata["env_step"], 7)
+        self.assertEqual(step.policy_id, "P5")
         self.assertEqual([vehicle.vehicle_id for vehicle in step.candidate_vehicles], [101, 202])
         self.assertEqual(set(step.ego_sc.keys()), set(question_ids))
 
@@ -225,6 +250,9 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
         self.assertTrue(sender_with_evidence.component_valid_mask["shared_summary_semantic"])
         self.assertGreater(sum(sender_with_evidence.shared_summary_raw), 0.0)
         self.assertGreater(sender_with_evidence.sender_gain["clg_left_rear_vehicle"], 0.0)
+        self.assertEqual(sender_with_evidence.alpha, 1.0)
+        self.assertEqual(sender_with_evidence.nu, 1.0)
+        self.assertAlmostEqual(sender_with_evidence.bandwidth, 0.7)
 
         sender_without_evidence = step.candidate_vehicles[1]
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_summary_raw"])
@@ -235,6 +263,9 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
         self.assertEqual(sender_without_evidence.communication_stats["window_message_count"], 1.0)
         self.assertEqual(set(sender_without_evidence.query_task_relevance.keys()), set(question_ids))
         self.assertEqual(set(sender_without_evidence.sender_collab.keys()), set(question_ids))
+        self.assertEqual(sender_without_evidence.alpha, 0.0)
+        self.assertEqual(sender_without_evidence.nu, 0.0)
+        self.assertEqual(sender_without_evidence.bandwidth, 0.0)
 
     def test_runtime_dual_dump_writes_backward_compatible_vlm_log_and_trainable_episode(self):
         question_ids = [
@@ -247,6 +278,7 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
             scene_id="right_turn_scene",
             episode_id="right_turn_episode_000002",
             scene_type="right_turn",
+            policy_id="P3",
             predictor_step=0,
             env_step=12,
             dt=0.1,
@@ -270,6 +302,8 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                         {"received_age_s": 0.1, "latency_s": 0.05, "payload_bytes": 256, "distance_m": 7.0},
                     ],
                     "shared_source": "received_feat",
+                    "policy_action": {"alpha": 1.0, "nu": 1.0, "bandwidth": 1.0},
+                    "policy_id": "P3",
                 }
             ],
             question_results=_make_question_results(question_ids),
@@ -291,6 +325,7 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                 self._emulation_scene_id = "right_turn_scene"
                 self._emulation_episode_id = "right_turn_episode_000002"
                 self._emulation_scene_type = "right_turn"
+                self._collaboration_policy_id = "P3"
 
             def dump_vlm_records(self, path: str) -> None:
                 with open(path, "w", encoding="utf-8") as handle:
@@ -302,6 +337,7 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                     episode_id=self._emulation_episode_id,
                     scene_type=self._emulation_scene_type,
                     dt=0.1,
+                    policy_id=self._collaboration_policy_id,
                     steps=self._emulation_episode_steps,
                     metadata={"source": "test"},
                 )
@@ -326,6 +362,8 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
             SCHEMA.validate_episode_record(episode)
             self.assertEqual(episode.steps[0].metadata["env_step"], 12)
             self.assertEqual(len(episode.steps[0].candidate_vehicles), 1)
+            self.assertEqual(episode.policy_id, "P3")
+            self.assertEqual(episode.steps[0].candidate_vehicles[0].alpha, 1.0)
 
 
 if __name__ == "__main__":

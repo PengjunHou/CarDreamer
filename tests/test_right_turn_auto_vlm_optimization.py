@@ -391,6 +391,84 @@ class RightTurnAutoVLMOptimizationTest(unittest.TestCase):
             "caption_then_language_multi_query",
         )
 
+    def test_shared_sensor_answers_converted_query_not_original_query(self):
+        scoring = _load_scoring_module()
+
+        class Dummy(scoring.RightTurnAutoVLMScoringMixin):
+            def __init__(self):
+                self._config = types.SimpleNamespace(
+                    world=types.SimpleNamespace(fixed_delta_seconds=0.1)
+                )
+                self._time_step = 21
+                self._vlm_enable_multi_query_scoring = True
+                self._vlm_enable_step_cache = True
+                self._vlm_step_cache = {}
+                self._vlm_score_max_new_tokens = 32
+                self._vlm_scene_description_max_new_tokens = 16
+                self._vlm_do_sample = False
+                self._vlm_temperature = 0.0
+                self._vlm_top_p = 0.9
+                self._vlm_model = object()
+                self._vlm_processor = object()
+                self.calls = []
+
+            def _run_qwen_generation(self, prompt, image=None, max_new_tokens=None):
+                self.calls.append(str(prompt))
+                return json.dumps(
+                    {
+                        "results": {
+                            "clg_front_vehicle": {
+                                "answer": "positive",
+                                "visibility_status": "visible",
+                                "question_answerability": "answerable",
+                                "support_strength": "moderate",
+                                "reason": "Converted region is visible.",
+                            }
+                        }
+                    }
+                )
+
+        dummy = Dummy()
+        original_question_cfg = {
+            "id": "clg_front_vehicle",
+            "type": "clg",
+            "query": "front?",
+            "positive": "front yes",
+            "negative": "front no",
+        }
+        sensor_info = {
+            "sender_id": 2,
+            "sensor_name": "cam0",
+            "is_ego": False,
+            "pose": {"x": 8.0, "y": 0.0, "yaw": 0.0},
+            "sensor_yaw_rad": 0.0,
+            "received_age_s": 0.1,
+            "scene_description": "Front: visible",
+            "text": "",
+            "image": None,
+        }
+        sensor_records = dummy._evaluate_sensor_questions(
+            sensor_info,
+            [original_question_cfg],
+            ego_pose={"x": 0.0, "y": 0.0, "yaw": 0.0},
+        )
+
+        self.assertEqual(len(dummy.calls), 1)
+        self.assertIn("converted query: clg_front_vehicle", dummy.calls[0])
+        self.assertNotIn("Query: front?", dummy.calls[0])
+        self.assertEqual(
+            sensor_records["clg_front_vehicle"]["converted_query"],
+            "converted query: clg_front_vehicle",
+        )
+        self.assertEqual(
+            sensor_records["clg_front_vehicle"]["converted_positive"],
+            "converted positive: clg_front_vehicle",
+        )
+        self.assertEqual(
+            sensor_records["clg_front_vehicle"]["converted_negative"],
+            "converted negative: clg_front_vehicle",
+        )
+
     def test_visual_sensor_uses_caption_then_language_even_when_flag_disabled(self):
         scoring = _load_scoring_module()
 

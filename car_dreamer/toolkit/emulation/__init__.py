@@ -48,6 +48,12 @@ from .policy_data_generator import (
     generate_policy_dataset,
     save_policy_dataset,
 )
+from .carla_rollout_collector import (
+    CARLARolloutCollectorConfig,
+    build_policy_rollout_argv,
+    collect_policy_rollouts,
+    rollout_single_episode,
+)
 from .queries import make_query_records
 from .schema import (
     CanonicalEpisodeRecord,
@@ -140,6 +146,10 @@ __all__ = [
     "generate_policy_dataset",
     "generate_synthetic_canonical_episode",
     "save_policy_dataset",
+    "CARLARolloutCollectorConfig",
+    "build_policy_rollout_argv",
+    "collect_policy_rollouts",
+    "rollout_single_episode",
     # dataset
     "CanonicalEmulationDataset",
     "build_fully_connected_edge_index",

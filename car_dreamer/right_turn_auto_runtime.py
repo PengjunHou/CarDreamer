@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -12,7 +13,23 @@ import torch
 from agents.navigation.basic_agent import BasicAgent
 from runtime_logging import get_runtime_logger, get_runtime_logging_config, should_log_periodic
 
-from .toolkit import Observer, V2VMessage, _dist_m, _tx_bytes_for_latency, get_vehicle_pos, payload_fn_llm
+from .toolkit import (
+    NetResource,
+    Observer,
+    V2VMessage,
+    _dist_m,
+    _tx_bytes_for_latency,
+    get_vehicle_pos,
+    payload_fn_llm,
+)
+from .toolkit.emulation.features import (
+    build_observable_region,
+    compute_accessibility,
+    compute_complementarity,
+    compute_task_relevance,
+)
+from .toolkit.emulation.policy import CollaborationAction, VehicleInfo, get_policy
+from .toolkit.emulation.queries import make_query_records
 
 
 GROUP_ID = 0
@@ -21,6 +38,13 @@ RUNTIME_LOGGER = get_runtime_logger("car_dreamer.runtime")
 
 
 class RightTurnAutoRuntimeMixin:
+    def _reset_policy_runtime_state(self) -> None:
+        self._policy_current_action = CollaborationAction()
+        self._policy_last_action_step = -1
+        self._policy_send_credit = {}
+        self._policy_send_decision = {}
+        self._policy_last_comm_step = -1
+
     def _get_runtime_debug_interval(self) -> int:
         runtime_cfg = get_runtime_logging_config()
         base_interval = int(runtime_cfg["step_debug_interval"])
@@ -70,6 +94,7 @@ class RightTurnAutoRuntimeMixin:
         self._emulation_episode_dumped = False
         self._emulation_episode_steps = []
         self._emulation_step_counter = 0
+        self._reset_policy_runtime_state()
         RUNTIME_LOGGER.debug("Group runtime state reset.")
 
     def _destroy_group_observers(self) -> None:
@@ -131,6 +156,110 @@ class RightTurnAutoRuntimeMixin:
         self.agent = BasicAgent(self.ego)
         self.agent.set_destination(ego_transform.location)
         self._cache_actor(self.ego)
+
+    def _build_policy_vehicle_infos(self) -> List[VehicleInfo]:
+        if getattr(self, "ego", None) is None:
+            return []
+        ego_tf = self.ego.get_transform()
+        ego_vel = self.ego.get_velocity()
+        ego_pose = {
+            "x": float(ego_tf.location.x),
+            "y": float(ego_tf.location.y),
+            "yaw_rad": math.radians(float(ego_tf.rotation.yaw)),
+        }
+        ego_velocity = {
+            "vx": float(ego_vel.x),
+            "vy": float(ego_vel.y),
+        }
+        scene_type = str(getattr(self, "_emulation_scene_type", "right_turn"))
+        queries = make_query_records(scene_type)
+        ego_region = build_observable_region((0.0, 0.0), 0.0, range_m=16.0, width_m=9.0, lookahead_m=8.0)
+        infos: List[VehicleInfo] = []
+        for actor in self.group_vehs:
+            tf = actor.get_transform()
+            vel = actor.get_velocity()
+            delta_pos = (
+                float(tf.location.x) - ego_pose["x"],
+                float(tf.location.y) - ego_pose["y"],
+            )
+            delta_vel = (
+                float(vel.x) - ego_velocity["vx"],
+                float(vel.y) - ego_velocity["vy"],
+            )
+            delta_yaw = math.radians(float(tf.rotation.yaw)) - ego_pose["yaw_rad"]
+            sender_region = build_observable_region(delta_pos, delta_yaw)
+            distance_m = math.sqrt(delta_pos[0] * delta_pos[0] + delta_pos[1] * delta_pos[1])
+            complementarity = compute_complementarity(sender_region, ego_region)
+            accessibility = compute_accessibility(distance_m, 0.0)
+            collab_values = []
+            for query in queries:
+                relevance = compute_task_relevance(sender_region, ego_region, query.required_region)
+                collab_values.append(float(complementarity * relevance * accessibility))
+            sender_collab = float(sum(collab_values) / len(collab_values)) if collab_values else 0.0
+            infos.append(
+                VehicleInfo(
+                    vehicle_id=int(actor.id),
+                    sender_collab=sender_collab,
+                    distance_m=float(distance_m),
+                )
+            )
+        return infos
+
+    def _compute_current_policy_action(self) -> CollaborationAction:
+        if getattr(self, "_policy_last_action_step", -1) == int(self._time_step):
+            return self._policy_current_action
+        policy = getattr(self, "_collaboration_policy", None)
+        if policy is None:
+            self._policy_current_action = CollaborationAction()
+            self._policy_last_action_step = int(self._time_step)
+            return self._policy_current_action
+        rng = random.Random(int(getattr(self, "_collaboration_policy_seed", 0)) + int(self._time_step))
+        infos = self._build_policy_vehicle_infos()
+        self._policy_current_action = policy(infos, rng=rng)
+        self._policy_last_action_step = int(self._time_step)
+        return self._policy_current_action
+
+    def _get_policy_action_value(self, vehicle_id: int) -> Dict[str, float]:
+        action = self._compute_current_policy_action()
+        vid = int(vehicle_id)
+        return {
+            "alpha": float(action.alpha.get(vid, 0.0)),
+            "nu": float(action.nu.get(vid, 0.0)),
+            "bandwidth": float(action.bandwidth.get(vid, 0.0)),
+        }
+
+    def _advance_policy_send_schedule(self) -> Dict[int, bool]:
+        if getattr(self, "_policy_last_comm_step", -1) == int(self._time_step):
+            return dict(self._policy_send_decision)
+        action = self._compute_current_policy_action()
+        decisions: Dict[int, bool] = {}
+        for vid, alpha in action.alpha.items():
+            vehicle_id = int(vid)
+            if float(alpha) <= 0.5:
+                self._policy_send_credit[vehicle_id] = 0.0
+                decisions[vehicle_id] = False
+                continue
+            nu = max(float(action.nu.get(vehicle_id, 0.0)), 0.0)
+            credit = float(self._policy_send_credit.get(vehicle_id, 0.0)) + nu
+            should_send = credit >= 1.0 - 1e-6
+            if should_send:
+                credit = max(credit - 1.0, 0.0)
+            self._policy_send_credit[vehicle_id] = credit
+            decisions[vehicle_id] = should_send
+        self._policy_send_decision = decisions
+        self._policy_last_comm_step = int(self._time_step)
+        return dict(decisions)
+
+    def _scale_net_resource_for_bandwidth(self, base: NetResource, bandwidth: float) -> NetResource:
+        scale = max(float(bandwidth), float(getattr(self, "_collaboration_bandwidth_floor", 0.1)))
+        return NetResource(
+            uplink_bps=float(base.uplink_bps) * scale,
+            downlink_bps=float(base.downlink_bps) * scale,
+            bandwidth_hz=float(base.bandwidth_hz) * scale,
+            tx_power_dbm=float(base.tx_power_dbm),
+            noise_figure_db=float(base.noise_figure_db),
+            carrier_freq_hz=float(base.carrier_freq_hz),
+        )
 
     # =========================================================
     # Communication helpers
@@ -220,6 +349,9 @@ class RightTurnAutoRuntimeMixin:
         out_deg, in_deg = self._compute_group_degrees()
         actor_map = self._build_group_actor_map()
         fixed_dt = float(self._world._settings.fixed_delta_seconds)
+        ego_id = int(self.ego.id)
+        current_action = self._compute_current_policy_action()
+        send_decisions = self._advance_policy_send_schedule()
         enqueued_count = 0
         sender_ids = set()
         total_payload_bytes = 0
@@ -227,23 +359,41 @@ class RightTurnAutoRuntimeMixin:
         for group_id, members in self.groups.items():
             member_ids = list(members)
             for sender_id in member_ids:
+                if int(sender_id) == ego_id:
+                    continue
                 sender = actor_map.get(int(sender_id))
                 if sender is None:
                     continue
+                alpha = float(current_action.alpha.get(int(sender_id), 0.0))
+                if alpha <= 0.5 or not bool(send_decisions.get(int(sender_id), False)):
+                    continue
                 sender_ids.add(int(sender_id))
                 payload = self._make_payload(sender)
+                payload["policy_action"] = {
+                    "policy_id": str(getattr(self, "_collaboration_policy_id", "")),
+                    "alpha": alpha,
+                    "nu": float(current_action.nu.get(int(sender_id), 0.0)),
+                    "bandwidth": float(current_action.bandwidth.get(int(sender_id), 0.0)),
+                }
                 payload_bytes = _tx_bytes_for_latency(
                     payload,
                     overhead_bytes=getattr(self.latency_model, "overhead_bytes", 64),
                 )
                 for receiver_id in member_ids:
-                    if int(receiver_id) == int(sender_id):
+                    if int(receiver_id) != ego_id or int(receiver_id) == int(sender_id):
                         continue
                     receiver = actor_map.get(int(receiver_id))
                     if receiver is None:
                         continue
-                    sender_res = self._veh_net_res.get(int(sender_id), self._default_net_res)
-                    receiver_res = self._veh_net_res.get(int(receiver_id), self._default_net_res)
+                    bandwidth = float(current_action.bandwidth.get(int(sender_id), 0.0))
+                    sender_res = self._scale_net_resource_for_bandwidth(
+                        self._veh_net_res.get(int(sender_id), self._default_net_res),
+                        bandwidth,
+                    )
+                    receiver_res = self._scale_net_resource_for_bandwidth(
+                        self._veh_net_res.get(int(receiver_id), self._default_net_res),
+                        bandwidth,
+                    )
                     latency_s = self.latency_model.compute_latency_s(
                         sender=sender,
                         receiver=receiver,
@@ -271,8 +421,9 @@ class RightTurnAutoRuntimeMixin:
             logger=RUNTIME_LOGGER,
         ):
             RUNTIME_LOGGER.debug(
-                "Communication round step=%d senders=%s enqueued=%d in_flight=%d payload_bytes=%d",
+                "Communication round step=%d policy=%s senders=%s enqueued=%d in_flight=%d payload_bytes=%d",
                 self._time_step,
+                getattr(self, "_collaboration_policy_id", ""),
                 sorted(sender_ids),
                 enqueued_count,
                 len(self._in_flight),
