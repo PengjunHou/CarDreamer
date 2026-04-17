@@ -114,6 +114,46 @@ class CarlaRolloutCollectorTest(unittest.TestCase):
         self.assertIn(("P1", "P1_scene_0000"), created)
         self.assertIn(("P8", "P8_scene_0001"), created)
 
+    def test_rollout_single_episode_forces_dump_when_max_steps_reached(self):
+        class DummyActionSpace:
+            def sample(self):
+                return 0
+
+        class DummyBaseEnv:
+            def __init__(self, out_dir: str):
+                self._emulation_dump_dir = out_dir
+                self._time_step = 0
+                self._emulation_episode_dumped = False
+
+            def dump_emulation_episode(self, path: str) -> None:
+                Path(path).write_text('{"forced": true}', encoding="utf-8")
+
+        class DummyEnv:
+            action_space = DummyActionSpace()
+
+            def __init__(self, out_dir: str):
+                self._base = DummyBaseEnv(out_dir)
+                self.unwrapped = self._base
+
+            def reset(self, seed=None):
+                return {}, {}
+
+            def step(self, action):
+                del action
+                self._base._time_step += 1
+                return {}, 0.0, False, False, {}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = DummyEnv(tmpdir)
+            dump_path = COLLECTOR.rollout_single_episode(
+                env,
+                seed=0,
+                max_steps=2,
+                force_dump_on_max_steps=True,
+            )
+            self.assertTrue(Path(dump_path).exists())
+            self.assertIn("emulation_episode_max_steps_step_2.json", dump_path)
+
 
 if __name__ == "__main__":
     unittest.main()

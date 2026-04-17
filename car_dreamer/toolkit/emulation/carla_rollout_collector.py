@@ -19,6 +19,7 @@ class CARLARolloutCollectorConfig:
     seed: int = 0
     task_argv: List[str] = field(default_factory=list)
     speed_preset: str = "fast_episode"
+    force_dump_on_max_steps: bool = True
 
 
 def build_policy_rollout_argv(
@@ -43,7 +44,39 @@ def build_policy_rollout_argv(
     return argv
 
 
-def rollout_single_episode(env, *, seed: int, max_steps: int) -> str:
+def _unwrap_env(env):
+    current = env
+    seen_ids = set()
+    while hasattr(current, "unwrapped") and id(current) not in seen_ids:
+        seen_ids.add(id(current))
+        unwrapped = getattr(current, "unwrapped")
+        if unwrapped is current:
+            break
+        current = unwrapped
+    return current
+
+
+def _force_dump_episode(env, *, suffix: str = "max_steps") -> str:
+    base_env = _unwrap_env(env)
+    if not hasattr(base_env, "dump_emulation_episode"):
+        raise RuntimeError("Environment does not support dump_emulation_episode for forced dumps.")
+    dump_dir = Path(str(getattr(base_env, "_emulation_dump_dir", "data")))
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    step = int(getattr(base_env, "_time_step", 0))
+    path = dump_dir / f"emulation_episode_{suffix}_step_{step}.json"
+    base_env.dump_emulation_episode(str(path))
+    if hasattr(base_env, "_emulation_episode_dumped"):
+        base_env._emulation_episode_dumped = True
+    return str(path)
+
+
+def rollout_single_episode(
+    env,
+    *,
+    seed: int,
+    max_steps: int,
+    force_dump_on_max_steps: bool = True,
+) -> str:
     _, info = env.reset(seed=int(seed))
     done = False
     steps = 0
@@ -54,6 +87,8 @@ def rollout_single_episode(env, *, seed: int, max_steps: int) -> str:
         done = bool(terminated or truncated)
         steps += 1
     if not done:
+        if bool(force_dump_on_max_steps):
+            return _force_dump_episode(env, suffix="max_steps")
         raise RuntimeError(
             f"Episode did not finish within max_steps={int(max_steps)}; no emulation dump was created."
         )
@@ -94,6 +129,7 @@ def collect_policy_rollouts(
                     env,
                     seed=int(config.seed) + int(episode_index),
                     max_steps=int(config.max_steps),
+                    force_dump_on_max_steps=bool(config.force_dump_on_max_steps),
                 )
             finally:
                 close = getattr(env, "close", None)
@@ -124,6 +160,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--speed-preset", default="fast_episode")
     parser.add_argument(
+        "--force-dump-on-max-steps",
+        type=int,
+        default=1,
+        help="Force-write the current emulation episode when max_steps is reached before termination.",
+    )
+    parser.add_argument(
         "--task-argv",
         nargs="*",
         default=[],
@@ -144,6 +186,7 @@ def main(argv: Sequence[str] | None = None) -> Dict[str, List[str]]:
         seed=int(args.seed),
         task_argv=list(args.task_argv),
         speed_preset=str(args.speed_preset),
+        force_dump_on_max_steps=bool(int(args.force_dump_on_max_steps)),
     )
     saved = collect_policy_rollouts(config)
     total = sum(len(paths) for paths in saved.values())
