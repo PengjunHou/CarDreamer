@@ -192,8 +192,13 @@ def split_episodes_by_policy(
     train_indices: List[int] = []
     val_indices: List[int] = []
     for idx, ep in enumerate(episodes):
-        pid = str(ep.policy_id or "")
-        if pid in unseen:
+        metadata_policy_ids = [
+            str(policy_id)
+            for policy_id in list(dict(ep.metadata or {}).get("policy_ids_used", []))
+            if str(policy_id).strip()
+        ]
+        policy_ids_used = metadata_policy_ids or [str(ep.policy_id or "")]
+        if any(policy_id in unseen for policy_id in policy_ids_used):
             val_indices.append(idx)
         else:
             train_indices.append(idx)

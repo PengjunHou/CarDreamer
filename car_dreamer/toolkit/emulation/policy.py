@@ -19,7 +19,7 @@ from __future__ import annotations
 import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence
+from typing import Dict, Iterable, List, Mapping, Sequence
 
 # Sharing frequency levels (Section IV.B)
 NU_LOW: float = 0.2
@@ -56,6 +56,25 @@ class CollaborationAction:
 
     def active_ids(self) -> List[int]:
         return [vid for vid, a in self.alpha.items() if a > 0.5]
+
+
+@dataclass(frozen=True)
+class SceneSummary:
+    num_candidates: int = 0
+    max_sender_collab: float = 0.0
+    mean_sender_collab: float = 0.0
+    min_distance_m: float = 0.0
+    mean_distance_m: float = 0.0
+    avg_link_latency_s: float = 0.0
+    drop_ratio_prev_round: float = 0.0
+
+
+@dataclass(frozen=True)
+class PolicySelectorDecision:
+    policy_id: str
+    reason: str = ""
+    overridden: bool = False
+    scene_summary: SceneSummary = field(default_factory=SceneSummary)
 
 
 class FixedCollaborationPolicy(ABC):
@@ -284,7 +303,56 @@ class Random3AdaptiveValuePolicy(FixedCollaborationPolicy):
 # Registry
 # ---------------------------------------------------------------------------
 
-ALL_POLICIES: List[FixedCollaborationPolicy] = [
+class PolicyRegistry:
+    def __init__(self, policies: Iterable[FixedCollaborationPolicy] | None = None) -> None:
+        self._policies: Dict[str, FixedCollaborationPolicy] = {}
+        if policies is not None:
+            for policy in policies:
+                self.register(policy)
+
+    def register(self, policy: FixedCollaborationPolicy) -> None:
+        policy_id = str(getattr(policy, "policy_id", "")).strip()
+        if not policy_id:
+            raise ValueError("Registered policies must expose a non-empty policy_id.")
+        self._policies[policy_id] = policy
+
+    def get(self, policy_id: str) -> FixedCollaborationPolicy:
+        if policy_id not in self._policies:
+            raise KeyError(f"Unknown policy_id '{policy_id}'. Valid IDs: {sorted(self._policies)}")
+        return self._policies[policy_id]
+
+    def list_policy_ids(self) -> List[str]:
+        return sorted(self._policies.keys())
+
+    def values(self) -> List[FixedCollaborationPolicy]:
+        return [self._policies[policy_id] for policy_id in self.list_policy_ids()]
+
+
+class RuleBasedPolicySelector:
+    selector_id = "default"
+
+    def __call__(
+        self,
+        scene_summary: SceneSummary,
+        *,
+        registry: PolicyRegistry,
+    ) -> PolicySelectorDecision:
+        del registry
+        num_candidates = int(scene_summary.num_candidates)
+        if num_candidates == 0:
+            return PolicySelectorDecision("P1", reason="no_candidates", scene_summary=scene_summary)
+        if float(scene_summary.drop_ratio_prev_round) > 0.5 or float(scene_summary.avg_link_latency_s) > 0.25:
+            return PolicySelectorDecision("P2", reason="poor_link_quality", scene_summary=scene_summary)
+        if float(scene_summary.min_distance_m) <= 8.0 and num_candidates >= 2:
+            return PolicySelectorDecision("P6", reason="nearby_senders", scene_summary=scene_summary)
+        if float(scene_summary.max_sender_collab) >= 0.55 and num_candidates >= 2:
+            return PolicySelectorDecision("P5", reason="high_collaboration_value", scene_summary=scene_summary)
+        if num_candidates >= 3 and float(scene_summary.mean_sender_collab) < 0.25:
+            return PolicySelectorDecision("P7", reason="many_low_value_candidates", scene_summary=scene_summary)
+        return PolicySelectorDecision("P3", reason="default_full_high", scene_summary=scene_summary)
+
+
+DEFAULT_POLICIES: List[FixedCollaborationPolicy] = [
     EgoOnlyPolicy(),
     FullLowEqualPolicy(),
     FullHighEqualPolicy(),
@@ -294,8 +362,14 @@ ALL_POLICIES: List[FixedCollaborationPolicy] = [
     Random2MidEqualPolicy(),
     Random3AdaptiveValuePolicy(),
 ]
+ALL_POLICIES = DEFAULT_POLICIES
 
-POLICY_REGISTRY: Dict[str, FixedCollaborationPolicy] = {p.policy_id: p for p in ALL_POLICIES}
+
+def build_default_policy_registry() -> PolicyRegistry:
+    return PolicyRegistry(DEFAULT_POLICIES)
+
+
+POLICY_REGISTRY = build_default_policy_registry()
 
 # Canonical seen/unseen split for Section IV.H evaluation protocols
 SEEN_POLICY_IDS: List[str] = ["P1", "P2", "P3", "P4", "P6"]
@@ -304,13 +378,11 @@ UNSEEN_POLICY_IDS: List[str] = ["P5", "P7", "P8"]
 
 def get_policy(policy_id: str) -> FixedCollaborationPolicy:
     """Look up a policy by ID string (e.g. 'P1', 'P4')."""
-    if policy_id not in POLICY_REGISTRY:
-        raise KeyError(f"Unknown policy_id '{policy_id}'. Valid IDs: {sorted(POLICY_REGISTRY)}")
-    return POLICY_REGISTRY[policy_id]
+    return POLICY_REGISTRY.get(policy_id)
 
 
 def list_policy_ids() -> List[str]:
-    return sorted(POLICY_REGISTRY.keys())
+    return POLICY_REGISTRY.list_policy_ids()
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +447,7 @@ def generate_policy_conditioned_episodes(base_episode, policies=None, *, seed_ba
     """
     import dataclasses as _dc
     if policies is None:
-        policies = ALL_POLICIES
+        policies = DEFAULT_POLICIES
     result = []
     for pol in policies:
         new_ep = apply_action_to_episode(base_episode, pol, seed_base=seed_base)

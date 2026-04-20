@@ -58,6 +58,25 @@ class CarlaRolloutCollectorTest(unittest.TestCase):
         self.assertIn("--env.emulation_dump_dir=data/emulation/P6", argv)
         self.assertIn("--env.dump_emulation_records_on_episode_end=True", argv)
         self.assertIn("--env.dump_vlm_records_on_episode_end=False", argv)
+        self.assertIn("--env.policy_mode=fixed", argv)
+        self.assertIn("--env.payload.selector_id=default", argv)
+
+    def test_build_policy_rollout_argv_supports_adaptive_mode(self):
+        config = COLLECTOR.CARLARolloutCollectorConfig(
+            output_dir="data/emulation",
+            policy_mode="adaptive",
+            policy_selector_id="default",
+            payload_enabled_types=["images", "tokens"],
+        )
+        argv = COLLECTOR.build_policy_rollout_argv(
+            config,
+            policy_id="adaptive",
+            episode_index=2,
+            policy_dir="data/emulation/adaptive",
+        )
+        self.assertIn("--env.policy_mode=adaptive", argv)
+        self.assertIn("--env.scene_id=adaptive_scene_0002", argv)
+        self.assertIn("--env.payload.enabled_types=[images,tokens]", argv)
 
     def test_collect_policy_rollouts_groups_outputs_by_policy(self):
         created = []

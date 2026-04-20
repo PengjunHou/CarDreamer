@@ -1,4 +1,5 @@
 import importlib.util
+import copy
 import sys
 import tempfile
 import types
@@ -21,6 +22,7 @@ def _ensure_pkg(name: str, path: Path) -> None:
 def _load_module(module_name: str):
     _ensure_pkg("car_dreamer", REPO_ROOT / "car_dreamer")
     _ensure_pkg("car_dreamer.toolkit", REPO_ROOT / "car_dreamer" / "toolkit")
+    _ensure_pkg("car_dreamer.toolkit.communication", REPO_ROOT / "car_dreamer" / "toolkit" / "communication")
     _ensure_pkg("car_dreamer.toolkit.emulation", EMULATION_ROOT)
     full_name = f"car_dreamer.toolkit.emulation.{module_name}"
     if full_name in sys.modules:
@@ -69,15 +71,23 @@ class EmulationTrainingTest(unittest.TestCase):
         self.assertGreaterEqual(len(val_idx), 1)
         self.assertGreaterEqual(len(train_idx), 1)
 
-    def test_load_sources_and_build_dataset_splits(self):
+    def test_old_vlm_logs_raise_for_strict_shared_latent_mode(self):
         real_source = TRAINING.EpisodeSource(
             path=str(REPO_ROOT / "data" / "vlm_records_terminated_step_96.json"),
             scene_type="right_turn",
             dt=0.1,
         )
+        episodes = TRAINING.load_episodes_from_sources([real_source])
+        SCHEMA.validate_episode_record(episodes[0])
+
+        config = TRAINING.EmulationTrainingConfig(history_len=4, horizon=3, val_ratio=0.5, seed=1)
+        with self.assertRaisesRegex(ValueError, "shared_latent"):
+            TRAINING.build_dataset_splits(episodes, config)
+
+    def test_build_dataset_splits_from_strict_shared_latent_episodes(self):
         episodes = TRAINING.load_episodes_from_sources(
-            [real_source],
-            synthetic_episodes=1,
+            [],
+            synthetic_episodes=2,
             synthetic_scene_type="lane_change",
             synthetic_num_steps=10,
             synthetic_num_vehicles=2,
@@ -129,6 +139,26 @@ class EmulationTrainingTest(unittest.TestCase):
         self.assertEqual(len(val_ids), 2)
         self.assertEqual(episodes[train_ids[0]].policy_id, "P1")
         self.assertEqual(sorted(episodes[idx].policy_id for idx in val_ids), ["P5", "P7"])
+
+    def test_unseen_policy_split_uses_mixed_episode_metadata(self):
+        base_episode = SYNTHETIC.generate_synthetic_canonical_episode(num_steps=8, num_vehicles=3, seed=13)
+        mixed_episode = copy.deepcopy(base_episode)
+        mixed_episode.policy_id = "mixed"
+        mixed_episode.metadata = {
+            **dict(mixed_episode.metadata or {}),
+            "policy_ids_used": ["P1", "P7"],
+            "payload_types_used": ["images", "tokens"],
+        }
+        config = TRAINING.EmulationTrainingConfig(
+            history_len=4,
+            horizon=2,
+            eval_mode="unseen",
+            unseen_policy_ids=["P7"],
+        )
+        _, val_dataset, train_ids, val_ids = TRAINING.build_dataset_splits([base_episode, mixed_episode], config)
+        self.assertIsNotNone(val_dataset)
+        self.assertEqual(train_ids, [0])
+        self.assertEqual(val_ids, [1])
 
     @unittest.skipIf(TRAINING.torch_is_available(), "This guard test only applies when torch is unavailable.")
     def test_fit_emulation_model_requires_torch(self):

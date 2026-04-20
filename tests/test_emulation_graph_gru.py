@@ -22,6 +22,7 @@ def _ensure_pkg(name: str, path: Path) -> None:
 def _load_module(module_name: str):
     _ensure_pkg("car_dreamer", REPO_ROOT / "car_dreamer")
     _ensure_pkg("car_dreamer.toolkit", REPO_ROOT / "car_dreamer" / "toolkit")
+    _ensure_pkg("car_dreamer.toolkit.communication", REPO_ROOT / "car_dreamer" / "toolkit" / "communication")
     _ensure_pkg("car_dreamer.toolkit.emulation", EMULATION_ROOT)
     full_name = f"car_dreamer.toolkit.emulation.{module_name}"
     if full_name in sys.modules:
@@ -59,11 +60,15 @@ class EmulationGraphGRUTest(unittest.TestCase):
 
         vehicle = reloaded.steps[0].candidate_vehicles[0]
         node_feature = FEATURES.pack_vehicle_node_state(vehicle)
-        self.assertEqual(node_feature.shape[0], 31)
+        self.assertEqual(node_feature.shape[0], 23)
         self.assertEqual(len(vehicle.query_task_relevance), len(reloaded.steps[0].queries))
+        self.assertEqual(len(vehicle.shared_latent), 8)
+        self.assertEqual(vehicle.shared_image_latent_dim, 4)
+        self.assertEqual(vehicle.shared_text_latent_dim, 4)
         self.assertEqual(len(vehicle.shared_summary_raw), 8)
         self.assertEqual(len(vehicle.shared_summary_semantic), 8)
         self.assertEqual(len(vehicle.intent_summary), 4)
+        self.assertEqual(vehicle.payload_type, "tokens")
 
     def test_adapter_builds_canonical_episode_from_real_vlm_log(self):
         episode = ADAPTER.adapt_vlm_records_to_canonical_episode(
@@ -103,11 +108,11 @@ class EmulationGraphGRUTest(unittest.TestCase):
         dataset = DATASET.CanonicalEmulationDataset([episode], history_len=8, horizon=5)
         sample = dataset[9]
 
-        self.assertEqual(sample["node_features"].shape, (8, 3, 31))
-        self.assertEqual(sample["state_node_features"].shape, (8, 3, 28))
-        self.assertEqual(sample["action_features"].shape, (8, 3, 3))
+        self.assertEqual(sample["node_features"].shape, (8, 3, 23))
+        self.assertEqual(sample["state_node_features"].shape, (8, 3, 15))
+        self.assertEqual(sample["action_features"].shape, (8, 3, 8))
         self.assertEqual(sample["target_raw_state"].shape, (5, 3, 5))
-        self.assertEqual(sample["target_shared_state"].shape, (5, 3, 21))
+        self.assertEqual(sample["target_shared_state"].shape, (5, 3, 8))
         self.assertEqual(sample["task_relevance"].shape, (8, 3, 6))
         self.assertEqual(sample["target_sender_collab"].shape, (5, 3, 6))
         self.assertEqual(sample["target_sender_gain"].shape, (5, 3, 6))
@@ -135,6 +140,8 @@ class EmulationGraphGRUTest(unittest.TestCase):
             history_len=4,
             horizon=3,
             hidden_dim=32,
+            raw_state_dim=sample["target_raw_state"].shape[-1],
+            shared_state_dim=sample["target_shared_state"].shape[-1],
         )
         net = MODEL.GraphGRUEmulationModel(config)
         outputs = net(sample)

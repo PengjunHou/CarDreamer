@@ -39,6 +39,7 @@ def build_runtime_emulation_step(
     question_ids: Sequence[str],
     feature_size: int,
     step_communication_stats: Mapping[str, Any] | None = None,
+    step_metadata: Mapping[str, Any] | None = None,
 ) -> CanonicalStepRecord:
     ordered_question_ids = list(question_ids)
     missing = [qid for qid in ordered_question_ids if qid not in question_results]
@@ -55,6 +56,8 @@ def build_runtime_emulation_step(
     )
 
     candidate_vehicles: List[CandidateVehicleState] = []
+    payload_types_used = set()
+    payload_overridden = False
     for candidate in candidate_vehicle_states:
         vehicle_id = int(candidate["vehicle_id"])
         pose = candidate.get("pose", {})
@@ -63,7 +66,22 @@ def build_runtime_emulation_step(
         window_messages = list(candidate.get("window_messages", []))
         shared_source = str(candidate.get("shared_source", "received_feat"))
         policy_action = dict(candidate.get("policy_action", {}))
+        payload_action = dict(candidate.get("payload_action", {}))
         runtime_comm_stats = dict(candidate.get("runtime_comm_stats", {}))
+        payload_type = str(
+            payload_action.get(
+                "payload_type",
+                candidate.get("payload_type", "tokens"),
+            )
+        ).strip() or "tokens"
+        payload_encoder_id = str(
+            payload_action.get(
+                "payload_encoder_id",
+                candidate.get("payload_encoder_id", "tokens_v1"),
+            )
+        ).strip() or "tokens_v1"
+        payload_types_used.add(payload_type)
+        payload_overridden = payload_overridden or bool(payload_action.get("payload_overridden", False))
 
         delta_pos = (
             float(pose.get("x", 0.0)) - float(ego_pose.get("x", 0.0)),
@@ -93,6 +111,11 @@ def build_runtime_emulation_step(
         )
         shared_confidence = float(shared_summary_semantic[3]) if selected_infos else 0.0
         intent_summary = _infer_intent_summary(scene_type, delta_yaw, delta_vel)
+        shared_latent = [float(x) for x in candidate.get("shared_latent", [])]
+        shared_image_latent_dim = int(candidate.get("shared_image_latent_dim", 0))
+        shared_text_latent_dim = int(candidate.get("shared_text_latent_dim", 0))
+        shared_latent_source = str(candidate.get("shared_latent_source", ""))
+        has_shared_latent = bool(candidate.get("shared_latent_valid", False)) and bool(shared_latent)
         task_relevance = {
             query.query_id: compute_task_relevance(sender_region, ego_region, query.required_region)
             for query in queries
@@ -113,6 +136,10 @@ def build_runtime_emulation_step(
                 delta_pos=delta_pos,
                 delta_vel=delta_vel,
                 delta_yaw=delta_yaw,
+                shared_latent=shared_latent,
+                shared_image_latent_dim=shared_image_latent_dim,
+                shared_text_latent_dim=shared_text_latent_dim,
+                shared_latent_source=shared_latent_source,
                 shared_summary_raw=shared_summary_raw,
                 shared_summary_semantic=shared_summary_semantic,
                 shared_confidence=shared_confidence,
@@ -123,6 +150,7 @@ def build_runtime_emulation_step(
                     "delta_pos": True,
                     "delta_vel": True,
                     "delta_yaw": True,
+                    "shared_latent": has_shared_latent,
                     "shared_summary_raw": has_selected_evidence,
                     "shared_summary_semantic": has_selected_evidence,
                     "shared_confidence": has_selected_evidence,
@@ -150,11 +178,18 @@ def build_runtime_emulation_step(
                     "env_step": int(env_step),
                     "shared_source": shared_source,
                     "has_selected_evidence": has_selected_evidence,
+                    "shared_latent_valid": has_shared_latent,
                     "policy_id": str(candidate.get("policy_id", policy_id)),
+                    "payload_type": payload_type,
+                    "payload_encoder_id": payload_encoder_id,
+                    "payload_selector_reason": str(payload_action.get("payload_selector_reason", "")),
+                    "payload_overridden": bool(payload_action.get("payload_overridden", False)),
                 },
                 alpha=float(policy_action.get("alpha", 0.0)),
                 nu=float(policy_action.get("nu", 0.0)),
                 bandwidth=float(policy_action.get("bandwidth", 0.0)),
+                payload_type=payload_type,
+                payload_encoder_id=payload_encoder_id,
             )
         )
 
@@ -162,6 +197,19 @@ def build_runtime_emulation_step(
         query_id: _extract_ego_sc(question_results[query_id])
         for query_id in ordered_question_ids
     }
+    step_metadata = dict(step_metadata or {})
+    selector_reason = str(
+        step_metadata.get(
+            "reason",
+            step_metadata.get("policy_selector_reason", ""),
+        )
+    )
+    policy_overridden = bool(
+        step_metadata.get(
+            "overridden",
+            step_metadata.get("policy_overridden", False),
+        )
+    )
     return CanonicalStepRecord(
         scene_id=str(scene_id),
         episode_id=str(episode_id),
@@ -178,7 +226,14 @@ def build_runtime_emulation_step(
             "num_questions": float(len(ordered_question_ids)),
             **{str(key): float(value) for key, value in dict(step_communication_stats or {}).items()},
         },
-        metadata={"env_step": int(env_step), "policy_id": str(policy_id)},
+        metadata={
+            "env_step": int(env_step),
+            "policy_id": str(policy_id),
+            "policy_selector_reason": selector_reason,
+            "policy_overridden": bool(policy_overridden),
+            "payload_types_used": sorted(payload_types_used),
+            "payload_overridden": bool(payload_overridden),
+        },
         policy_id=str(policy_id),
     )
 
@@ -193,14 +248,53 @@ def build_runtime_emulation_episode(
     steps: Sequence[CanonicalStepRecord],
     metadata: Mapping[str, Any] | None = None,
 ) -> CanonicalEpisodeRecord:
+    step_policy_ids = [str(step.policy_id or "").strip() for step in steps if str(step.policy_id or "").strip()]
+    unique_policy_ids = sorted({policy_id for policy_id in step_policy_ids if policy_id})
+    step_payload_sets = [
+        tuple(sorted({str(vehicle.payload_type or "tokens") for vehicle in step.candidate_vehicles}))
+        for step in steps
+    ]
+    unique_payload_types = sorted(
+        {
+            str(vehicle.payload_type or "tokens")
+            for step in steps
+            for vehicle in step.candidate_vehicles
+        }
+    )
+    policy_switch_count = 0
+    last_policy_id = None
+    for current_policy_id in step_policy_ids:
+        if last_policy_id is not None and current_policy_id != last_policy_id:
+            policy_switch_count += 1
+        last_policy_id = current_policy_id
+    payload_switch_count = 0
+    last_payload_set = None
+    for payload_set in step_payload_sets:
+        if last_payload_set is not None and payload_set != last_payload_set:
+            payload_switch_count += 1
+        last_payload_set = payload_set
+    episode_policy_id = str(policy_id)
+    if len(unique_policy_ids) > 1:
+        episode_policy_id = "mixed"
+    elif unique_policy_ids:
+        episode_policy_id = unique_policy_ids[0]
+    metadata = dict(metadata or {})
+    metadata.update(
+        {
+            "policy_ids_used": unique_policy_ids,
+            "payload_types_used": unique_payload_types,
+            "policy_switch_count": int(policy_switch_count),
+            "payload_switch_count": int(payload_switch_count),
+        }
+    )
     return CanonicalEpisodeRecord(
         scene_id=str(scene_id),
         episode_id=str(episode_id),
         scene_type=str(scene_type),
         dt=float(dt),
         steps=list(steps),
-        metadata=dict(metadata or {}),
-        policy_id=str(policy_id),
+        metadata=metadata,
+        policy_id=episode_policy_id,
     )
 
 

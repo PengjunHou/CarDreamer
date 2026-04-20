@@ -15,9 +15,13 @@ from runtime_logging import get_runtime_logger, get_runtime_logging_config, shou
 from .toolkit import (
     NetResource,
     Observer,
+    PayloadEncoder,
+    PayloadSelectorDecision,
     V2VMessage,
     _dist_m,
     _tx_bytes_for_latency,
+    canonicalize_payload_type,
+    decode_payload_dict,
     get_vehicle_pos,
     payload_fn_llm,
 )
@@ -27,7 +31,13 @@ from .toolkit.emulation.features import (
     compute_complementarity,
     compute_task_relevance,
 )
-from .toolkit.emulation.policy import CollaborationAction, VehicleInfo, get_policy
+from .toolkit.emulation.policy import (
+    CollaborationAction,
+    PolicySelectorDecision,
+    SceneSummary,
+    VehicleInfo,
+    get_policy,
+)
 from .toolkit.emulation.queries import make_query_records
 
 
@@ -43,6 +53,56 @@ class RightTurnAutoRuntimeMixin:
         self._policy_send_credit = {}
         self._policy_send_decision = {}
         self._policy_last_comm_step = -1
+        self._policy_current_decision = PolicySelectorDecision(policy_id=str(getattr(self, "_collaboration_policy_id", "")))
+        self._policy_prev_comm_summary = {
+            "attempted_message_count": 0.0,
+            "dropped_message_count": 0.0,
+            "drop_ratio_prev_round": 0.0,
+        }
+        self._payload_decisions_by_sender = {}
+        self._payload_last_decision_step = -1
+
+    def register_collaboration_policy(self, policy) -> None:
+        registry = getattr(self, "_policy_registry", None)
+        if registry is None:
+            raise RuntimeError("Policy registry is not initialized.")
+        registry.register(policy)
+
+    def set_policy_override(self, policy_id: str | None) -> None:
+        policy_id = str(policy_id or "").strip()
+        if policy_id:
+            getattr(self, "_policy_registry").get(policy_id)
+        self._policy_override_id = policy_id
+        self._policy_last_action_step = -1
+        self._policy_last_comm_step = -1
+
+    def clear_policy_override(self) -> None:
+        self.set_policy_override(None)
+
+    def set_policy_selector(self, selector) -> None:
+        self._policy_selector = selector
+        self._policy_last_action_step = -1
+
+    def register_payload_encoder(self, payload_type: str, encoder: PayloadEncoder) -> None:
+        registry = getattr(self, "_payload_registry", None)
+        if registry is None:
+            raise RuntimeError("Payload registry is not initialized.")
+        registry.register(payload_type, encoder, default=True)
+
+    def set_payload_override(self, payload_type: str | None) -> None:
+        payload_type = str(payload_type or "").strip()
+        if payload_type:
+            payload_type = canonicalize_payload_type(payload_type)
+            getattr(self, "_payload_registry").get(payload_type)
+        self._payload_override = payload_type
+        self._payload_last_decision_step = -1
+
+    def clear_payload_override(self) -> None:
+        self.set_payload_override(None)
+
+    def set_payload_selector(self, selector) -> None:
+        self._payload_selector = selector
+        self._payload_last_decision_step = -1
 
     def _get_runtime_debug_interval(self) -> int:
         runtime_cfg = get_runtime_logging_config()
@@ -99,6 +159,26 @@ class RightTurnAutoRuntimeMixin:
         self._reset_policy_runtime_state()
         RUNTIME_LOGGER.debug("Group runtime state reset.")
 
+    def _get_active_policy_id(self) -> str:
+        decision = getattr(self, "_policy_current_decision", None)
+        if decision is not None and str(getattr(decision, "policy_id", "")).strip():
+            return str(decision.policy_id)
+        return str(getattr(self, "_collaboration_policy_id", "")).strip()
+
+    def _get_current_policy_decision(self) -> Dict[str, Any]:
+        decision = getattr(self, "_policy_current_decision", None)
+        if decision is None:
+            return {
+                "policy_id": self._get_active_policy_id(),
+                "reason": "",
+                "overridden": False,
+            }
+        return {
+            "policy_id": str(getattr(decision, "policy_id", "")),
+            "reason": str(getattr(decision, "reason", "")),
+            "overridden": bool(getattr(decision, "overridden", False)),
+        }
+
     def _ensure_comm_step_summary(self) -> Dict[str, float]:
         current_step = int(getattr(self, "_time_step", 0))
         if int(getattr(self, "_comm_step_summary_step", -1)) != current_step:
@@ -150,6 +230,70 @@ class RightTurnAutoRuntimeMixin:
     def _get_current_comm_step_summary(self) -> Dict[str, float]:
         summary = self._ensure_comm_step_summary()
         return {str(key): float(value) for key, value in summary.items()}
+
+    def _build_scene_summary(self, infos: List[VehicleInfo]) -> SceneSummary:
+        if not infos:
+            return SceneSummary(
+                num_candidates=0,
+                avg_link_latency_s=float(getattr(self, "_policy_prev_comm_summary", {}).get("avg_link_latency_s", 0.0)),
+                drop_ratio_prev_round=float(getattr(self, "_policy_prev_comm_summary", {}).get("drop_ratio_prev_round", 0.0)),
+            )
+        collabs = [float(info.sender_collab) for info in infos]
+        dists = [float(info.distance_m) for info in infos]
+        comm_stats = self._comm_link_analysis_by_sender or {}
+        latencies = [
+            float(stats.get("analysis_latency_s", stats.get("latest_latency_s", 0.0)))
+            for stats in comm_stats.values()
+            if isinstance(stats, dict)
+        ]
+        prev_summary = getattr(self, "_policy_prev_comm_summary", {})
+        return SceneSummary(
+            num_candidates=len(infos),
+            max_sender_collab=max(collabs) if collabs else 0.0,
+            mean_sender_collab=sum(collabs) / len(collabs) if collabs else 0.0,
+            min_distance_m=min(dists) if dists else 0.0,
+            mean_distance_m=sum(dists) / len(dists) if dists else 0.0,
+            avg_link_latency_s=(sum(latencies) / len(latencies)) if latencies else float(prev_summary.get("avg_link_latency_s", 0.0)),
+            drop_ratio_prev_round=float(prev_summary.get("drop_ratio_prev_round", 0.0)),
+        )
+
+    def _select_active_policy(self, infos: List[VehicleInfo]) -> Tuple[Any, PolicySelectorDecision]:
+        registry = getattr(self, "_policy_registry", None)
+        if registry is None:
+            policy = get_policy(str(getattr(self, "_collaboration_policy_id", "P3")))
+            return policy, PolicySelectorDecision(policy_id=policy.policy_id)
+        scene_summary = self._build_scene_summary(infos)
+        override_id = str(getattr(self, "_policy_override_id", "")).strip()
+        if override_id:
+            policy = registry.get(override_id)
+            return policy, PolicySelectorDecision(
+                policy_id=override_id,
+                reason="policy_override",
+                overridden=True,
+                scene_summary=scene_summary,
+            )
+        if str(getattr(self, "_policy_mode", "fixed")).lower() != "adaptive":
+            policy_id = str(getattr(self, "_collaboration_policy_id", "P3"))
+            policy = registry.get(policy_id)
+            return policy, PolicySelectorDecision(
+                policy_id=policy_id,
+                reason="fixed_policy_mode",
+                overridden=False,
+                scene_summary=scene_summary,
+            )
+        selector = getattr(self, "_policy_selector", None)
+        if selector is None:
+            policy_id = str(getattr(self, "_collaboration_policy_id", "P3"))
+            policy = registry.get(policy_id)
+            return policy, PolicySelectorDecision(
+                policy_id=policy_id,
+                reason="missing_policy_selector",
+                overridden=False,
+                scene_summary=scene_summary,
+            )
+        decision = selector(scene_summary, registry=registry)
+        policy = registry.get(str(decision.policy_id))
+        return policy, decision
 
     def _destroy_group_observers(self) -> None:
         for observer in self._other_observers.values():
@@ -264,13 +408,20 @@ class RightTurnAutoRuntimeMixin:
     def _compute_current_policy_action(self) -> CollaborationAction:
         if getattr(self, "_policy_last_action_step", -1) == int(self._time_step):
             return self._policy_current_action
-        policy = getattr(self, "_collaboration_policy", None)
+        infos = self._build_policy_vehicle_infos()
+        policy, decision = self._select_active_policy(infos)
+        previous_policy_id = self._get_active_policy_id()
+        self._policy_current_decision = decision
+        self._collaboration_policy_id = str(decision.policy_id)
+        self._collaboration_policy = policy
+        if previous_policy_id and previous_policy_id != self._collaboration_policy_id:
+            self._policy_send_credit = {}
+            self._policy_send_decision = {}
         if policy is None:
             self._policy_current_action = CollaborationAction()
             self._policy_last_action_step = int(self._time_step)
             return self._policy_current_action
         rng = random.Random(int(getattr(self, "_collaboration_policy_seed", 0)) + int(self._time_step))
-        infos = self._build_policy_vehicle_infos()
         self._policy_current_action = policy(infos, rng=rng)
         self._policy_last_action_step = int(self._time_step)
         return self._policy_current_action
@@ -278,7 +429,11 @@ class RightTurnAutoRuntimeMixin:
     def _get_policy_action_value(self, vehicle_id: int) -> Dict[str, float]:
         action = self._compute_current_policy_action()
         vid = int(vehicle_id)
+        decision = self._get_current_policy_decision()
         return {
+            "policy_id": str(decision.get("policy_id", "")),
+            "policy_selector_reason": str(decision.get("reason", "")),
+            "policy_overridden": 1.0 if bool(decision.get("overridden", False)) else 0.0,
             "alpha": float(action.alpha.get(vid, 0.0)),
             "nu": float(action.nu.get(vid, 0.0)),
             "bandwidth": float(action.bandwidth.get(vid, 0.0)),
@@ -306,6 +461,87 @@ class RightTurnAutoRuntimeMixin:
         self._policy_last_comm_step = int(self._time_step)
         return dict(decisions)
 
+    def _select_payload_decision(
+        self,
+        *,
+        sender_id: int,
+        bandwidth: float,
+        distance_m: float,
+    ) -> PayloadSelectorDecision:
+        registry = getattr(self, "_payload_registry", None)
+        if registry is None:
+            return PayloadSelectorDecision(payload_type="tokens", payload_encoder_id="tokens_v1", reason="missing_registry")
+        override = str(getattr(self, "_payload_override", "")).strip()
+        if override:
+            encoder_id = registry.default_encoder_id(override)
+            return PayloadSelectorDecision(
+                payload_type=override,
+                payload_encoder_id=encoder_id,
+                reason="payload_override",
+                overridden=True,
+            )
+        selector = getattr(self, "_payload_selector", None)
+        if selector is None:
+            return PayloadSelectorDecision(
+                payload_type="tokens",
+                payload_encoder_id=registry.default_encoder_id("tokens"),
+                reason="missing_payload_selector",
+                overridden=False,
+            )
+        latest_comm_stats = self._get_latest_comm_link_analysis(int(sender_id))
+        return selector(
+            sender_id=int(sender_id),
+            bandwidth=float(bandwidth),
+            distance_m=float(distance_m),
+            latest_comm_stats=latest_comm_stats,
+            registry=registry,
+            enabled_types=list(getattr(self, "_payload_enabled_types", ["tokens", "images"])),
+        )
+
+    def _compute_current_payload_decisions(self) -> Dict[int, PayloadSelectorDecision]:
+        if getattr(self, "_payload_last_decision_step", -1) == int(self._time_step):
+            return dict(self._payload_decisions_by_sender)
+        action = self._compute_current_policy_action()
+        decisions: Dict[int, PayloadSelectorDecision] = {}
+        actor_map = self._build_group_actor_map()
+        ego_id = int(getattr(self.ego, "id", -1)) if getattr(self, "ego", None) is not None else -1
+        ego_actor = actor_map.get(ego_id)
+        for actor in self.group_vehs:
+            sender_id = int(actor.id)
+            if sender_id == ego_id:
+                continue
+            bandwidth = float(action.bandwidth.get(sender_id, 0.0))
+            distance_m = _dist_m(actor, ego_actor) if ego_actor is not None else 0.0
+            decisions[sender_id] = self._select_payload_decision(
+                sender_id=sender_id,
+                bandwidth=bandwidth,
+                distance_m=distance_m,
+            )
+        self._payload_decisions_by_sender = decisions
+        self._payload_last_decision_step = int(self._time_step)
+        return dict(decisions)
+
+    def _get_payload_action_value(self, vehicle_id: int) -> Dict[str, Any]:
+        decisions = self._compute_current_payload_decisions()
+        decision = decisions.get(int(vehicle_id))
+        if decision is None:
+            registry = getattr(self, "_payload_registry", None)
+            encoder_id = "tokens_v1"
+            if registry is not None:
+                encoder_id = registry.default_encoder_id("tokens")
+            decision = PayloadSelectorDecision(
+                payload_type="tokens",
+                payload_encoder_id=encoder_id,
+                reason="default_tokens",
+                overridden=False,
+            )
+        return {
+            "payload_type": str(decision.payload_type),
+            "payload_encoder_id": str(decision.payload_encoder_id),
+            "payload_selector_reason": str(decision.reason),
+            "payload_overridden": 1.0 if bool(decision.overridden) else 0.0,
+        }
+
     def _scale_net_resource_for_bandwidth(self, base: NetResource, bandwidth: float) -> NetResource:
         scale = max(float(bandwidth), float(getattr(self, "_collaboration_bandwidth_floor", 0.1)))
         return NetResource(
@@ -321,20 +557,35 @@ class RightTurnAutoRuntimeMixin:
     # Communication helpers
     # =========================================================
 
-    def _make_payload(self, sender: carla.Actor) -> Dict[str, Any]:
+    def _make_payload(
+        self,
+        sender: carla.Actor,
+        payload_decision: PayloadSelectorDecision,
+    ) -> Dict[str, Any]:
         obs = self.obs if int(sender.id) == int(self.ego.id) else self.group_obs.get(int(sender.id), {})
         payload: Dict[str, Any] = {}
-        if self.payload_fn is not None:
-            sender_id = int(sender.id)
-            payload = self.payload_fn(
-                sender,
-                obs,
-                self.feature_size,
-                image_proc_fn=lambda img, _unused, sid=sender_id: self._compute_single_image_description_from_array(
-                    img,
-                    cache_key=("scene_description", sid),
-                ),
-            )
+        registry = getattr(self, "_payload_registry", None)
+        if registry is None:
+            raise RuntimeError("Payload registry is not initialized.")
+        encoder = registry.get(payload_decision.payload_type, payload_decision.payload_encoder_id)
+        sender_id = int(sender.id)
+        encoding = encoder.encode(
+            sender,
+            obs,
+            self.feature_size,
+            image_proc_fn=lambda img, _unused, sid=sender_id: self._compute_single_image_description_from_array(
+                img,
+                cache_key=("scene_description", sid),
+            ),
+            jpeg_quality=int(getattr(self, "_payload_image_jpeg_quality", 80)),
+        )
+        payload = encoding.to_payload_dict()
+        payload["selector_metadata"] = {
+            "payload_type": str(payload_decision.payload_type),
+            "payload_encoder_id": str(payload_decision.payload_encoder_id),
+            "reason": str(payload_decision.reason),
+            "overridden": bool(payload_decision.overridden),
+        }
 
         tf = sender.get_transform()
         vel = sender.get_velocity()
@@ -347,6 +598,7 @@ class RightTurnAutoRuntimeMixin:
                 },
                 "vel": {"vx": float(vel.x), "vy": float(vel.y)},
                 "sender_id": int(sender.id),
+                "sensor_name": "cam0",
             }
         )
         return payload
@@ -408,7 +660,9 @@ class RightTurnAutoRuntimeMixin:
         fixed_dt = float(self._world._settings.fixed_delta_seconds)
         ego_id = int(self.ego.id)
         current_action = self._compute_current_policy_action()
+        policy_decision = self._get_current_policy_decision()
         send_decisions = self._advance_policy_send_schedule()
+        payload_decisions = self._compute_current_payload_decisions()
         enqueued_count = 0
         sender_ids = set()
         total_payload_bytes = 0
@@ -425,12 +679,27 @@ class RightTurnAutoRuntimeMixin:
                 if alpha <= 0.5 or not bool(send_decisions.get(int(sender_id), False)):
                     continue
                 sender_ids.add(int(sender_id))
-                payload = self._make_payload(sender)
+                receiver = actor_map.get(ego_id)
+                distance_to_ego = _dist_m(sender, receiver) if receiver is not None else 0.0
+                payload_decision = payload_decisions.get(
+                    int(sender_id),
+                    self._select_payload_decision(
+                        sender_id=int(sender_id),
+                        bandwidth=float(current_action.bandwidth.get(int(sender_id), 0.0)),
+                        distance_m=distance_to_ego,
+                    ),
+                )
+                payload = self._make_payload(sender, payload_decision)
                 payload["policy_action"] = {
-                    "policy_id": str(getattr(self, "_collaboration_policy_id", "")),
+                    "policy_id": str(policy_decision.get("policy_id", getattr(self, "_collaboration_policy_id", ""))),
+                    "policy_selector_reason": str(policy_decision.get("reason", "")),
+                    "policy_overridden": bool(policy_decision.get("overridden", False)),
                     "alpha": alpha,
                     "nu": float(current_action.nu.get(int(sender_id), 0.0)),
                     "bandwidth": float(current_action.bandwidth.get(int(sender_id), 0.0)),
+                    "beta": str(payload_decision.payload_type),
+                    "payload_type": str(payload_decision.payload_type),
+                    "payload_encoder_id": str(payload_decision.payload_encoder_id),
                 }
                 payload_bytes = _tx_bytes_for_latency(
                     payload,
@@ -547,6 +816,23 @@ class RightTurnAutoRuntimeMixin:
                 len(self._in_flight),
                 total_payload_bytes,
             )
+        attempted = float(step_summary.get("attempted_message_count", 0.0))
+        dropped = float(step_summary.get("dropped_message_count", 0.0))
+        avg_latency_s = 0.0
+        if self._comm_link_analysis_by_sender:
+            latencies = [
+                float(stats.get("analysis_latency_s", 0.0))
+                for stats in self._comm_link_analysis_by_sender.values()
+                if isinstance(stats, dict)
+            ]
+            if latencies:
+                avg_latency_s = float(sum(latencies) / len(latencies))
+        self._policy_prev_comm_summary = {
+            "attempted_message_count": attempted,
+            "dropped_message_count": dropped,
+            "drop_ratio_prev_round": (dropped / attempted) if attempted > 0.0 else 0.0,
+            "avg_link_latency_s": avg_latency_s,
+        }
 
     def _deliver_messages(self) -> None:
         if not self._in_flight:

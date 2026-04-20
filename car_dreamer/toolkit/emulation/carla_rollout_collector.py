@@ -15,6 +15,13 @@ class CARLARolloutCollectorConfig:
     output_dir: str = "data/emulation"
     episodes_per_policy: int = 1
     policy_ids: List[str] = field(default_factory=list)
+    policy_mode: str = "fixed"
+    policy_selector_id: str = "default"
+    policy_override: str = ""
+    payload_selector_id: str = "default"
+    payload_override_type: str = ""
+    payload_enabled_types: List[str] = field(default_factory=lambda: ["images", "tokens"])
+    payload_image_jpeg_quality: int = 80
     max_steps: int = 256
     seed: int = 0
     task_argv: List[str] = field(default_factory=list)
@@ -29,14 +36,26 @@ def build_policy_rollout_argv(
     episode_index: int,
     policy_dir: str | Path,
 ) -> List[str]:
-    scene_id = f"{policy_id}_scene_{episode_index:04d}"
+    policy_mode = str(config.policy_mode).strip().lower() or "fixed"
+    scene_id = (
+        f"adaptive_scene_{episode_index:04d}"
+        if policy_mode == "adaptive"
+        else f"{policy_id}_scene_{episode_index:04d}"
+    )
     argv = list(config.task_argv)
     argv.extend(
         [
+            f"--env.policy_mode={policy_mode}",
             f"--env.policy_id={policy_id}",
+            f"--env.policy_selector_id={config.policy_selector_id}",
+            f"--env.policy_override={config.policy_override}",
             f"--env.scene_id={scene_id}",
             f"--env.speed_preset={config.speed_preset}",
             f"--env.emulation_dump_dir={policy_dir}",
+            f"--env.payload.selector_id={config.payload_selector_id}",
+            f"--env.payload.override_type={config.payload_override_type}",
+            f"--env.payload.enabled_types=[{','.join(config.payload_enabled_types)}]",
+            f"--env.payload.image_jpeg_quality={int(config.payload_image_jpeg_quality)}",
             "--env.dump_emulation_records_on_episode_end=True",
             "--env.dump_vlm_records_on_episode_end=False",
         ]
@@ -110,7 +129,10 @@ def collect_policy_rollouts(
 
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    policy_mode = str(config.policy_mode).strip().lower() or "fixed"
     policy_ids = list(config.policy_ids or list_policy_ids())
+    if policy_mode == "adaptive":
+        policy_ids = ["adaptive"]
     saved: Dict[str, List[str]] = {}
 
     for policy_id in policy_ids:
@@ -156,6 +178,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default="data/emulation")
     parser.add_argument("--episodes-per-policy", type=int, default=1)
     parser.add_argument("--policy-ids", nargs="*", default=[])
+    parser.add_argument("--policy-mode", default="fixed", choices=["fixed", "adaptive"])
+    parser.add_argument("--policy-selector-id", default="default")
+    parser.add_argument("--policy-override", default="")
+    parser.add_argument("--payload-selector-id", default="default")
+    parser.add_argument("--payload-override-type", default="")
+    parser.add_argument("--payload-enabled-types", nargs="*", default=["images", "tokens"])
+    parser.add_argument("--payload-image-jpeg-quality", type=int, default=80)
     parser.add_argument("--max-steps", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--speed-preset", default="fast_episode")
@@ -182,6 +211,13 @@ def main(argv: Sequence[str] | None = None) -> Dict[str, List[str]]:
         output_dir=str(args.output_dir),
         episodes_per_policy=int(args.episodes_per_policy),
         policy_ids=list(args.policy_ids),
+        policy_mode=str(args.policy_mode),
+        policy_selector_id=str(args.policy_selector_id),
+        policy_override=str(args.policy_override),
+        payload_selector_id=str(args.payload_selector_id),
+        payload_override_type=str(args.payload_override_type),
+        payload_enabled_types=list(args.payload_enabled_types),
+        payload_image_jpeg_quality=int(args.payload_image_jpeg_quality),
         max_steps=int(args.max_steps),
         seed=int(args.seed),
         task_argv=list(args.task_argv),

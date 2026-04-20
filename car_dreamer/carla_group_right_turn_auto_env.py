@@ -11,17 +11,21 @@ from runtime_logging import get_runtime_logger, get_runtime_logging_config, shou
 from .carla_wpt_fixed_env import CarlaWptFixedEnv
 from .right_turn_auto_runtime import RECEIVED_BUFFER_SIZE, RightTurnAutoRuntimeMixin
 from .toolkit import (
+    DEFAULT_PAYLOAD_TYPE,
     GraphBuildConfig,
     LatencyModel,
     NetResource,
     Observer,
+    RuleBasedPayloadSelector,
     SimpleWirelessLatency,
     V2VMessage,
     VehicleNodeGraphBuilder,
+    build_default_payload_registry,
+    canonicalize_payload_type,
     payload_fn_llm,
 )
 from .toolkit.vlm import RightTurnAutoVLMMixin
-from .toolkit.emulation.policy import get_policy
+from .toolkit.emulation.policy import RuleBasedPolicySelector, build_default_policy_registry, get_policy
 
 
 AUTO_ENV_LOGGER = get_runtime_logger("car_dreamer.env.right_turn_auto")
@@ -100,6 +104,17 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         overhead_bytes = int(getattr(comm_cfg, "overhead_bytes", 64))
         self._drop_on_capacity_exceeded = bool(getattr(comm_cfg, "drop_on_capacity_exceeded", False))
         self._log_dropped_messages = bool(getattr(comm_cfg, "log_dropped_messages", True))
+        payload_cfg = getattr(self._config, "payload", None)
+        enabled_types = list(getattr(payload_cfg, "enabled_types", [DEFAULT_PAYLOAD_TYPE, "images"]))
+        self._payload_enabled_types = [canonicalize_payload_type(item) for item in enabled_types]
+        if not self._payload_enabled_types:
+            self._payload_enabled_types = [DEFAULT_PAYLOAD_TYPE]
+        self._payload_selector_id = str(getattr(payload_cfg, "selector_id", "default"))
+        self._payload_override_type = str(getattr(payload_cfg, "override_type", "")).strip()
+        self._payload_image_jpeg_quality = int(getattr(payload_cfg, "image_jpeg_quality", 80))
+        self._payload_registry = build_default_payload_registry()
+        self._payload_selector = RuleBasedPayloadSelector()
+        self._payload_override = canonicalize_payload_type(self._payload_override_type) if self._payload_override_type else ""
 
         self._default_net_res = NetResource(uplink_bps=uplink_bps, downlink_bps=downlink_bps)
         self.latency_model: LatencyModel = SimpleWirelessLatency(
@@ -178,9 +193,21 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self._vlm_enable_multi_query_scoring = bool(
             getattr(vlm_cfg, "enable_multi_query_scoring", True)
         )
+        self._vlm_shared_latent_mode = str(
+            getattr(vlm_cfg, "shared_latent_mode", "clip_image_text_concat")
+        )
+        self._vlm_shared_latent_model_name = str(
+            getattr(vlm_cfg, "shared_latent_model_name", "openai/clip-vit-large-patch14")
+        )
+        self._vlm_shared_latent_local_files_only = bool(
+            getattr(vlm_cfg, "shared_latent_local_files_only", self._vlm_local_files_only)
+        )
 
         self._vlm_model = None
         self._vlm_processor: Optional[AutoProcessor] = None
+        self._shared_latent_clip_model = None
+        self._shared_latent_clip_processor = None
+        self._shared_latent_text_embedding_cache: Dict[str, Any] = {}
         self._vlm_records: List[Dict[str, Any]] = []
         self._vlm_last_eval: Dict[str, Any] = {}
         self._vlm_step_cache: Dict[str, Any] = {}
@@ -211,15 +238,26 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self.agent = None
 
     def _init_collaboration_policy(self) -> None:
+        self._policy_mode = str(getattr(self._config, "policy_mode", "fixed")).strip().lower() or "fixed"
+        if self._policy_mode not in {"fixed", "adaptive"}:
+            AUTO_ENV_LOGGER.warning("Unknown policy_mode '%s'; falling back to fixed.", self._policy_mode)
+            self._policy_mode = "fixed"
+        self._policy_selector_id = str(getattr(self._config, "policy_selector_id", "default"))
+        self._policy_override_id = str(getattr(self._config, "policy_override", "")).strip()
+        self._policy_registry = build_default_policy_registry()
+        self._policy_selector = RuleBasedPolicySelector()
         self._collaboration_policy_id = str(getattr(self._config, "policy_id", "P3"))
-        self._collaboration_policy = get_policy(self._collaboration_policy_id)
+        self._collaboration_policy = self._policy_registry.get(self._collaboration_policy_id)
         self._collaboration_policy_seed = int(getattr(self._config, "policy_seed", 0))
         self._collaboration_bandwidth_floor = float(
             getattr(self._config, "policy_bandwidth_floor", 0.1)
         )
         AUTO_ENV_LOGGER.info(
-            "Configured collaboration policy policy_id=%s seed=%d bandwidth_floor=%.3f",
+            "Configured collaboration policy mode=%s policy_id=%s selector=%s override=%s seed=%d bandwidth_floor=%.3f",
+            self._policy_mode,
             self._collaboration_policy_id,
+            self._policy_selector_id,
+            self._policy_override_id or "<none>",
             self._collaboration_policy_seed,
             self._collaboration_bandwidth_floor,
         )

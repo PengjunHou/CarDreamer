@@ -58,6 +58,22 @@ def _feature_nbytes(payload: Any) -> int:
         return len(payload.encode("utf-8"))
 
     if isinstance(payload, dict):
+        if "data_nbytes" in payload:
+            try:
+                return int(payload["data_nbytes"])
+            except Exception:
+                pass
+
+        if "payload_type" in payload and "data" in payload:
+            if isinstance(payload["data"], np.ndarray):
+                return int(payload["data"].nbytes)
+            if isinstance(payload["data"], torch.Tensor):
+                return int(payload["data"].element_size() * payload["data"].numel())
+            if isinstance(payload["data"], (bytes, bytearray)):
+                return int(len(payload["data"]))
+            if isinstance(payload["data"], str):
+                return int(len(payload["data"].encode("utf-8")))
+
         if "scene_description" in payload and payload["scene_description"] is not None:
             return _feature_nbytes(payload["scene_description"])
 

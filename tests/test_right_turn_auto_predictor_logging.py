@@ -40,6 +40,7 @@ def _load_module(full_name: str, path: Path):
 def _load_emulation_module(module_name: str):
     _ensure_pkg("car_dreamer", REPO_ROOT / "car_dreamer")
     _ensure_pkg("car_dreamer.toolkit", TOOLKIT_ROOT)
+    _ensure_pkg("car_dreamer.toolkit.communication", TOOLKIT_ROOT / "communication")
     _ensure_pkg("car_dreamer.toolkit.emulation", EMULATION_ROOT)
     return _load_module(
         f"car_dreamer.toolkit.emulation.{module_name}",
@@ -50,6 +51,7 @@ def _load_emulation_module(module_name: str):
 def _load_vlm_module(module_name: str):
     _ensure_pkg("car_dreamer", REPO_ROOT / "car_dreamer")
     _ensure_pkg("car_dreamer.toolkit", TOOLKIT_ROOT)
+    _ensure_pkg("car_dreamer.toolkit.communication", TOOLKIT_ROOT / "communication")
     _ensure_pkg("car_dreamer.toolkit.vlm", VLM_ROOT)
     return _load_module(
         f"car_dreamer.toolkit.vlm.{module_name}",
@@ -125,10 +127,21 @@ def _load_runtime_module():
             self.carrier_freq_hz = carrier_freq_hz
 
     toolkit_pkg.NetResource = _NetResource
+    toolkit_pkg.PayloadEncoder = object
+    toolkit_pkg.PayloadSelectorDecision = lambda **kwargs: types.SimpleNamespace(**kwargs)
     toolkit_pkg.Observer = object
     toolkit_pkg.V2VMessage = object
     toolkit_pkg._dist_m = lambda *args, **kwargs: 0.0
     toolkit_pkg._tx_bytes_for_latency = lambda payload, overhead_bytes=64: int(overhead_bytes)
+    toolkit_pkg.canonicalize_payload_type = lambda payload_type: str(payload_type or "tokens")
+    toolkit_pkg.decode_payload_dict = lambda payload: {
+        "payload_type": str(payload.get("payload_type", "tokens")),
+        "payload_encoder_id": str(payload.get("payload_encoder_id", "tokens_v1")),
+        "image": None,
+        "scene_description": str(payload.get("scene_description", "")),
+        "text": str(payload.get("text", "")),
+        "data_nbytes": int(payload.get("data_nbytes", 0)),
+    }
     toolkit_pkg.get_vehicle_pos = lambda actor: (0.0, 0.0)
     toolkit_pkg.payload_fn_llm = lambda *args, **kwargs: {}
 
@@ -194,6 +207,11 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                     "vehicle_id": 101,
                     "pose": {"x": 8.0, "y": 1.5, "yaw_rad": 0.1},
                     "velocity": {"vx": 5.5, "vy": 0.1},
+                    "shared_latent": [0.1, 0.2, 0.3, 0.4, 0.7, 0.6, 0.5, 0.4],
+                    "shared_image_latent_dim": 4,
+                    "shared_text_latent_dim": 4,
+                    "shared_latent_source": "clip_image_text_concat",
+                    "shared_latent_valid": True,
                     "selected_infos": [
                         {
                             "sender_id": 101,
@@ -209,6 +227,7 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                     ],
                     "shared_source": "received_feat",
                     "policy_action": {"alpha": 1.0, "nu": 1.0, "bandwidth": 0.7},
+                    "payload_action": {"payload_type": "images", "payload_encoder_id": "images_v1"},
                     "runtime_comm_stats": {
                         "required_load_bps": 6400.0,
                         "link_rate_bps": 3200.0,
@@ -221,12 +240,18 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                     "vehicle_id": 202,
                     "pose": {"x": -6.0, "y": -2.0, "yaw_rad": -0.2},
                     "velocity": {"vx": 3.2, "vy": 0.0},
+                    "shared_latent": [0.0] * 8,
+                    "shared_image_latent_dim": 4,
+                    "shared_text_latent_dim": 4,
+                    "shared_latent_source": "clip_image_text_concat",
+                    "shared_latent_valid": False,
                     "selected_infos": [],
                     "window_messages": [
                         {"received_age_s": 0.5, "latency_s": 0.2, "payload_bytes": 256, "distance_m": 6.5},
                     ],
                     "shared_source": "received_feat",
                     "policy_action": {"alpha": 0.0, "nu": 0.0, "bandwidth": 0.0},
+                    "payload_action": {"payload_type": "tokens", "payload_encoder_id": "tokens_v1"},
                     "policy_id": "P5",
                 },
             ],
@@ -237,6 +262,7 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                 "attempted_message_count": 1.0,
                 "dropped_message_count": 1.0,
             },
+            step_metadata={"reason": "high_collaboration_value", "overridden": False},
         )
 
         SCHEMA.validate_episode_record(
@@ -253,10 +279,17 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
         self.assertEqual(step.step, 0)
         self.assertEqual(step.metadata["env_step"], 7)
         self.assertEqual(step.policy_id, "P5")
+        self.assertEqual(step.metadata["policy_selector_reason"], "high_collaboration_value")
+        self.assertEqual(step.metadata["payload_types_used"], ["images", "tokens"])
         self.assertEqual([vehicle.vehicle_id for vehicle in step.candidate_vehicles], [101, 202])
         self.assertEqual(set(step.ego_sc.keys()), set(question_ids))
 
         sender_with_evidence = step.candidate_vehicles[0]
+        self.assertTrue(sender_with_evidence.component_valid_mask["shared_latent"])
+        self.assertEqual(len(sender_with_evidence.shared_latent), 8)
+        self.assertEqual(sender_with_evidence.shared_image_latent_dim, 4)
+        self.assertEqual(sender_with_evidence.shared_text_latent_dim, 4)
+        self.assertEqual(sender_with_evidence.shared_latent_source, "clip_image_text_concat")
         self.assertTrue(sender_with_evidence.component_valid_mask["shared_summary_raw"])
         self.assertTrue(sender_with_evidence.component_valid_mask["shared_summary_semantic"])
         self.assertGreater(sum(sender_with_evidence.shared_summary_raw), 0.0)
@@ -264,6 +297,8 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
         self.assertEqual(sender_with_evidence.alpha, 1.0)
         self.assertEqual(sender_with_evidence.nu, 1.0)
         self.assertAlmostEqual(sender_with_evidence.bandwidth, 0.7)
+        self.assertEqual(sender_with_evidence.payload_type, "images")
+        self.assertEqual(sender_with_evidence.payload_encoder_id, "images_v1")
         self.assertEqual(sender_with_evidence.communication_stats["required_load_bps"], 6400.0)
         self.assertEqual(sender_with_evidence.communication_stats["link_rate_bps"], 3200.0)
         self.assertEqual(sender_with_evidence.communication_stats["comm_feasible"], 0.0)
@@ -272,6 +307,8 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
         self.assertEqual(step.communication_stats["dropped_message_count"], 1.0)
 
         sender_without_evidence = step.candidate_vehicles[1]
+        self.assertFalse(sender_without_evidence.component_valid_mask["shared_latent"])
+        self.assertEqual(sender_without_evidence.shared_latent, [0.0] * 8)
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_summary_raw"])
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_summary_semantic"])
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_confidence"])
@@ -283,6 +320,7 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
         self.assertEqual(sender_without_evidence.alpha, 0.0)
         self.assertEqual(sender_without_evidence.nu, 0.0)
         self.assertEqual(sender_without_evidence.bandwidth, 0.0)
+        self.assertEqual(sender_without_evidence.payload_type, "tokens")
 
     def test_runtime_dual_dump_writes_backward_compatible_vlm_log_and_trainable_episode(self):
         question_ids = [
@@ -306,6 +344,11 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                     "vehicle_id": 101,
                     "pose": {"x": 7.0, "y": 0.5, "yaw_rad": 0.0},
                     "velocity": {"vx": 4.0, "vy": 0.0},
+                    "shared_latent": [0.11, 0.22, 0.33, 0.44, 0.55, 0.66, 0.77, 0.88],
+                    "shared_image_latent_dim": 4,
+                    "shared_text_latent_dim": 4,
+                    "shared_latent_source": "clip_image_text_concat",
+                    "shared_latent_valid": True,
                     "selected_infos": [
                         {
                             "sender_id": 101,
@@ -320,6 +363,7 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                     ],
                     "shared_source": "received_feat",
                     "policy_action": {"alpha": 1.0, "nu": 1.0, "bandwidth": 1.0},
+                    "payload_action": {"payload_type": "tokens", "payload_encoder_id": "tokens_v1"},
                     "policy_id": "P3",
                 }
             ],
@@ -380,6 +424,84 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
             self.assertEqual(len(episode.steps[0].candidate_vehicles), 1)
             self.assertEqual(episode.policy_id, "P3")
             self.assertEqual(episode.steps[0].candidate_vehicles[0].alpha, 1.0)
+            self.assertEqual(episode.steps[0].candidate_vehicles[0].payload_type, "tokens")
+
+    def test_runtime_episode_builder_marks_mixed_policy_and_payload_metadata(self):
+        step_a = HELPER.build_runtime_emulation_step(
+            scene_id="scene",
+            episode_id="episode",
+            scene_type="right_turn",
+            policy_id="P3",
+            predictor_step=0,
+            env_step=1,
+            dt=0.1,
+            ego_pose={"x": 0.0, "y": 0.0, "yaw_rad": 0.0},
+            ego_velocity={"vx": 0.0, "vy": 0.0},
+            candidate_vehicle_states=[
+                {
+                    "vehicle_id": 7,
+                    "pose": {"x": 4.0, "y": 0.0, "yaw_rad": 0.0},
+                    "velocity": {"vx": 0.0, "vy": 0.0},
+                    "shared_latent": [0.0] * 8,
+                    "shared_image_latent_dim": 4,
+                    "shared_text_latent_dim": 4,
+                    "shared_latent_source": "clip_image_text_concat",
+                    "shared_latent_valid": True,
+                    "selected_infos": [],
+                    "window_messages": [],
+                    "shared_source": "raw",
+                    "policy_action": {"alpha": 1.0, "nu": 1.0, "bandwidth": 1.0},
+                    "payload_action": {"payload_type": "tokens", "payload_encoder_id": "tokens_v1"},
+                }
+            ],
+            question_results=_make_question_results(["clg_left_rear_vehicle"]),
+            question_ids=["clg_left_rear_vehicle"],
+            feature_size=64,
+        )
+        step_b = HELPER.build_runtime_emulation_step(
+            scene_id="scene",
+            episode_id="episode",
+            scene_type="right_turn",
+            policy_id="P6",
+            predictor_step=1,
+            env_step=2,
+            dt=0.1,
+            ego_pose={"x": 0.0, "y": 0.0, "yaw_rad": 0.0},
+            ego_velocity={"vx": 0.0, "vy": 0.0},
+            candidate_vehicle_states=[
+                {
+                    "vehicle_id": 7,
+                    "pose": {"x": 4.0, "y": 0.0, "yaw_rad": 0.0},
+                    "velocity": {"vx": 0.0, "vy": 0.0},
+                    "shared_latent": [0.0] * 8,
+                    "shared_image_latent_dim": 4,
+                    "shared_text_latent_dim": 4,
+                    "shared_latent_source": "clip_image_text_concat",
+                    "shared_latent_valid": True,
+                    "selected_infos": [],
+                    "window_messages": [],
+                    "shared_source": "raw",
+                    "policy_action": {"alpha": 1.0, "nu": 0.5, "bandwidth": 0.8},
+                    "payload_action": {"payload_type": "images", "payload_encoder_id": "images_v1"},
+                }
+            ],
+            question_results=_make_question_results(["clg_left_rear_vehicle"]),
+            question_ids=["clg_left_rear_vehicle"],
+            feature_size=64,
+        )
+        episode = HELPER.build_runtime_emulation_episode(
+            scene_id="scene",
+            episode_id="episode",
+            scene_type="right_turn",
+            dt=0.1,
+            policy_id="P3",
+            steps=[step_a, step_b],
+        )
+        self.assertEqual(episode.policy_id, "mixed")
+        self.assertEqual(episode.metadata["policy_ids_used"], ["P3", "P6"])
+        self.assertEqual(episode.metadata["payload_types_used"], ["images", "tokens"])
+        self.assertEqual(episode.metadata["policy_switch_count"], 1)
+        self.assertEqual(episode.metadata["payload_switch_count"], 1)
 
     def test_runtime_communication_drop_switch_controls_enqueue(self):
         class DummyActor:
@@ -440,6 +562,7 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                 self._comm_link_analysis_by_sender = {}
                 self._comm_step_summary = {}
                 self._comm_step_summary_step = -1
+                self._policy_prev_comm_summary = {}
                 self.enqueued = []
 
             def _compute_current_policy_action(self):
@@ -452,11 +575,31 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
             def _advance_policy_send_schedule(self):
                 return {2: True}
 
+            def _get_current_policy_decision(self):
+                return {"policy_id": "P3", "reason": "fixed_policy_mode", "overridden": False}
+
+            def _compute_current_payload_decisions(self):
+                return {
+                    2: types.SimpleNamespace(
+                        payload_type="tokens",
+                        payload_encoder_id="tokens_v1",
+                        reason="default_tokens",
+                        overridden=False,
+                    )
+                }
+
             def _build_group_actor_map(self):
                 return {1: self.ego, 2: self.group_vehs[0]}
 
-            def _make_payload(self, sender):
-                return {"feat": [1.0, 2.0], "sender_id": int(sender.id)}
+            def _make_payload(self, sender, payload_decision):
+                return {
+                    "feat": [1.0, 2.0],
+                    "sender_id": int(sender.id),
+                    "payload_type": payload_decision.payload_type,
+                    "payload_encoder_id": payload_decision.payload_encoder_id,
+                    "data": b"payload",
+                    "data_nbytes": 7,
+                }
 
             def _enqueue_message(self, **kwargs):
                 self.enqueued.append(dict(kwargs))

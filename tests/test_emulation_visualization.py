@@ -24,6 +24,7 @@ def _ensure_pkg(name: str, path: Path) -> None:
 def _load_module(module_name: str):
     _ensure_pkg("car_dreamer", REPO_ROOT / "car_dreamer")
     _ensure_pkg("car_dreamer.toolkit", REPO_ROOT / "car_dreamer" / "toolkit")
+    _ensure_pkg("car_dreamer.toolkit.communication", REPO_ROOT / "car_dreamer" / "toolkit" / "communication")
     _ensure_pkg("car_dreamer.toolkit.emulation", EMULATION_ROOT)
     full_name = f"car_dreamer.toolkit.emulation.{module_name}"
     if full_name in sys.modules:
@@ -120,6 +121,8 @@ class EmulationVisualizationTest(unittest.TestCase):
             horizon=3,
             hidden_dim=32,
             num_graph_layers=2,
+            raw_state_dim=int(sample["target_raw_state"].shape[-1]),
+            shared_state_dim=int(sample["target_shared_state"].shape[-1]),
         )
         model = MODEL.GraphGRUEmulationModel(model_config)
         query_id = episode.steps[0].queries[0].query_id

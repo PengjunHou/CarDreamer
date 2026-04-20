@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor, CLIPModel, CLIPProcessor, Qwen2_5_VLForConditionalGeneration
 
 
 SCENE_DESCRIPTION_REGION_PROMPTS = {
@@ -56,6 +56,134 @@ class RightTurnAutoVLMPromptMixin:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._vlm_model = self._vlm_model.to(device)
         self._vlm_model.eval()
+
+    def _ensure_shared_latent_encoder(self) -> None:
+        if getattr(self, "_shared_latent_clip_model", None) is not None and getattr(
+            self, "_shared_latent_clip_processor", None
+        ) is not None:
+            return
+        model_name = str(
+            getattr(
+                self,
+                "_vlm_shared_latent_model_name",
+                "openai/clip-vit-large-patch14",
+            )
+        )
+        local_files_only = bool(
+            getattr(
+                self,
+                "_vlm_shared_latent_local_files_only",
+                getattr(self, "_vlm_local_files_only", False),
+            )
+        )
+        clip_model = CLIPModel.from_pretrained(
+            model_name,
+            local_files_only=local_files_only,
+        )
+        clip_processor = CLIPProcessor.from_pretrained(
+            model_name,
+            local_files_only=local_files_only,
+        )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        clip_model = clip_model.to(device)
+        clip_model.eval()
+        self._shared_latent_clip_model = clip_model
+        self._shared_latent_clip_processor = clip_processor
+        self._shared_latent_text_embedding_cache = {}
+
+    def _get_shared_latent_dims(self) -> tuple[int, int]:
+        self._ensure_shared_latent_encoder()
+        model = getattr(self, "_shared_latent_clip_model")
+        projection_dim = int(getattr(model.config, "projection_dim", 0) or 0)
+        if projection_dim <= 0:
+            projection_dim = int(model.visual_projection.out_features)
+        return projection_dim, projection_dim
+
+    def _normalize_clip_embedding(self, emb: torch.Tensor) -> torch.Tensor:
+        emb = emb.detach().float()
+        return torch.nn.functional.normalize(emb, p=2, dim=-1)
+
+    def _compute_shared_text_embedding(self, text: str) -> torch.Tensor:
+        text = str(text).strip()
+        if not text:
+            raise ValueError("scene description is empty")
+        cache = getattr(self, "_shared_latent_text_embedding_cache", None)
+        if isinstance(cache, dict) and text in cache:
+            return cache[text].clone()
+
+        self._ensure_shared_latent_encoder()
+        model = getattr(self, "_shared_latent_clip_model")
+        processor = getattr(self, "_shared_latent_clip_processor")
+        device = next(model.parameters()).device
+        inputs = processor(
+            text=[text],
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+        with torch.no_grad():
+            text_outputs = model.text_model(**inputs)
+            pooled = text_outputs.pooler_output
+            text_features = model.text_projection(pooled)
+        embedding = self._normalize_clip_embedding(text_features.squeeze(0)).cpu()
+        if isinstance(cache, dict):
+            cache[text] = embedding
+        return embedding.clone()
+
+    def _compute_shared_image_embedding(self, image: Image.Image) -> torch.Tensor:
+        if image is None:
+            raise ValueError("image is required for CLIP shared latent")
+        self._ensure_shared_latent_encoder()
+        model = getattr(self, "_shared_latent_clip_model")
+        processor = getattr(self, "_shared_latent_clip_processor")
+        device = next(model.parameters()).device
+        inputs = processor(images=image, return_tensors="pt")
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+        with torch.no_grad():
+            vision_outputs = model.vision_model(**inputs)
+            pooled = vision_outputs.pooler_output
+            image_features = model.visual_projection(pooled)
+        return self._normalize_clip_embedding(image_features.squeeze(0)).cpu()
+
+    def _compute_clip_shared_latent(
+        self,
+        *,
+        image: Optional[Image.Image],
+        scene_description: str,
+        cache_key: Any = None,
+    ) -> Dict[str, Any]:
+        bucket = self._get_vlm_step_cache_bucket("shared_latents")
+        if cache_key is not None and bucket is not None and cache_key in bucket:
+            cached = dict(bucket[cache_key])
+            cached["shared_latent"] = list(cached.get("shared_latent", []))
+            return cached
+
+        image_dim, text_dim = self._get_shared_latent_dims()
+        scene_description = str(scene_description).strip()
+        valid = False
+        if image is not None and scene_description:
+            try:
+                image_emb = self._compute_shared_image_embedding(image)
+                text_emb = self._compute_shared_text_embedding(scene_description)
+            except Exception:
+                image_emb = None
+                text_emb = None
+            else:
+                shared_latent = torch.cat([image_emb, text_emb], dim=-1).cpu().tolist()
+                valid = True
+        if not valid:
+            shared_latent = [0.0] * (image_dim + text_dim)
+        payload = {
+            "shared_latent": [float(x) for x in shared_latent],
+            "shared_image_latent_dim": int(image_dim),
+            "shared_text_latent_dim": int(text_dim),
+            "shared_latent_source": "clip_image_text_concat",
+            "shared_latent_valid": bool(valid),
+        }
+        if cache_key is not None and bucket is not None:
+            bucket[cache_key] = dict(payload)
+        return payload
 
     def _build_vlm_questions(self) -> List[Dict[str, Any]]:
         return [

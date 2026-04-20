@@ -9,6 +9,7 @@ from PIL import Image
 
 from runtime_logging import get_runtime_logger, get_runtime_logging_config, should_log_periodic
 
+from ..communication.payloads import decode_payload_dict
 from .right_turn_auto_prompts import RightTurnAutoVLMPromptMixin
 
 
@@ -118,6 +119,7 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
         payload = payload if isinstance(payload, dict) else {}
         if not payload:
             return None
+        decoded_payload = decode_payload_dict(payload)
         received_age_steps = max(int(self._time_step) - int(msg.created_step), 0)
         received_age_s = received_age_steps * self._get_fixed_dt()
         return {
@@ -128,13 +130,17 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
             "received_age_s": float(received_age_s),
             "deliver_step": int(msg.deliver_step),
             "created_step": int(msg.created_step),
-            "image": None,
+            "image": decoded_payload.get("image"),
             "img_emb": payload.get("img_emb"),
-            "scene_description": str(payload.get("scene_description", "")).strip(),
-            "text": str(payload.get("text", "")).strip(),
+            "scene_description": str(decoded_payload.get("scene_description", "")).strip(),
+            "text": str(decoded_payload.get("text", "")).strip(),
             "feat": payload.get("feat"),
             "feat_dim": int(payload.get("feat_dim", 0)),
             "policy_action": dict(payload.get("policy_action", {})),
+            "payload_type": str(decoded_payload.get("payload_type", payload.get("payload_type", "tokens"))),
+            "payload_encoder_id": str(
+                decoded_payload.get("payload_encoder_id", payload.get("payload_encoder_id", "tokens_v1"))
+            ),
         }
 
     def _get_raw_shared_images_info(self) -> Tuple[List[Image.Image], List[Dict[str, Any]], Dict[str, Any]]:
@@ -184,10 +190,16 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
             label = "[latest]" if age < 0.01 else f"[age={age:.2f}s]"
             parts.append(f"{label}\n{desc}")
         texts = [str(info.get("text", "")).strip() for info in sorted_infos if str(info.get("text", "")).strip()]
+        latest_image = None
+        for info in reversed(sorted_infos):
+            if info.get("image") is not None:
+                latest_image = info.get("image")
+                break
         return {
             **latest,
             "scene_description": "\n\n".join(parts),
             "text": texts[-1] if texts else "",
+            "image": latest_image,
         }
 
     def _get_received_shared_images_info(
@@ -212,7 +224,12 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
                 info = self._make_shared_info_from_message(msg, msg.payload)
                 if info is None:
                     continue
-                if info.get("scene_description") or info.get("img_emb") is not None or info.get("text"):
+                if (
+                    info.get("scene_description")
+                    or info.get("img_emb") is not None
+                    or info.get("text")
+                    or info.get("image") is not None
+                ):
                     infos.append(info)
             if infos:
                 per_sender_infos[int(sender_id)] = [self._merge_sender_infos(infos)]

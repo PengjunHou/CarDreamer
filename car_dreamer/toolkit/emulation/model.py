@@ -30,10 +30,10 @@ class GraphGRUEmulationConfig:
     history_len: int = 8
     horizon: int = 5
     dropout: float = 0.0
-    action_dim: int = 3
-    vehicle_exogenous_dim: int = 10
+    action_dim: int = 8
+    vehicle_exogenous_dim: int = 7
     ego_state_dim: int = 5
-    step_exogenous_dim: int = 4
+    step_exogenous_dim: int = 2
     raw_state_dim: int = 5
     shared_state_dim: int = 21
 

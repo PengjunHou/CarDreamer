@@ -59,6 +59,7 @@ class CanonicalEmulationDataset:
         self.history_len = max(int(history_len), 1)
         self.horizon = max(int(horizon), 1)
         self.episodes = list(episodes)
+        self._require_shared_latent_support()
         self.episode_indices = [self._build_episode_index(episode) for episode in self.episodes]
         self.max_nodes = int(max_nodes or max(len(index.node_ids) for index in self.episode_indices))
         self.max_queries = int(max_queries or max(len(index.query_ids) for index in self.episode_indices))
@@ -76,6 +77,19 @@ class CanonicalEmulationDataset:
             self.query_dim,
         ) = self._infer_feature_dims()
         self.samples = self._build_sample_index()
+
+    def _require_shared_latent_support(self) -> None:
+        for episode in self.episodes:
+            for step in episode.steps:
+                for vehicle in step.candidate_vehicles:
+                    if vehicle.shared_latent:
+                        continue
+                    raise ValueError(
+                        "Episode "
+                        f"{episode.episode_id} step {step.step} vehicle {vehicle.vehicle_id} "
+                        "is missing shared_latent. Old compact-summary-only data is not supported "
+                        "in strict shared-latent mode."
+                    )
 
     def __len__(self) -> int:
         return len(self.samples)

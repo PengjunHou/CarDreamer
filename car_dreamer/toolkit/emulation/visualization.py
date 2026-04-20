@@ -366,6 +366,8 @@ def _build_model_from_checkpoint_payload(
             history_len=int(train_config.get("history_len", np.asarray(sample["node_features"]).shape[0])),
             horizon=int(train_config.get("horizon", np.asarray(sample["target_ego_sc"]).shape[0])),
             dropout=float(train_config.get("dropout", 0.0)),
+            raw_state_dim=int(np.asarray(sample["target_raw_state"]).shape[-1]),
+            shared_state_dim=int(np.asarray(sample["target_shared_state"]).shape[-1]),
         )
 
     model = GraphGRUEmulationModel(model_config).to(device)
