@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 import re
 import gc
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from PIL import Image
 from transformers import AutoProcessor, CLIPModel, CLIPProcessor, Qwen2_5_VLForConditionalGeneration
+
+
+_SHARED_VLM_CACHE: Dict[Tuple[str, str, str, bool], Tuple[Any, Any]] = {}
+_SHARED_CLIP_CACHE: Dict[Tuple[str, str, bool], Tuple[Any, Any]] = {}
 
 
 SCENE_DESCRIPTION_REGION_PROMPTS = {
@@ -45,38 +49,37 @@ class RightTurnAutoVLMPromptMixin:
 
     def _init_vlm(self) -> None:
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        self._vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self._vlm_model_name,
-            torch_dtype=dtype,
-            local_files_only=self._vlm_local_files_only,
-        )
-        self._vlm_processor = AutoProcessor.from_pretrained(
-            self._vlm_model_name,
-            local_files_only=self._vlm_local_files_only,
-        )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self._vlm_model = self._vlm_model.to(device)
-        self._vlm_model.eval()
+        cache_key = (
+            str(self._vlm_model_name),
+            str(dtype),
+            str(device),
+            bool(self._vlm_local_files_only),
+        )
+        cached = _SHARED_VLM_CACHE.get(cache_key)
+        if cached is None:
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                self._vlm_model_name,
+                torch_dtype=dtype,
+                local_files_only=self._vlm_local_files_only,
+            )
+            processor = AutoProcessor.from_pretrained(
+                self._vlm_model_name,
+                local_files_only=self._vlm_local_files_only,
+            )
+            model = model.to(device)
+            model.eval()
+            cached = (model, processor)
+            _SHARED_VLM_CACHE[cache_key] = cached
+        self._vlm_model, self._vlm_processor = cached
 
     def _release_vlm_models(self) -> None:
-        model_attrs = (
+        for attr in (
             "_vlm_model",
-            "_shared_latent_clip_model",
-        )
-        processor_attrs = (
             "_vlm_processor",
+            "_shared_latent_clip_model",
             "_shared_latent_clip_processor",
-        )
-        for attr in model_attrs:
-            model = getattr(self, attr, None)
-            if model is None:
-                continue
-            try:
-                model.to("cpu")
-            except Exception:
-                pass
-            setattr(self, attr, None)
-        for attr in processor_attrs:
+        ):
             if hasattr(self, attr):
                 setattr(self, attr, None)
         if hasattr(self, "_shared_latent_text_embedding_cache"):
@@ -84,15 +87,6 @@ class RightTurnAutoVLMPromptMixin:
         if hasattr(self, "_vlm_step_cache"):
             self._vlm_step_cache = {}
         gc.collect()
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-            try:
-                torch.cuda.ipc_collect()
-            except Exception:
-                pass
 
     def _ensure_shared_latent_encoder(self) -> None:
         if getattr(self, "_shared_latent_clip_model", None) is not None and getattr(
@@ -113,20 +107,25 @@ class RightTurnAutoVLMPromptMixin:
                 getattr(self, "_vlm_local_files_only", False),
             )
         )
-        clip_model = CLIPModel.from_pretrained(
-            model_name,
-            local_files_only=local_files_only,
-        )
-        clip_processor = CLIPProcessor.from_pretrained(
-            model_name,
-            local_files_only=local_files_only,
-        )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        clip_model = clip_model.to(device)
-        clip_model.eval()
-        self._shared_latent_clip_model = clip_model
-        self._shared_latent_clip_processor = clip_processor
-        self._shared_latent_text_embedding_cache = {}
+        cache_key = (str(model_name), str(device), bool(local_files_only))
+        cached = _SHARED_CLIP_CACHE.get(cache_key)
+        if cached is None:
+            clip_model = CLIPModel.from_pretrained(
+                model_name,
+                local_files_only=local_files_only,
+            )
+            clip_processor = CLIPProcessor.from_pretrained(
+                model_name,
+                local_files_only=local_files_only,
+            )
+            clip_model = clip_model.to(device)
+            clip_model.eval()
+            cached = (clip_model, clip_processor)
+            _SHARED_CLIP_CACHE[cache_key] = cached
+        self._shared_latent_clip_model, self._shared_latent_clip_processor = cached
+        if getattr(self, "_shared_latent_text_embedding_cache", None) is None:
+            self._shared_latent_text_embedding_cache = {}
 
     def _get_shared_latent_dims(self) -> tuple[int, int]:
         self._ensure_shared_latent_encoder()
