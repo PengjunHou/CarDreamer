@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import math
+import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,6 +14,51 @@ from .right_turn_auto_context import RightTurnAutoVLMContextMixin
 
 
 VLM_SCORING_LOGGER = get_runtime_logger("car_dreamer.vlm.scoring")
+
+_SCENE_DESCRIPTION_REGION_ROWS: Tuple[str, ...] = (
+    "Front",
+    "Left-front",
+    "Right-front",
+    "Rear",
+    "Left-rear",
+    "Right-rear",
+)
+_SCENE_DESCRIPTION_REGION_ALIASES: Dict[str, str] = {
+    row.lower(): row for row in _SCENE_DESCRIPTION_REGION_ROWS
+}
+_SCENE_DESCRIPTION_DIRECTION_TO_ROWS: Dict[str, Tuple[str, ...]] = {
+    "front": ("Front",),
+    "front-left": ("Left-front",),
+    "left-front": ("Left-front",),
+    "front-right": ("Right-front",),
+    "right-front": ("Right-front",),
+    "rear": ("Rear",),
+    "rear-left": ("Left-rear",),
+    "left-rear": ("Left-rear",),
+    "rear-right": ("Right-rear",),
+    "right-rear": ("Right-rear",),
+    "left": ("Left-front", "Left-rear"),
+    "right": ("Right-front", "Right-rear"),
+}
+_SCENE_DESCRIPTION_NEGATIVE_PHRASES: Tuple[str, ...] = (
+    "no vehicle",
+    "no vehicles",
+    "no visible vehicle",
+    "no visible vehicles",
+    "no other vehicles",
+    "vehicles are not visible",
+    "vehicle is not visible",
+    "road ahead is clear",
+    "road is clear",
+    "road appears clear",
+)
+_SCENE_DESCRIPTION_POSITIVE_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(car|cars|truck|trucks|bus|buses|van|vans|suv|suvs|pickup|pickups)\b"),
+    re.compile(r"\b(?:a|an)\s+(?:\w+\s+){0,2}vehicle\b"),
+    re.compile(r"\bvehicle\s+(?:is\s+)?visible\b"),
+    re.compile(r"\bvehicles\s+are\s+visible\b"),
+    re.compile(r"\bvehicle\s+(?:directly\s+)?ahead\b"),
+)
 
 
 class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
@@ -226,6 +273,201 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             return ""
         return f"scene_description:\n{scene_description}"
 
+    def _parse_scene_description_regions(self, scene_description: str) -> Dict[str, str]:
+        regions = {row: "" for row in _SCENE_DESCRIPTION_REGION_ROWS}
+        for raw_line in str(scene_description).splitlines():
+            line = raw_line.strip()
+            if not line or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            canonical = _SCENE_DESCRIPTION_REGION_ALIASES.get(key.strip().lower())
+            if canonical is None:
+                continue
+            # Later rows override earlier ones so merged multi-age captions use the newest snapshot.
+            regions[canonical] = value.strip()
+        return regions
+
+    def _is_scene_region_explicitly_not_visible(self, region_text: str) -> bool:
+        normalized = str(region_text).strip().strip(".").strip().lower().replace(" ", "_")
+        return normalized == "not_visible"
+
+    def _is_scene_region_visible_text(self, region_text: str) -> bool:
+        region_text = str(region_text).strip()
+        return bool(region_text) and not self._is_scene_region_explicitly_not_visible(region_text)
+
+    def _question_direction_from_id(self, question_cfg: Dict[str, Any]) -> str:
+        qid = str(question_cfg.get("id", "")).strip().lower()
+        if "left_rear" in qid:
+            return "rear-left"
+        if "right_rear" in qid:
+            return "rear-right"
+        if "right_front" in qid:
+            return "front-right"
+        if "left_front" in qid:
+            return "front-left"
+        if "rear" in qid and "front" not in qid:
+            return "rear"
+        if "left_vehicle_speed" in qid or "left_side" in qid:
+            return "left"
+        if "right_vehicle_speed" in qid or "right_side" in qid:
+            return "right"
+        return "front"
+
+    def _query_direction_from_text(self, query_text: Any) -> str:
+        normalized = str(query_text).strip().lower().replace("_", "-")
+        for direction in (
+            "front-right",
+            "front-left",
+            "rear-right",
+            "rear-left",
+            "right-front",
+            "left-front",
+            "right-rear",
+            "left-rear",
+            "right",
+            "left",
+            "rear",
+            "front",
+        ):
+            if f"{direction} region" in normalized:
+                return direction
+        return ""
+
+    def _resolve_scene_description_direction(
+        self,
+        question_cfg: Dict[str, Any],
+        sensor_info: Dict[str, Any],
+        converted_question_cfg: Optional[Dict[str, Any]],
+    ) -> str:
+        if not sensor_info.get("is_ego") and converted_question_cfg:
+            direction = str(converted_question_cfg.get("direction", "")).strip().lower()
+            if direction:
+                return direction
+            direction = self._query_direction_from_text(converted_question_cfg.get("query", ""))
+            if direction:
+                return direction
+        return self._question_direction_from_id(question_cfg)
+
+    def _scene_region_has_explicit_negative_vehicle_evidence(self, region_text: str) -> bool:
+        normalized = " ".join(str(region_text).strip().lower().split())
+        if not normalized or self._is_scene_region_explicitly_not_visible(normalized):
+            return False
+        return any(phrase in normalized for phrase in _SCENE_DESCRIPTION_NEGATIVE_PHRASES)
+
+    def _scene_region_has_explicit_positive_vehicle_evidence(self, region_text: str) -> bool:
+        normalized = " ".join(str(region_text).strip().lower().split())
+        if not normalized or self._scene_region_has_explicit_negative_vehicle_evidence(normalized):
+            return False
+        return any(pattern.search(normalized) for pattern in _SCENE_DESCRIPTION_POSITIVE_PATTERNS)
+
+    def _derive_scene_description_consistency_hint(
+        self,
+        question_cfg: Dict[str, Any],
+        sensor_info: Dict[str, Any],
+        scene_description: str,
+        converted_question_cfg: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        direction = self._resolve_scene_description_direction(
+            question_cfg,
+            sensor_info,
+            converted_question_cfg,
+        )
+        region_labels = list(
+            _SCENE_DESCRIPTION_DIRECTION_TO_ROWS.get(
+                str(direction).strip().lower().replace("_", "-"),
+                ("Front",),
+            )
+        )
+        regions = self._parse_scene_description_regions(scene_description)
+        region_texts = {label: str(regions.get(label, "")).strip() for label in region_labels}
+        visible_texts = {
+            label: text for label, text in region_texts.items() if self._is_scene_region_visible_text(text)
+        }
+        visibility_status = "visible" if visible_texts else "not_visible"
+
+        answer_hint = "unknown"
+        if visible_texts:
+            if any(
+                self._scene_region_has_explicit_positive_vehicle_evidence(text)
+                for text in visible_texts.values()
+            ):
+                answer_hint = "positive"
+            elif len(visible_texts) == len(region_labels) and all(
+                self._scene_region_has_explicit_negative_vehicle_evidence(text)
+                for text in visible_texts.values()
+            ):
+                answer_hint = "negative"
+
+        return {
+            "direction": direction,
+            "region_labels": region_labels,
+            "region_texts": region_texts,
+            "visibility_status": visibility_status,
+            "answer_hint": answer_hint,
+        }
+
+    def _apply_scene_description_consistency_override(
+        self,
+        question_cfg: Dict[str, Any],
+        sensor_info: Dict[str, Any],
+        scene_description: str,
+        scoring: Dict[str, Any],
+        converted_question_cfg: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        visibility_status = str(scoring.get("visibility_status", "")).strip()
+        question_answerability = str(scoring.get("question_answerability", "")).strip()
+        if visibility_status != "not_visible" and question_answerability != "not_answerable":
+            return scoring
+
+        hint = self._derive_scene_description_consistency_hint(
+            question_cfg,
+            sensor_info,
+            scene_description,
+            converted_question_cfg,
+        )
+        if hint["visibility_status"] != "visible":
+            return scoring
+
+        answer_hint = str(hint["answer_hint"])
+        if answer_hint == "positive":
+            payload = {
+                "answer": "positive",
+                "visibility_status": "visible",
+                "question_answerability": "answerable",
+                "support_strength": "moderate",
+                "reason": "Caption consistency override: target region description indicates a visible vehicle.",
+            }
+        elif answer_hint == "negative":
+            payload = {
+                "answer": "negative",
+                "visibility_status": "visible",
+                "question_answerability": "answerable",
+                "support_strength": "moderate",
+                "reason": "Caption consistency override: target region description indicates the visible region is clear of vehicles.",
+            }
+        else:
+            payload = {
+                "answer": "insufficient",
+                "visibility_status": "visible",
+                "question_answerability": "partially_answerable",
+                "support_strength": "none",
+                "reason": "Caption consistency override: target region is visible, but vehicle presence remains unresolved.",
+            }
+
+        payload.update(
+            {
+                "caption_consistency_override": True,
+                "caption_target_direction": hint["direction"],
+                "caption_target_regions": list(hint["region_labels"]),
+                "caption_target_region_texts": dict(hint["region_texts"]),
+                "original_visibility_status": visibility_status,
+                "original_question_answerability": question_answerability,
+                "original_reason": str(scoring.get("reason", "")).strip(),
+                "original_vlm_json": dict(scoring.get("raw_vlm_json", {}) or {}),
+            }
+        )
+        return self._parse_language_scores(json.dumps(payload, ensure_ascii=False))
+
     def _get_converted_question_cfg(
         self,
         question_cfg: Dict[str, Any],
@@ -252,6 +494,7 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 "query": converted.query,
                 "positive": converted.positive,
                 "negative": converted.negative,
+                "direction": str(getattr(converted, "converted_direction", "")).strip().lower(),
             }
             if bucket is not None:
                 bucket[cache_key] = dict(converted_question_cfg)
@@ -360,6 +603,13 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 or self._default_question_score(
                     reason=f"Missing score for question_id={question_id}.",
                 )
+            )
+            scoring = self._apply_scene_description_consistency_override(
+                question_cfg,
+                sensor_info,
+                scene_description,
+                scoring,
+                converted_by_id.get(question_id),
             )
             used_for_aggregation, skip_reason = self._should_use_sensor_for_question(
                 question_cfg,

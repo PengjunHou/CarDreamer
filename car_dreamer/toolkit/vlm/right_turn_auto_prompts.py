@@ -729,6 +729,8 @@ class RightTurnAutoVLMPromptMixin:
         for i, question_cfg in enumerate(question_cfgs):
             question_id = str(question_cfg.get("id", "unknown_question"))
             item = raw_results.get(f"question_{i}")
+            if not isinstance(item, dict):
+                item = raw_results.get(question_id)
             if isinstance(item, dict):
                 parsed_scores[question_id] = self._parse_language_scores(
                     json.dumps(item, ensure_ascii=False)
