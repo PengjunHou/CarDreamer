@@ -51,6 +51,7 @@ def build_policy_rollout_argv(
             f"--env.policy_override={config.policy_override}",
             f"--env.scene_id={scene_id}",
             f"--env.speed_preset={config.speed_preset}",
+            "--env.display.enable=False",
             f"--env.emulation_dump_dir={policy_dir}",
             f"--env.payload.selector_id={config.payload_selector_id}",
             f"--env.payload.override_type={config.payload_override_type}",

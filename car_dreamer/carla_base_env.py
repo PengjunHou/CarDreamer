@@ -17,7 +17,7 @@ class CarlaBaseEnv(gym.Env):
     def __init__(self, config):
         self._config = config
 
-        self._monitor = EnvMonitorOpenCV(self._config)
+        self._monitor = EnvMonitorOpenCV(self._config) if bool(self._config.display.enable) else None
         self._world = WorldManager(self._config)
         self._world.on_reset(self.on_reset)
         self._world.on_step(self.on_step)
@@ -215,4 +215,5 @@ class CarlaBaseEnv(gym.Env):
         return self.obs["collision"][0] > 0
 
     def _render(self, obs, info):
-        self._monitor.render(obs, info)
+        if self._monitor is not None:
+            self._monitor.render(obs, info)

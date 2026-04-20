@@ -55,6 +55,7 @@ class CarlaRolloutCollectorTest(unittest.TestCase):
         )
         self.assertIn("--env.policy_id=P6", argv)
         self.assertIn("--env.scene_id=P6_scene_0003", argv)
+        self.assertIn("--env.display.enable=False", argv)
         self.assertIn("--env.emulation_dump_dir=data/emulation/P6", argv)
         self.assertIn("--env.dump_emulation_records_on_episode_end=True", argv)
         self.assertIn("--env.dump_vlm_records_on_episode_end=False", argv)
