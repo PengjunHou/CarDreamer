@@ -16,10 +16,18 @@ def main() -> None:
         output_dir=args.output_dir,
         episodes_per_policy=args.episodes_per_policy,
         policy_ids=list(args.policy_ids),
+        policy_mode=str(args.policy_mode),
+        policy_selector_id=str(args.policy_selector_id),
+        policy_override=str(args.policy_override),
+        payload_selector_id=str(args.payload_selector_id),
+        payload_override_type=str(args.payload_override_type),
+        payload_enabled_types=list(args.payload_enabled_types),
+        payload_image_jpeg_quality=int(args.payload_image_jpeg_quality),
         max_steps=args.max_steps,
         seed=args.seed,
         task_argv=list(args.task_argv),
         speed_preset=args.speed_preset,
+        force_dump_on_max_steps=bool(int(args.force_dump_on_max_steps)),
     )
     collect_policy_rollouts(config)
 
