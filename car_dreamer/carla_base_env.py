@@ -1,5 +1,6 @@
 from abc import abstractmethod
 from typing import Dict, Tuple, Optional, Any
+import gc
 
 import carla
 import gymnasium as gym
@@ -217,3 +218,45 @@ class CarlaBaseEnv(gym.Env):
     def _render(self, obs, info):
         if self._monitor is not None:
             self._monitor.render(obs, info)
+
+    def close(self):
+        try:
+            self._ego_observer.destroy()
+        except Exception:
+            pass
+        extra_destroy = getattr(self, "_destroy_group_observers", None)
+        if callable(extra_destroy):
+            try:
+                extra_destroy()
+            except Exception:
+                pass
+        release_vlm = getattr(self, "_release_vlm_models", None)
+        if callable(release_vlm):
+            try:
+                release_vlm()
+            except Exception:
+                pass
+        if self._monitor is not None:
+            try:
+                self._monitor.stop()
+            except Exception:
+                pass
+            self._monitor = None
+        if getattr(self, "_world", None) is not None:
+            close_world = getattr(self._world, "close", None)
+            if callable(close_world):
+                try:
+                    close_world()
+                except Exception:
+                    pass
+            self._world = None
+        gc.collect()
+        try:
+            import torch
+        except Exception:
+            torch = None
+        if torch is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass

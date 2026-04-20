@@ -92,6 +92,17 @@ class WorldManager:
         # This prevents some synchronization bugs
         time.sleep(1)
 
+    def close(self) -> None:
+        try:
+            self._client.apply_batch_sync([carla.command.DestroyActor(id) for id in self.actor_dict])
+        except Exception:
+            pass
+        self.actor_dict = {}
+        try:
+            self._set_synchronous_mode(False)
+        except Exception:
+            pass
+
     def step(self) -> None:
         self._time_step += 1
         self._world.tick()

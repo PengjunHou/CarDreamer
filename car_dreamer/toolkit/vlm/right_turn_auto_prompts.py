@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import gc
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -56,6 +57,42 @@ class RightTurnAutoVLMPromptMixin:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._vlm_model = self._vlm_model.to(device)
         self._vlm_model.eval()
+
+    def _release_vlm_models(self) -> None:
+        model_attrs = (
+            "_vlm_model",
+            "_shared_latent_clip_model",
+        )
+        processor_attrs = (
+            "_vlm_processor",
+            "_shared_latent_clip_processor",
+        )
+        for attr in model_attrs:
+            model = getattr(self, attr, None)
+            if model is None:
+                continue
+            try:
+                model.to("cpu")
+            except Exception:
+                pass
+            setattr(self, attr, None)
+        for attr in processor_attrs:
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        if hasattr(self, "_shared_latent_text_embedding_cache"):
+            self._shared_latent_text_embedding_cache = {}
+        if hasattr(self, "_vlm_step_cache"):
+            self._vlm_step_cache = {}
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
 
     def _ensure_shared_latent_encoder(self) -> None:
         if getattr(self, "_shared_latent_clip_model", None) is not None and getattr(

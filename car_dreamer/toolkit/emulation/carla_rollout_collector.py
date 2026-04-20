@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import gc
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Sequence, Tuple
@@ -90,6 +91,25 @@ def _force_dump_episode(env, *, suffix: str = "max_steps") -> str:
     return str(path)
 
 
+def _configure_env_for_episode(
+    env,
+    *,
+    policy_id: str,
+    episode_index: int,
+    policy_dir: str | Path,
+) -> None:
+    base_env = _unwrap_env(env)
+    scene_id = f"{policy_id}_scene_{int(episode_index):04d}"
+    if str(getattr(base_env, "_policy_mode", "fixed")).lower() == "adaptive":
+        scene_id = f"adaptive_scene_{int(episode_index):04d}"
+    if hasattr(base_env, "_emulation_scene_id"):
+        base_env._emulation_scene_id = scene_id
+    if hasattr(base_env, "_emulation_dump_dir"):
+        base_env._emulation_dump_dir = str(policy_dir)
+    if hasattr(base_env, "_vlm_dump_dir"):
+        base_env._vlm_dump_dir = str(policy_dir)
+
+
 def rollout_single_episode(
     env,
     *,
@@ -139,26 +159,43 @@ def collect_policy_rollouts(
     for policy_id in policy_ids:
         policy_dir = output_dir / str(policy_id)
         policy_dir.mkdir(parents=True, exist_ok=True)
-        for episode_index in range(int(config.episodes_per_policy)):
-            argv = build_policy_rollout_argv(
-                config,
-                policy_id=str(policy_id),
-                episode_index=int(episode_index),
-                policy_dir=policy_dir,
-            )
-            env, _ = task_factory(config.task_name, argv)
-            try:
+        argv = build_policy_rollout_argv(
+            config,
+            policy_id=str(policy_id),
+            episode_index=0,
+            policy_dir=policy_dir,
+        )
+        env, _ = task_factory(config.task_name, argv)
+        try:
+            for episode_index in range(int(config.episodes_per_policy)):
+                _configure_env_for_episode(
+                    env,
+                    policy_id=str(policy_id),
+                    episode_index=int(episode_index),
+                    policy_dir=policy_dir,
+                )
                 dump_path = rollout_single_episode(
                     env,
                     seed=int(config.seed) + int(episode_index),
                     max_steps=int(config.max_steps),
                     force_dump_on_max_steps=bool(config.force_dump_on_max_steps),
                 )
-            finally:
-                close = getattr(env, "close", None)
-                if callable(close):
-                    close()
-            saved.setdefault(str(policy_id), []).append(dump_path)
+                saved.setdefault(str(policy_id), []).append(dump_path)
+        finally:
+            close = getattr(env, "close", None)
+            if callable(close):
+                close()
+            del env
+            gc.collect()
+            try:
+                import torch
+            except Exception:
+                torch = None
+            if torch is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
     return saved
 
 

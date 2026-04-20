@@ -81,6 +81,7 @@ class CarlaRolloutCollectorTest(unittest.TestCase):
 
     def test_collect_policy_rollouts_groups_outputs_by_policy(self):
         created = []
+        resets = []
 
         class DummyActionSpace:
             def sample(self):
@@ -97,6 +98,7 @@ class CarlaRolloutCollectorTest(unittest.TestCase):
 
             def reset(self, seed=None):
                 self.step_count = 0
+                resets.append((self.policy_id, self.episode_index, seed))
                 return {}, {}
 
             def step(self, action):
@@ -132,7 +134,12 @@ class CarlaRolloutCollectorTest(unittest.TestCase):
         self.assertEqual(len(saved["P1"]), 2)
         self.assertEqual(len(saved["P8"]), 2)
         self.assertIn(("P1", "P1_scene_0000"), created)
-        self.assertIn(("P8", "P8_scene_0001"), created)
+        self.assertIn(("P8", "P8_scene_0000"), created)
+        self.assertEqual(len(created), 2)
+        self.assertEqual(
+            sorted((policy_id, seed) for policy_id, _episode_index, seed in resets),
+            [("P1", 0), ("P1", 1), ("P8", 0), ("P8", 1)],
+        )
 
     def test_rollout_single_episode_forces_dump_when_max_steps_reached(self):
         class DummyActionSpace:
