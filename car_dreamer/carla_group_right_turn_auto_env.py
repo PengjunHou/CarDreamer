@@ -98,6 +98,8 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         min_rate_factor = float(getattr(comm_cfg, "min_rate_factor", 0.2))
         jitter_s = float(getattr(comm_cfg, "jitter_s", 0.0))
         overhead_bytes = int(getattr(comm_cfg, "overhead_bytes", 64))
+        self._drop_on_capacity_exceeded = bool(getattr(comm_cfg, "drop_on_capacity_exceeded", False))
+        self._log_dropped_messages = bool(getattr(comm_cfg, "log_dropped_messages", True))
 
         self._default_net_res = NetResource(uplink_bps=uplink_bps, downlink_bps=downlink_bps)
         self.latency_model: LatencyModel = SimpleWirelessLatency(

@@ -38,6 +38,7 @@ def build_runtime_emulation_step(
     question_results: Mapping[str, Mapping[str, Any]],
     question_ids: Sequence[str],
     feature_size: int,
+    step_communication_stats: Mapping[str, Any] | None = None,
 ) -> CanonicalStepRecord:
     ordered_question_ids = list(question_ids)
     missing = [qid for qid in ordered_question_ids if qid not in question_results]
@@ -62,6 +63,7 @@ def build_runtime_emulation_step(
         window_messages = list(candidate.get("window_messages", []))
         shared_source = str(candidate.get("shared_source", "received_feat"))
         policy_action = dict(candidate.get("policy_action", {}))
+        runtime_comm_stats = dict(candidate.get("runtime_comm_stats", {}))
 
         delta_pos = (
             float(pose.get("x", 0.0)) - float(ego_pose.get("x", 0.0)),
@@ -139,6 +141,7 @@ def build_runtime_emulation_step(
                     "current_distance_m": float(current_distance_m),
                     "shared_source_received_feat": 1.0 if shared_source == "received_feat" else 0.0,
                     "shared_source_raw": 1.0 if shared_source == "raw" else 0.0,
+                    **{str(key): float(value) for key, value in runtime_comm_stats.items()},
                 },
                 query_task_relevance=task_relevance,
                 sender_collab=sender_collab,
@@ -173,6 +176,7 @@ def build_runtime_emulation_step(
             "env_step": float(env_step),
             "num_candidate_vehicles": float(len(candidate_vehicles)),
             "num_questions": float(len(ordered_question_ids)),
+            **{str(key): float(value) for key, value in dict(step_communication_stats or {}).items()},
         },
         metadata={"env_step": int(env_step), "policy_id": str(policy_id)},
         policy_id=str(policy_id),

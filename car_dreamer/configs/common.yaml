@@ -197,6 +197,8 @@ env:
     min_rate_factor: 0.2      # minimum rate factor (prevents rate from dropping to zero)
     jitter_s: 0.0             # random jitter added to latency (seconds, 0 = disabled)
     overhead_bytes: 64        # fixed protocol overhead per message (bytes)
+    drop_on_capacity_exceeded: false
+    log_dropped_messages: true
 
 runtime_logging:
   enabled: True

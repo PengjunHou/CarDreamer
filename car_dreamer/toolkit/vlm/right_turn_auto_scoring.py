@@ -58,8 +58,11 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             velocity = actor.get_velocity()
             actor_id = int(actor.id)
             policy_action = {}
+            runtime_comm_stats = {}
             if hasattr(self, "_get_policy_action_value"):
                 policy_action = dict(self._get_policy_action_value(actor_id))
+            if hasattr(self, "_get_latest_comm_link_analysis"):
+                runtime_comm_stats = dict(self._get_latest_comm_link_analysis(actor_id))
             candidate_vehicle_states.append(
                 {
                     "vehicle_id": actor_id,
@@ -77,6 +80,7 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                     "window_messages": list(window_messages_by_sender.get(actor_id, [])),
                     "shared_source": shared_source,
                     "policy_action": policy_action,
+                    "runtime_comm_stats": runtime_comm_stats,
                     "policy_id": str(shared_meta.get("policy_id", getattr(self, "_collaboration_policy_id", ""))),
                 }
             )
@@ -131,6 +135,11 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             question_results=question_results,
             question_ids=ordered_question_ids,
             feature_size=int(self.feature_size),
+            step_communication_stats=(
+                dict(self._get_current_comm_step_summary())
+                if hasattr(self, "_get_current_comm_step_summary")
+                else None
+            ),
         )
         self._emulation_episode_steps.append(step_record)
         self._emulation_step_counter += 1

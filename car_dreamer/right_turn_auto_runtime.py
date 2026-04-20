@@ -21,7 +21,6 @@ from .toolkit import (
     get_vehicle_pos,
     payload_fn_llm,
 )
-from .toolkit.planner.agents.navigation.basic_agent import BasicAgent
 from .toolkit.emulation.features import (
     build_observable_region,
     compute_accessibility,
@@ -94,8 +93,63 @@ class RightTurnAutoRuntimeMixin:
         self._emulation_episode_dumped = False
         self._emulation_episode_steps = []
         self._emulation_step_counter = 0
+        self._comm_link_analysis_by_sender = {}
+        self._comm_step_summary = {}
+        self._comm_step_summary_step = -1
         self._reset_policy_runtime_state()
         RUNTIME_LOGGER.debug("Group runtime state reset.")
+
+    def _ensure_comm_step_summary(self) -> Dict[str, float]:
+        current_step = int(getattr(self, "_time_step", 0))
+        if int(getattr(self, "_comm_step_summary_step", -1)) != current_step:
+            self._comm_step_summary = {
+                "attempted_message_count": 0.0,
+                "dropped_message_count": 0.0,
+                "enqueued_message_count": 0.0,
+                "dropped_capacity_exceeded_count": 0.0,
+            }
+            self._comm_step_summary_step = current_step
+        return self._comm_step_summary
+
+    def _record_comm_link_analysis(
+        self,
+        sender_id: int,
+        receiver_id: int,
+        payload_bytes: int,
+        analysis: Any,
+        *,
+        dropped: bool,
+        drop_reason: str = "",
+    ) -> None:
+        if dropped and not bool(getattr(self, "_log_dropped_messages", True)):
+            return
+        if analysis is None:
+            return
+        self._comm_link_analysis_by_sender[int(sender_id)] = {
+            "sender_id": int(sender_id),
+            "receiver_id": int(receiver_id),
+            "payload_bytes": float(payload_bytes),
+            "required_load_bps": float(getattr(analysis, "required_load_bps", 0.0)),
+            "link_rate_bps": float(getattr(analysis, "link_rate_bps", 0.0)),
+            "shannon_bps": float(getattr(analysis, "shannon_bps", 0.0)),
+            "uplink_bps": float(getattr(analysis, "uplink_bps", 0.0)),
+            "downlink_bps": float(getattr(analysis, "downlink_bps", 0.0)),
+            "comm_bandwidth_hz": float(getattr(analysis, "bandwidth_hz", 0.0)),
+            "comm_snr_db": float(getattr(analysis, "snr_db", 0.0)),
+            "comm_feasible": 1.0 if bool(getattr(analysis, "feasible", False)) else 0.0,
+            "dropped_capacity_exceeded": 1.0 if bool(dropped) else 0.0,
+            "drop_reason_capacity_exceeded": 1.0 if str(drop_reason) == "capacity_exceeded" else 0.0,
+            "analysis_latency_s": float(getattr(analysis, "latency_s", 0.0)),
+            "analysis_distance_m": float(getattr(analysis, "distance_m", 0.0)),
+        }
+
+    def _get_latest_comm_link_analysis(self, vehicle_id: int) -> Dict[str, float]:
+        stats = self._comm_link_analysis_by_sender.get(int(vehicle_id), {})
+        return {str(key): float(value) for key, value in stats.items()}
+
+    def _get_current_comm_step_summary(self) -> Dict[str, float]:
+        summary = self._ensure_comm_step_summary()
+        return {str(key): float(value) for key, value in summary.items()}
 
     def _destroy_group_observers(self) -> None:
         for observer in self._other_observers.values():
@@ -148,6 +202,8 @@ class RightTurnAutoRuntimeMixin:
                 self.group_obs[int(actor.id)], _ = observer.get_observation(self.get_state())
 
     def _setup_basic_agent(self) -> None:
+        from .toolkit.planner.agents.navigation.basic_agent import BasicAgent
+
         self.ego_end = self._config.lane_end_point
         ego_transform = carla.Transform(
             carla.Location(*self.ego_end[:3]),
@@ -346,6 +402,7 @@ class RightTurnAutoRuntimeMixin:
     def _run_group_communication(self) -> None:
         if not self.groups:
             return
+        step_summary = self._ensure_comm_step_summary()
         out_deg, in_deg = self._compute_group_degrees()
         actor_map = self._build_group_actor_map()
         fixed_dt = float(self._world._settings.fixed_delta_seconds)
@@ -394,14 +451,72 @@ class RightTurnAutoRuntimeMixin:
                         self._veh_net_res.get(int(receiver_id), self._default_net_res),
                         bandwidth,
                     )
-                    latency_s = self.latency_model.compute_latency_s(
-                        sender=sender,
-                        receiver=receiver,
-                        payload_size_bytes=payload_bytes,
-                        sender_res=sender_res,
-                        receiver_res=receiver_res,
-                        out_degree=max(out_deg.get(int(sender_id), 1), 1),
-                        in_degree=max(in_deg.get(int(receiver_id), 1), 1),
+                    analysis_fn = getattr(self.latency_model, "analyze_transmission", None)
+                    if callable(analysis_fn):
+                        analysis = analysis_fn(
+                            sender=sender,
+                            receiver=receiver,
+                            payload_size_bytes=payload_bytes,
+                            sender_res=sender_res,
+                            receiver_res=receiver_res,
+                            out_degree=max(out_deg.get(int(sender_id), 1), 1),
+                            in_degree=max(in_deg.get(int(receiver_id), 1), 1),
+                            alpha=alpha,
+                            nu=float(current_action.nu.get(int(sender_id), 0.0)),
+                            fixed_dt=fixed_dt,
+                        )
+                        latency_s = float(getattr(analysis, "latency_s", 0.0))
+                    else:
+                        analysis = None
+                        latency_s = self.latency_model.compute_latency_s(
+                            sender=sender,
+                            receiver=receiver,
+                            payload_size_bytes=payload_bytes,
+                            sender_res=sender_res,
+                            receiver_res=receiver_res,
+                            out_degree=max(out_deg.get(int(sender_id), 1), 1),
+                            in_degree=max(in_deg.get(int(receiver_id), 1), 1),
+                            alpha=alpha,
+                            nu=float(current_action.nu.get(int(sender_id), 0.0)),
+                            fixed_dt=fixed_dt,
+                        )
+                    step_summary["attempted_message_count"] += 1.0
+                    if (
+                        bool(getattr(self, "_drop_on_capacity_exceeded", False))
+                        and analysis is not None
+                        and not bool(getattr(analysis, "feasible", True))
+                    ):
+                        step_summary["dropped_message_count"] += 1.0
+                        step_summary["dropped_capacity_exceeded_count"] += 1.0
+                        self._record_comm_link_analysis(
+                            int(sender_id),
+                            int(receiver_id),
+                            payload_bytes,
+                            analysis,
+                            dropped=True,
+                            drop_reason="capacity_exceeded",
+                        )
+                        if should_log_periodic(
+                            int(self._time_step),
+                            int(self._get_runtime_debug_interval()),
+                            logger=RUNTIME_LOGGER,
+                        ):
+                            RUNTIME_LOGGER.debug(
+                                "Dropped message step=%d sender=%d receiver=%d payload_bytes=%d r_req=%.3f R_link=%.3f",
+                                self._time_step,
+                                int(sender_id),
+                                int(receiver_id),
+                                int(payload_bytes),
+                                float(getattr(analysis, "required_load_bps", 0.0)),
+                                float(getattr(analysis, "link_rate_bps", 0.0)),
+                            )
+                        continue
+                    self._record_comm_link_analysis(
+                        int(sender_id),
+                        int(receiver_id),
+                        payload_bytes,
+                        analysis,
+                        dropped=False,
                     )
                     self._enqueue_message(
                         group_id=group_id,
@@ -413,6 +528,7 @@ class RightTurnAutoRuntimeMixin:
                         distance_m=_dist_m(sender, receiver),
                         fixed_dt=fixed_dt,
                     )
+                    step_summary["enqueued_message_count"] += 1.0
                     enqueued_count += 1
                     total_payload_bytes += int(payload_bytes)
         if should_log_periodic(
@@ -421,10 +537,12 @@ class RightTurnAutoRuntimeMixin:
             logger=RUNTIME_LOGGER,
         ):
             RUNTIME_LOGGER.debug(
-                "Communication round step=%d policy=%s senders=%s enqueued=%d in_flight=%d payload_bytes=%d",
+                "Communication round step=%d policy=%s senders=%s attempted=%d dropped=%d enqueued=%d in_flight=%d payload_bytes=%d",
                 self._time_step,
                 getattr(self, "_collaboration_policy_id", ""),
                 sorted(sender_ids),
+                int(step_summary.get("attempted_message_count", 0.0)),
+                int(step_summary.get("dropped_message_count", 0.0)),
                 enqueued_count,
                 len(self._in_flight),
                 total_payload_bytes,

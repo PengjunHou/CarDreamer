@@ -66,9 +66,12 @@ class EmulationTrainingConfig:
     min_learning_rate: float = 1e-5
     loss_type: str = "huber"
     huber_delta: float = 1.0
+    raw_state_weight: float = 1.0
+    shared_state_weight: float = 1.0
     sender_collab_weight: float = 1.0
     sender_gain_weight: float = 1.0
     ego_sc_weight: float = 1.0
+    consistency_weight: float = 0.0
     shuffle: bool = True
     report_every: int = 10
     from_checkpoint: str = ""
@@ -288,6 +291,11 @@ def emulation_collate_fn(samples: Sequence[Mapping[str, Any]]) -> Dict[str, Any]
         "node_ids",
         "history_mask",
         "node_features",
+        "state_node_features",
+        "action_features",
+        "vehicle_exogenous_features",
+        "ego_state_features",
+        "step_exogenous_features",
         "component_valid_mask",
         "node_mask",
         "edge_index",
@@ -298,6 +306,11 @@ def emulation_collate_fn(samples: Sequence[Mapping[str, Any]]) -> Dict[str, Any]
         "task_relevance",
         "future_mask",
         "future_node_mask",
+        "future_action_features",
+        "future_vehicle_exogenous_features",
+        "future_step_exogenous_features",
+        "target_raw_state",
+        "target_shared_state",
         "target_sender_collab",
         "target_sender_gain",
         "target_ego_sc",
@@ -356,7 +369,7 @@ def make_model_from_dataset(
     _require_torch("make_model_from_dataset")
     sample = dataset[0]
     model_config = GraphGRUEmulationConfig(
-        node_dim=int(sample["node_features"].shape[-1]),
+        node_dim=int(sample["state_node_features"].shape[-1]),
         query_dim=int(sample["query_features"].shape[-1]),
         edge_attr_dim=int(sample["edge_attr"].shape[-1]),
         hidden_dim=int(config.hidden_dim),
@@ -364,6 +377,12 @@ def make_model_from_dataset(
         history_len=int(config.history_len),
         horizon=int(config.horizon),
         dropout=float(config.dropout),
+        action_dim=int(sample["action_features"].shape[-1]),
+        vehicle_exogenous_dim=int(sample["vehicle_exogenous_features"].shape[-1]),
+        ego_state_dim=int(sample["ego_state_features"].shape[-1]),
+        step_exogenous_dim=int(sample["step_exogenous_features"].shape[-1]),
+        raw_state_dim=int(sample["target_raw_state"].shape[-1]),
+        shared_state_dim=int(sample["target_shared_state"].shape[-1]),
     )
     return GraphGRUEmulationModel(model_config), model_config
 
@@ -545,9 +564,12 @@ def train_one_epoch(
             batch,
             loss_type=str(config.loss_type),
             delta=float(config.huber_delta),
+            raw_state_weight=float(config.raw_state_weight),
+            shared_state_weight=float(config.shared_state_weight),
             sender_collab_weight=float(config.sender_collab_weight),
             sender_gain_weight=float(config.sender_gain_weight),
             ego_sc_weight=float(config.ego_sc_weight),
+            consistency_weight=float(config.consistency_weight),
         )
         losses["loss"].backward()
         if float(config.gradient_clip_norm) > 0:
@@ -568,6 +590,8 @@ def train_one_epoch(
             print(
                 f"[emulation][train] batch={batch_index + 1} "
                 f"loss={batch_metrics['loss']:.6f} "
+                f"raw={batch_metrics['raw_state_loss']:.6f} "
+                f"shared={batch_metrics['shared_state_loss']:.6f} "
                 f"collab={batch_metrics['sender_collab_loss']:.6f} "
                 f"gain={batch_metrics['sender_gain_loss']:.6f} "
                 f"ego={batch_metrics['ego_sc_loss']:.6f}"
@@ -596,9 +620,12 @@ def evaluate_emulation_model(
                 batch,
                 loss_type=str(config.loss_type),
                 delta=float(config.huber_delta),
+                raw_state_weight=float(config.raw_state_weight),
+                shared_state_weight=float(config.shared_state_weight),
                 sender_collab_weight=float(config.sender_collab_weight),
                 sender_gain_weight=float(config.sender_gain_weight),
                 ego_sc_weight=float(config.ego_sc_weight),
+                consistency_weight=float(config.consistency_weight),
             )
             batch_metrics = {key: float(value.detach().cpu().item()) for key, value in losses.items()}
             for key, value in batch_metrics.items():
@@ -693,9 +720,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-learning-rate", type=float, default=1e-5)
     parser.add_argument("--loss-type", default="huber", choices=["huber", "mse"])
     parser.add_argument("--huber-delta", type=float, default=1.0)
+    parser.add_argument("--raw-state-weight", type=float, default=1.0)
+    parser.add_argument("--shared-state-weight", type=float, default=1.0)
     parser.add_argument("--sender-collab-weight", type=float, default=1.0)
     parser.add_argument("--sender-gain-weight", type=float, default=1.0)
     parser.add_argument("--ego-sc-weight", type=float, default=1.0)
+    parser.add_argument("--consistency-weight", type=float, default=0.0)
     parser.add_argument("--report-every", type=int, default=10)
     parser.add_argument("--from-checkpoint", default="")
     parser.add_argument("--synthetic-episodes", type=int, default=0)
@@ -749,9 +779,12 @@ def main(argv: Sequence[str] | None = None) -> Dict[str, Any]:
         min_learning_rate=float(args.min_learning_rate),
         loss_type=str(args.loss_type),
         huber_delta=float(args.huber_delta),
+        raw_state_weight=float(args.raw_state_weight),
+        shared_state_weight=float(args.shared_state_weight),
         sender_collab_weight=float(args.sender_collab_weight),
         sender_gain_weight=float(args.sender_gain_weight),
         ego_sc_weight=float(args.ego_sc_weight),
+        consistency_weight=float(args.consistency_weight),
         report_every=int(args.report_every),
         from_checkpoint=str(args.from_checkpoint),
         synthetic_episodes=int(args.synthetic_episodes),

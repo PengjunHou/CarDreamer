@@ -121,6 +121,22 @@ class NetResource:
     carrier_freq_hz: float = 5.9e9     # 5.9 GHz
 
 
+@dataclass(frozen=True)
+class LinkCapacityAnalysis:
+    distance_m: float
+    payload_size_bytes: int
+    payload_size_bits: float
+    required_load_bps: float
+    link_rate_bps: float
+    shannon_bps: float
+    uplink_bps: float
+    downlink_bps: float
+    bandwidth_hz: float
+    snr_db: float
+    feasible: bool
+    latency_s: float
+
+
 @dataclass
 class V2VMessage:
     sender_id: int
@@ -149,6 +165,23 @@ class LatencyModel:
         in_degree: int,
         **kwargs,
     ) -> float:
+        raise NotImplementedError
+
+    def analyze_transmission(
+        self,
+        sender: carla.Actor,
+        receiver: carla.Actor,
+        payload_size_bytes: int,
+        sender_res: NetResource,
+        receiver_res: NetResource,
+        out_degree: int,
+        in_degree: int,
+        *,
+        alpha: float = 1.0,
+        nu: float = 1.0,
+        fixed_dt: float = 0.1,
+        **kwargs,
+    ) -> LinkCapacityAnalysis:
         raise NotImplementedError
 
 
@@ -201,6 +234,35 @@ class SimpleWirelessLatency(LatencyModel):
         in_degree: int,
         **kwargs,
     ) -> float:
+        analysis = self.analyze_transmission(
+            sender=sender,
+            receiver=receiver,
+            payload_size_bytes=payload_size_bytes,
+            sender_res=sender_res,
+            receiver_res=receiver_res,
+            out_degree=out_degree,
+            in_degree=in_degree,
+            alpha=float(kwargs.get("alpha", 1.0)),
+            nu=float(kwargs.get("nu", 1.0)),
+            fixed_dt=float(kwargs.get("fixed_dt", 0.1)),
+        )
+        return float(analysis.latency_s)
+
+    def analyze_transmission(
+        self,
+        sender: carla.Actor,
+        receiver: carla.Actor,
+        payload_size_bytes: int,
+        sender_res: NetResource,
+        receiver_res: NetResource,
+        out_degree: int,
+        in_degree: int,
+        *,
+        alpha: float = 1.0,
+        nu: float = 1.0,
+        fixed_dt: float = 0.1,
+        **kwargs,
+    ) -> LinkCapacityAnalysis:
         d = _dist_m(sender, receiver)
 
         # contention-aware caps (KEEP variable names)
@@ -251,4 +313,22 @@ class SimpleWirelessLatency(LatencyModel):
             jitter = self.rng.uniform(-self.jitter_s, self.jitter_s)
 
         latency = self.base_rtt_s + 2.0 * self.proc_delay_s + tx_time + jitter
-        return max(latency, 0.0)
+        payload_bits = 8.0 * float(payload_size_bytes)
+        required_load_bps = (
+            max(float(alpha), 0.0) * max(float(nu), 0.0) * payload_bits / max(float(fixed_dt), 1e-6)
+        )
+        link_rate_bps = max(rate_bps, 1.0)
+        return LinkCapacityAnalysis(
+            distance_m=float(d),
+            payload_size_bytes=int(payload_size_bytes),
+            payload_size_bits=float(payload_bits),
+            required_load_bps=float(required_load_bps),
+            link_rate_bps=float(link_rate_bps),
+            shannon_bps=float(shannon_bps),
+            uplink_bps=float(uplink),
+            downlink_bps=float(downlink),
+            bandwidth_hz=float(bandwidth_hz),
+            snr_db=float(snr_db),
+            feasible=bool(required_load_bps <= link_rate_bps + 1e-9),
+            latency_s=float(max(latency, 0.0)),
+        )

@@ -5,7 +5,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
-from .schema import CandidateVehicleState, QueryRecord, RegionBox
+from .schema import CandidateVehicleState, CanonicalStepRecord, EgoState, QueryRecord, RegionBox
 
 
 def wrap_angle_rad(angle: float) -> float:
@@ -49,6 +49,30 @@ def get_node_feature_layout(raw_dim: int, semantic_dim: int, intent_dim: int) ->
     return layout
 
 
+def get_vehicle_exogenous_feature_keys() -> Tuple[str, ...]:
+    return (
+        "window_message_count",
+        "selected_message_count",
+        "latest_latency_s",
+        "latest_payload_bytes",
+        "latest_distance_m",
+        "current_distance_m",
+        "shared_source_received_feat",
+        "shared_source_raw",
+        "distance_m",
+        "latency_s",
+    )
+
+
+def get_step_exogenous_feature_keys() -> Tuple[str, ...]:
+    return (
+        "env_step",
+        "num_candidate_vehicles",
+        "num_questions",
+        "avg_latency_s",
+    )
+
+
 def build_observable_region(
     delta_pos: Sequence[float],
     delta_yaw: float,
@@ -90,6 +114,84 @@ def pack_vehicle_node_state(vehicle: CandidateVehicleState) -> np.ndarray:
         np.asarray([float(vehicle.alpha), float(vehicle.nu), float(vehicle.bandwidth)], dtype=np.float32),
     ]
     return np.concatenate(blocks, axis=0)
+
+
+def pack_vehicle_state_features(vehicle: CandidateVehicleState) -> np.ndarray:
+    """Pack the per-vehicle state x_i,t without action variables."""
+    blocks = [
+        np.asarray(
+            [
+                float(vehicle.delta_pos[0]),
+                float(vehicle.delta_pos[1]),
+                float(vehicle.delta_vel[0]),
+                float(vehicle.delta_vel[1]),
+                float(vehicle.delta_yaw),
+            ],
+            dtype=np.float32,
+        ),
+        np.asarray(vehicle.shared_summary_raw, dtype=np.float32).reshape(-1),
+        np.asarray(vehicle.shared_summary_semantic, dtype=np.float32).reshape(-1),
+        np.asarray([float(vehicle.shared_confidence)], dtype=np.float32),
+        np.asarray(vehicle.intent_summary, dtype=np.float32).reshape(-1),
+        np.asarray([float(vehicle.complementarity), float(vehicle.accessibility)], dtype=np.float32),
+    ]
+    return np.concatenate(blocks, axis=0)
+
+
+def pack_vehicle_action_features(vehicle: CandidateVehicleState) -> np.ndarray:
+    return np.asarray([float(vehicle.alpha), float(vehicle.nu), float(vehicle.bandwidth)], dtype=np.float32)
+
+
+def pack_vehicle_raw_state_target(vehicle: CandidateVehicleState) -> np.ndarray:
+    return np.asarray(
+        [
+            float(vehicle.delta_pos[0]),
+            float(vehicle.delta_pos[1]),
+            float(vehicle.delta_vel[0]),
+            float(vehicle.delta_vel[1]),
+            float(vehicle.delta_yaw),
+        ],
+        dtype=np.float32,
+    )
+
+
+def pack_vehicle_shared_state_target(vehicle: CandidateVehicleState) -> np.ndarray:
+    blocks = [
+        np.asarray(vehicle.shared_summary_raw, dtype=np.float32).reshape(-1),
+        np.asarray(vehicle.shared_summary_semantic, dtype=np.float32).reshape(-1),
+        np.asarray([float(vehicle.shared_confidence)], dtype=np.float32),
+        np.asarray(vehicle.intent_summary, dtype=np.float32).reshape(-1),
+    ]
+    return np.concatenate(blocks, axis=0)
+
+
+def pack_vehicle_exogenous_features(vehicle: CandidateVehicleState) -> np.ndarray:
+    stats = vehicle.communication_stats or {}
+    return np.asarray(
+        [float(stats.get(key, 0.0)) for key in get_vehicle_exogenous_feature_keys()],
+        dtype=np.float32,
+    )
+
+
+def pack_ego_state_features(ego_state: EgoState) -> np.ndarray:
+    return np.asarray(
+        [
+            float(ego_state.pose_xy[0]),
+            float(ego_state.pose_xy[1]),
+            float(ego_state.velocity_xy[0]),
+            float(ego_state.velocity_xy[1]),
+            float(ego_state.yaw),
+        ],
+        dtype=np.float32,
+    )
+
+
+def pack_step_exogenous_features(step: CanonicalStepRecord) -> np.ndarray:
+    stats = step.communication_stats or {}
+    return np.asarray(
+        [float(stats.get(key, 0.0)) for key in get_step_exogenous_feature_keys()],
+        dtype=np.float32,
+    )
 
 
 def pack_component_valid_mask(vehicle: CandidateVehicleState) -> np.ndarray:

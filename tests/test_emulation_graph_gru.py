@@ -59,7 +59,7 @@ class EmulationGraphGRUTest(unittest.TestCase):
 
         vehicle = reloaded.steps[0].candidate_vehicles[0]
         node_feature = FEATURES.pack_vehicle_node_state(vehicle)
-        self.assertEqual(node_feature.shape[0], 28)
+        self.assertEqual(node_feature.shape[0], 31)
         self.assertEqual(len(vehicle.query_task_relevance), len(reloaded.steps[0].queries))
         self.assertEqual(len(vehicle.shared_summary_raw), 8)
         self.assertEqual(len(vehicle.shared_summary_semantic), 8)
@@ -103,7 +103,11 @@ class EmulationGraphGRUTest(unittest.TestCase):
         dataset = DATASET.CanonicalEmulationDataset([episode], history_len=8, horizon=5)
         sample = dataset[9]
 
-        self.assertEqual(sample["node_features"].shape, (8, 3, 28))
+        self.assertEqual(sample["node_features"].shape, (8, 3, 31))
+        self.assertEqual(sample["state_node_features"].shape, (8, 3, 28))
+        self.assertEqual(sample["action_features"].shape, (8, 3, 3))
+        self.assertEqual(sample["target_raw_state"].shape, (5, 3, 5))
+        self.assertEqual(sample["target_shared_state"].shape, (5, 3, 21))
         self.assertEqual(sample["task_relevance"].shape, (8, 3, 6))
         self.assertEqual(sample["target_sender_collab"].shape, (5, 3, 6))
         self.assertEqual(sample["target_sender_gain"].shape, (5, 3, 6))
