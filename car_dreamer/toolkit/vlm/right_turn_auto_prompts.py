@@ -88,7 +88,15 @@ class RightTurnAutoVLMPromptMixin:
             self._vlm_step_cache = {}
         gc.collect()
 
+    def _get_shared_latent_mode(self) -> str:
+        return str(getattr(self, "_vlm_shared_latent_mode", "")).strip().lower()
+
     def _ensure_shared_latent_encoder(self) -> None:
+        mode = self._get_shared_latent_mode()
+        if mode in {"qwen_hidden_mean_pool", "qwen_hidden_concat"}:
+            if getattr(self, "_vlm_model", None) is None or getattr(self, "_vlm_processor", None) is None:
+                self._init_vlm()
+            return
         if getattr(self, "_shared_latent_clip_model", None) is not None and getattr(
             self, "_shared_latent_clip_processor", None
         ) is not None:
@@ -129,11 +137,35 @@ class RightTurnAutoVLMPromptMixin:
 
     def _get_shared_latent_dims(self) -> tuple[int, int]:
         self._ensure_shared_latent_encoder()
+        mode = self._get_shared_latent_mode()
+        if mode in {"qwen_hidden_mean_pool", "qwen_hidden_concat"}:
+            hidden_size = int(getattr(self._vlm_model.config, "hidden_size", 0) or 0)
+            if hidden_size <= 0:
+                text_cfg = getattr(self._vlm_model.config, "text_config", None)
+                hidden_size = int(getattr(text_cfg, "hidden_size", 0) or 0)
+            if hidden_size <= 0:
+                raise RuntimeError("Cannot resolve Qwen2.5-VL hidden_size for shared latent.")
+            return hidden_size, hidden_size
         model = getattr(self, "_shared_latent_clip_model")
         projection_dim = int(getattr(model.config, "projection_dim", 0) or 0)
         if projection_dim <= 0:
             projection_dim = int(model.visual_projection.out_features)
         return projection_dim, projection_dim
+
+    def _get_qwen_image_pad_token_id(self) -> int:
+        cached = getattr(self, "_qwen_image_pad_token_id", None)
+        if isinstance(cached, int) and cached >= 0:
+            return cached
+        tokenizer = getattr(self._vlm_processor, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError("Qwen2.5-VL processor has no tokenizer.")
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        for token in ("<|image_pad|>", "<|vision_pad|>"):
+            tid = tokenizer.convert_tokens_to_ids(token)
+            if isinstance(tid, int) and tid >= 0 and tid != unk_id:
+                self._qwen_image_pad_token_id = int(tid)
+                return int(tid)
+        raise RuntimeError("Could not locate Qwen2.5-VL image pad token id.")
 
     def _normalize_clip_embedding(self, emb: torch.Tensor) -> torch.Tensor:
         emb = emb.detach().float()
@@ -182,7 +214,51 @@ class RightTurnAutoVLMPromptMixin:
             image_features = model.visual_projection(pooled)
         return self._normalize_clip_embedding(image_features.squeeze(0)).cpu()
 
-    def _compute_clip_shared_latent(
+    def _compute_qwen_shared_latent_tensors(
+        self,
+        *,
+        image: Image.Image,
+        scene_description: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": scene_description},
+            ],
+        }]
+        text = self._vlm_processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False,
+        )
+        inputs = self._vlm_processor(
+            text=[text], images=[image], padding=True, return_tensors="pt",
+        )
+        model_device = next(self._vlm_model.parameters()).device
+        inputs = {k: v.to(model_device) if hasattr(v, "to") else v for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = self._vlm_model(
+                **inputs,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        last_hidden = outputs.hidden_states[-1][0]  # [L, hidden_size]
+        input_ids = inputs["input_ids"][0]
+        attn_mask = inputs["attention_mask"][0].to(torch.bool)
+
+        image_pad_id = self._get_qwen_image_pad_token_id()
+        image_mask = (input_ids == image_pad_id) & attn_mask
+        text_mask = attn_mask & ~image_mask
+        if not image_mask.any() or not text_mask.any():
+            raise RuntimeError("Qwen2.5-VL shared-latent extraction produced empty image/text mask.")
+
+        image_hidden = last_hidden[image_mask]
+        text_hidden = last_hidden[text_mask]
+        image_emb = image_hidden.mean(dim=0).float().cpu()
+        text_emb = text_hidden.mean(dim=0).float().cpu()
+        return image_emb, text_emb
+
+    def _compute_shared_latent(
         self,
         *,
         image: Optional[Image.Image],
@@ -195,13 +271,21 @@ class RightTurnAutoVLMPromptMixin:
             cached["shared_latent"] = list(cached.get("shared_latent", []))
             return cached
 
+        mode = self._get_shared_latent_mode()
         image_dim, text_dim = self._get_shared_latent_dims()
         scene_description = str(scene_description).strip()
         valid = False
+        shared_latent: List[float] = []
+
         if image is not None and scene_description:
             try:
-                image_emb = self._compute_shared_image_embedding(image)
-                text_emb = self._compute_shared_text_embedding(scene_description)
+                if mode in {"qwen_hidden_mean_pool", "qwen_hidden_concat"}:
+                    image_emb, text_emb = self._compute_qwen_shared_latent_tensors(
+                        image=image, scene_description=scene_description,
+                    )
+                else:
+                    image_emb = self._compute_shared_image_embedding(image)
+                    text_emb = self._compute_shared_text_embedding(scene_description)
             except Exception:
                 image_emb = None
                 text_emb = None
@@ -210,16 +294,26 @@ class RightTurnAutoVLMPromptMixin:
                 valid = True
         if not valid:
             shared_latent = [0.0] * (image_dim + text_dim)
+
+        source_label = (
+            "qwen_hidden_mean_pool"
+            if mode in {"qwen_hidden_mean_pool", "qwen_hidden_concat"}
+            else "clip_image_text_concat"
+        )
         payload = {
             "shared_latent": [float(x) for x in shared_latent],
             "shared_image_latent_dim": int(image_dim),
             "shared_text_latent_dim": int(text_dim),
-            "shared_latent_source": "clip_image_text_concat",
+            "shared_latent_source": source_label,
             "shared_latent_valid": bool(valid),
         }
         if cache_key is not None and bucket is not None:
             bucket[cache_key] = dict(payload)
         return payload
+
+    # Backward-compatible alias. Legacy callers referenced the CLIP-specific name;
+    # both CLIP and Qwen paths are now routed through _compute_shared_latent.
+    _compute_clip_shared_latent = _compute_shared_latent
 
     def _build_vlm_questions(self) -> List[Dict[str, Any]]:
         return [

@@ -69,7 +69,8 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
         image: Any,
         scene_description: str = "",
     ) -> Dict[str, Any]:
-        if str(getattr(self, "_vlm_shared_latent_mode", "")) != "clip_image_text_concat":
+        mode = str(getattr(self, "_vlm_shared_latent_mode", "")).strip().lower()
+        if mode not in {"clip_image_text_concat", "qwen_hidden_mean_pool", "qwen_hidden_concat"}:
             return {
                 "shared_latent": [],
                 "shared_image_latent_dim": 0,
