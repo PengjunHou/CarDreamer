@@ -117,6 +117,29 @@ class PolicyPayloadSelectionTest(unittest.TestCase):
         action = registry.get("PX")([POLICY.VehicleInfo(vehicle_id=5, sender_collab=0.2, distance_m=8.0)])
         self.assertEqual(action.alpha[5], 1.0)
 
+    def test_collaboration_action_normalizes_only_active_bandwidth(self):
+        action = POLICY.CollaborationAction(
+            alpha={1: 1.0, 2: 1.0, 3: 1.0, 4: 0.0},
+            nu={1: 1.0, 2: 1.0, 3: 1.0, 4: 0.0},
+            bandwidth={1: 0.5, 2: 0.5, 3: 0.5, 4: 0.4},
+        )
+
+        normalized = action.normalized_bandwidth()
+
+        self.assertAlmostEqual(normalized.bandwidth[1], 1.0 / 3.0)
+        self.assertAlmostEqual(normalized.bandwidth[2], 1.0 / 3.0)
+        self.assertAlmostEqual(normalized.bandwidth[3], 1.0 / 3.0)
+        self.assertEqual(normalized.bandwidth[4], 0.0)
+
+        partial = POLICY.CollaborationAction(
+            alpha={1: 1.0, 2: 1.0, 3: 0.0},
+            nu={1: 1.0, 2: 1.0, 3: 0.0},
+            bandwidth={1: 0.5, 2: 0.2, 3: 0.9},
+        ).normalized_bandwidth()
+        self.assertEqual(partial.bandwidth[1], 0.5)
+        self.assertEqual(partial.bandwidth[2], 0.2)
+        self.assertEqual(partial.bandwidth[3], 0.0)
+
     def test_payload_encoders_and_selector(self):
         registry = PAYLOADS.build_default_payload_registry()
         image = np.full((8, 8, 3), fill_value=120, dtype=np.uint8)

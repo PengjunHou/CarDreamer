@@ -32,6 +32,7 @@ from .toolkit.emulation.features import (
     compute_task_relevance,
 )
 from .toolkit.emulation.policy import (
+    BANDWIDTH_BUDGET,
     CollaborationAction,
     PolicySelectorDecision,
     SceneSummary,
@@ -212,8 +213,6 @@ class RightTurnAutoRuntimeMixin:
             "required_load_bps": float(getattr(analysis, "required_load_bps", 0.0)),
             "link_rate_bps": float(getattr(analysis, "link_rate_bps", 0.0)),
             "shannon_bps": float(getattr(analysis, "shannon_bps", 0.0)),
-            "uplink_bps": float(getattr(analysis, "uplink_bps", 0.0)),
-            "downlink_bps": float(getattr(analysis, "downlink_bps", 0.0)),
             "comm_bandwidth_hz": float(getattr(analysis, "bandwidth_hz", 0.0)),
             "comm_snr_db": float(getattr(analysis, "snr_db", 0.0)),
             "comm_feasible": 1.0 if bool(getattr(analysis, "feasible", False)) else 0.0,
@@ -422,7 +421,7 @@ class RightTurnAutoRuntimeMixin:
             self._policy_last_action_step = int(self._time_step)
             return self._policy_current_action
         rng = random.Random(int(getattr(self, "_collaboration_policy_seed", 0)) + int(self._time_step))
-        self._policy_current_action = policy(infos, rng=rng)
+        self._policy_current_action = self._normalize_runtime_policy_action(policy(infos, rng=rng))
         self._policy_last_action_step = int(self._time_step)
         return self._policy_current_action
 
@@ -438,6 +437,28 @@ class RightTurnAutoRuntimeMixin:
             "nu": float(action.nu.get(vid, 0.0)),
             "bandwidth": float(action.bandwidth.get(vid, 0.0)),
         }
+
+    def _normalize_runtime_policy_action(self, action: CollaborationAction) -> CollaborationAction:
+        normalized = action.normalized_bandwidth(budget=BANDWIDTH_BUDGET)
+        active_ids = normalized.active_ids()
+        original_total = sum(max(float(action.bandwidth.get(int(vid), 0.0)), 0.0) for vid in active_ids)
+        normalized_total = sum(max(float(normalized.bandwidth.get(int(vid), 0.0)), 0.0) for vid in active_ids)
+        if (
+            original_total > BANDWIDTH_BUDGET + 1e-9
+            and should_log_periodic(
+                int(self._time_step),
+                int(self._get_runtime_debug_interval()),
+                logger=RUNTIME_LOGGER,
+            )
+        ):
+            RUNTIME_LOGGER.debug(
+                "Normalized runtime bandwidth allocation step=%d total_before=%.6f total_after=%.6f active_ids=%s",
+                int(self._time_step),
+                float(original_total),
+                float(normalized_total),
+                sorted(int(vid) for vid in active_ids),
+            )
+        return normalized
 
     def _advance_policy_send_schedule(self) -> Dict[int, bool]:
         if getattr(self, "_policy_last_comm_step", -1) == int(self._time_step):
@@ -545,8 +566,6 @@ class RightTurnAutoRuntimeMixin:
     def _scale_net_resource_for_bandwidth(self, base: NetResource, bandwidth: float) -> NetResource:
         scale = max(float(bandwidth), float(getattr(self, "_collaboration_bandwidth_floor", 0.1)))
         return NetResource(
-            uplink_bps=float(base.uplink_bps) * scale,
-            downlink_bps=float(base.downlink_bps) * scale,
             bandwidth_hz=float(base.bandwidth_hz) * scale,
             tx_power_dbm=float(base.tx_power_dbm),
             noise_figure_db=float(base.noise_figure_db),
@@ -655,7 +674,6 @@ class RightTurnAutoRuntimeMixin:
         if not self.groups:
             return
         step_summary = self._ensure_comm_step_summary()
-        out_deg, in_deg = self._compute_group_degrees()
         actor_map = self._build_group_actor_map()
         fixed_dt = float(self._world._settings.fixed_delta_seconds)
         ego_id = int(self.ego.id)
@@ -728,8 +746,8 @@ class RightTurnAutoRuntimeMixin:
                             payload_size_bytes=payload_bytes,
                             sender_res=sender_res,
                             receiver_res=receiver_res,
-                            out_degree=max(out_deg.get(int(sender_id), 1), 1),
-                            in_degree=max(in_deg.get(int(receiver_id), 1), 1),
+                            out_degree=1,
+                            in_degree=1,
                             alpha=alpha,
                             nu=float(current_action.nu.get(int(sender_id), 0.0)),
                             fixed_dt=fixed_dt,
@@ -743,8 +761,8 @@ class RightTurnAutoRuntimeMixin:
                             payload_size_bytes=payload_bytes,
                             sender_res=sender_res,
                             receiver_res=receiver_res,
-                            out_degree=max(out_deg.get(int(sender_id), 1), 1),
-                            in_degree=max(in_deg.get(int(receiver_id), 1), 1),
+                            out_degree=1,
+                            in_degree=1,
                             alpha=alpha,
                             nu=float(current_action.nu.get(int(sender_id), 0.0)),
                             fixed_dt=fixed_dt,

@@ -200,10 +200,9 @@ env:
   communication: # V2V communication global default settings
     group_update_period: 20   # how often to recompute groups (steps)
     comm_period: 1            # how often to trigger intra-group communication (steps)
-    uplink_bps: 6000000.0     # per-vehicle uplink bandwidth (bps)
-    downlink_bps: 12000000.0  # per-vehicle downlink bandwidth (bps)
-    base_rtt_s: 0.02          # base round-trip time (seconds)
-    proc_delay_s: 0.005       # processing delay (seconds)
+    bandwidth_hz: 20000000.0  # total shared wireless bandwidth for the environment (Hz), e.g. 20 MHz
+    proc_delay_s: 0.0005      # base processing delay per endpoint (seconds)
+    proc_delay_per_kb_s: 0.0001 # additional processing delay per endpoint, per KB
     distance_decay_m: 60.0    # distance decay constant for latency model (meters)
     min_rate_factor: 0.2      # minimum rate factor (prevents rate from dropping to zero)
     jitter_s: 0.0             # random jitter added to latency (seconds, 0 = disabled)

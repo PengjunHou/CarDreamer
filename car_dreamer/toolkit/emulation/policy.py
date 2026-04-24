@@ -57,6 +57,49 @@ class CollaborationAction:
     def active_ids(self) -> List[int]:
         return [vid for vid, a in self.alpha.items() if a > 0.5]
 
+    def normalized_bandwidth(
+        self,
+        *,
+        budget: float = BANDWIDTH_BUDGET,
+        selection_threshold: float = 0.5,
+    ) -> "CollaborationAction":
+        """Return a copy whose active bandwidth shares respect the total budget."""
+        normalized_alpha = {int(vid): float(value) for vid, value in self.alpha.items()}
+        normalized_nu = {int(vid): float(value) for vid, value in self.nu.items()}
+        normalized_bandwidth = {int(vid): float(value) for vid, value in self.bandwidth.items()}
+
+        active_ids = [
+            int(vid)
+            for vid, alpha in normalized_alpha.items()
+            if float(alpha) > float(selection_threshold)
+        ]
+        if not active_ids:
+            return CollaborationAction(
+                alpha=normalized_alpha,
+                nu=normalized_nu,
+                bandwidth=normalized_bandwidth,
+            )
+
+        for vid in list(normalized_bandwidth.keys()):
+            if int(vid) not in active_ids:
+                normalized_bandwidth[int(vid)] = 0.0
+
+        active_total = sum(max(normalized_bandwidth.get(int(vid), 0.0), 0.0) for vid in active_ids)
+        budget = max(float(budget), 0.0)
+        if active_total > budget and active_total > 0.0:
+            scale = budget / active_total
+            for vid in active_ids:
+                normalized_bandwidth[int(vid)] = max(normalized_bandwidth.get(int(vid), 0.0), 0.0) * scale
+        else:
+            for vid in active_ids:
+                normalized_bandwidth[int(vid)] = max(normalized_bandwidth.get(int(vid), 0.0), 0.0)
+
+        return CollaborationAction(
+            alpha=normalized_alpha,
+            nu=normalized_nu,
+            bandwidth=normalized_bandwidth,
+        )
+
 
 @dataclass(frozen=True)
 class SceneSummary:

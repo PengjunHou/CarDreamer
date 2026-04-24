@@ -94,10 +94,9 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self.group_update_period = int(getattr(comm_cfg, "group_update_period", 20))
         self.comm_period = int(getattr(comm_cfg, "comm_period", 5))
 
-        uplink_bps = float(getattr(comm_cfg, "uplink_bps", 6e6))
-        downlink_bps = float(getattr(comm_cfg, "downlink_bps", 12e6))
-        base_rtt_s = float(getattr(comm_cfg, "base_rtt_s", 0.02))
-        proc_delay_s = float(getattr(comm_cfg, "proc_delay_s", 0.005))
+        bandwidth_hz = float(getattr(comm_cfg, "bandwidth_hz", 10e6))
+        proc_delay_s = float(getattr(comm_cfg, "proc_delay_s", 0.0005))
+        proc_delay_per_kb_s = float(getattr(comm_cfg, "proc_delay_per_kb_s", 0.0001))
         distance_decay_m = float(getattr(comm_cfg, "distance_decay_m", 60.0))
         min_rate_factor = float(getattr(comm_cfg, "min_rate_factor", 0.2))
         jitter_s = float(getattr(comm_cfg, "jitter_s", 0.0))
@@ -116,10 +115,10 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self._payload_selector = RuleBasedPayloadSelector()
         self._payload_override = canonicalize_payload_type(self._payload_override_type) if self._payload_override_type else ""
 
-        self._default_net_res = NetResource(uplink_bps=uplink_bps, downlink_bps=downlink_bps)
+        self._default_net_res = NetResource(bandwidth_hz=bandwidth_hz)
         self.latency_model: LatencyModel = SimpleWirelessLatency(
-            base_rtt_s=base_rtt_s,
             proc_delay_s=proc_delay_s,
+            proc_delay_per_kb_s=proc_delay_per_kb_s,
             distance_decay_m=distance_decay_m,
             min_rate_factor=min_rate_factor,
             jitter_s=jitter_s,

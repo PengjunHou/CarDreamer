@@ -90,20 +90,20 @@ class CarlaVehGroupsEnv(CarlaWptFixedEnv):
             self.grouping_strategy = AllInOneGroup()
 
         # Network resources (global default per-vehicle caps; you can override per-vehicle later)
-        uplink_bps = float(getattr(self._config, "uplink_bps", 6e6))
-        downlink_bps = float(getattr(self._config, "downlink_bps", 12e6))
-        self._default_net_res = NetResource(uplink_bps=uplink_bps, downlink_bps=downlink_bps)
+        comm_cfg = getattr(self._config, "communication", None)
+        bandwidth_hz = float(getattr(comm_cfg, "bandwidth_hz", 10e6))
+        self._default_net_res = NetResource(bandwidth_hz=bandwidth_hz)
 
         # Latency model
-        base_rtt_s = float(getattr(self._config, "base_rtt_s", 0.02))
-        proc_delay_s = float(getattr(self._config, "proc_delay_s", 0.005))
-        distance_decay_m = float(getattr(self._config, "distance_decay_m", 60.0))
-        min_rate_factor = float(getattr(self._config, "min_rate_factor", 0.2))
-        jitter_s = float(getattr(self._config, "jitter_s", 0.0))
+        proc_delay_s = float(getattr(comm_cfg, "proc_delay_s", 0.0005))
+        proc_delay_per_kb_s = float(getattr(comm_cfg, "proc_delay_per_kb_s", 0.0001))
+        distance_decay_m = float(getattr(comm_cfg, "distance_decay_m", 60.0))
+        min_rate_factor = float(getattr(comm_cfg, "min_rate_factor", 0.2))
+        jitter_s = float(getattr(comm_cfg, "jitter_s", 0.0))
 
         self.latency_model: LatencyModel = SimpleWirelessLatency(
-            base_rtt_s=base_rtt_s,
             proc_delay_s=proc_delay_s,
+            proc_delay_per_kb_s=proc_delay_per_kb_s,
             distance_decay_m=distance_decay_m,
             min_rate_factor=min_rate_factor,
             jitter_s=jitter_s,

@@ -121,17 +121,10 @@ class NetResource:
     """
     Simple per-vehicle network resource.
 
-    uplink_bps/downlink_bps:
-        Kept for backward compatibility and as a practical throughput cap.
-
     bandwidth_hz/tx_power_dbm/noise_figure_db/carrier_freq_hz:
         Used to estimate Shannon capacity (rate) with a simple path-loss model.
     """
-    uplink_bps: float
-    downlink_bps: float
-
-    # Shannon parameters (defaults are reasonable for V2X-like settings)
-    bandwidth_hz: float = 10e6         # 10 MHz
+    bandwidth_hz: float
     tx_power_dbm: float = 20.0         # 100 mW
     noise_figure_db: float = 9.0       # receiver noise figure
     carrier_freq_hz: float = 5.9e9     # 5.9 GHz
@@ -145,12 +138,12 @@ class LinkCapacityAnalysis:
     required_load_bps: float
     link_rate_bps: float
     shannon_bps: float
-    uplink_bps: float
-    downlink_bps: float
     bandwidth_hz: float
     snr_db: float
     feasible: bool
     latency_s: float
+    tx_time_s: float = 0.0
+    processing_delay_s: float = 0.0
 
 
 @dataclass
@@ -204,40 +197,57 @@ class LatencyModel:
 class SimpleWirelessLatency(LatencyModel):
     """
     A simple V2V latency model:
-        latency = base_rtt + proc_delay + tx_time
+        latency = processing_delay(payload_size) + tx_time
 
     tx_time is computed using a Shannon-capacity-like rate:
       C = B * log2(1 + SNR)
 
     Where:
-        - Effective bandwidth B is contention-aware and distance-degraded:
-          B = min(sender_B/out_degree, receiver_B/in_degree) * distance_factor
+        - Effective bandwidth B uses the sender/receiver bandwidth shares
+          allocated by policy, then applies distance degradation:
+          B = min(sender_B, receiver_B) * distance_factor
         - SNR is estimated with a free-space path loss + noise floor model:
             Pr(dBm) = Pt(dBm) - FSPL(dB)
             N(dBm)  = -174 + 10log10(B) + NF
             SNR(dB) = Pr - N
-        - Practical throughput is capped by min(uplink, downlink) (backward compat)
 
-    distance_factor is also retained to capture non-ideal attenuation/conditions.
+    The `out_degree`/`in_degree` arguments are kept for API compatibility,
+    but the current member->ego runtime path no longer applies degree-based
+    contention after policy allocation. distance_factor is retained to capture
+    non-ideal attenuation/conditions.
     """
 
     def __init__(
         self,
-        base_rtt_s: float = 0.02,
-        proc_delay_s: float = 0.005,
+        base_rtt_s: float = 0.0,
+        proc_delay_s: float = 0.0005,
+        proc_delay_per_kb_s: float = 0.0001,
         distance_decay_m: float = 100.0,
         min_rate_factor: float = 0.2,
         jitter_s: float = 0.0,
         rng: Optional[random.Random] = None,
         overhead_bytes: int = 120,
     ):
-        self.base_rtt_s = float(base_rtt_s)
+        # Deprecated: kept only for backward-compatible construction.
+        # The fixed RTT contribution is intentionally removed from latency.
+        self.base_rtt_s = 0.0
+        self._legacy_base_rtt_s = float(base_rtt_s)
         self.proc_delay_s = float(proc_delay_s)
+        self.proc_delay_per_kb_s = float(proc_delay_per_kb_s)
         self.distance_decay_m = float(distance_decay_m)
         self.min_rate_factor = float(min_rate_factor)
         self.jitter_s = float(jitter_s)
         self.rng = rng
         self.overhead_bytes = int(overhead_bytes)
+
+    def _processing_delay_s(self, payload_size_bytes: int) -> float:
+        payload_kb = max(float(payload_size_bytes), 0.0) / 1024.0
+        per_side_delay = max(
+            float(self.proc_delay_s) + float(self.proc_delay_per_kb_s) * payload_kb,
+            0.0,
+        )
+        # Model sender + receiver processing with the same size-aware cost.
+        return 2.0 * per_side_delay
 
     def compute_latency_s(
         self,
@@ -281,20 +291,21 @@ class SimpleWirelessLatency(LatencyModel):
     ) -> LinkCapacityAnalysis:
         d = _dist_m(sender, receiver)
 
-        # contention-aware caps (KEEP variable names)
+        # Keep these parameters for API compatibility even though the current
+        # member->ego runtime path does not apply degree-based splitting here.
         out_degree = max(int(out_degree), 1)
         in_degree = max(int(in_degree), 1)
-        uplink = max(sender_res.uplink_bps / out_degree, 1.0)
-        downlink = max(receiver_res.downlink_bps / in_degree, 1.0)
+        del out_degree, in_degree
 
         # distance attenuation factor (keep your original factor)
         distance_factor = math.exp(-d / max(self.distance_decay_m, 1e-6))
         distance_factor = max(self.min_rate_factor, float(distance_factor))
 
         # ---- Shannon capacity part ----
-        # Effective bandwidth under contention + distance degradation
-        B_sender = max(float(sender_res.bandwidth_hz) / out_degree, 1.0)
-        B_receiver = max(float(receiver_res.bandwidth_hz) / in_degree, 1.0)
+        # Effective bandwidth from the already-allocated policy share, degraded
+        # by distance but not split again by link degree.
+        B_sender = max(float(sender_res.bandwidth_hz), 1.0)
+        B_receiver = max(float(receiver_res.bandwidth_hz), 1.0)
         bandwidth_hz = min(B_sender, B_receiver) * distance_factor
         bandwidth_hz = max(bandwidth_hz, 1.0)
 
@@ -317,9 +328,8 @@ class SimpleWirelessLatency(LatencyModel):
         # Shannon capacity (bps)
         shannon_bps = bandwidth_hz * math.log2(1.0 + max(snr_linear, 0.0))
 
-        # Practical throughput cap (KEEP uplink/downlink variables)
-        rate_bps = min(shannon_bps, uplink, downlink)
-        rate_bps = max(rate_bps, 1.0)
+        # Final usable rate is governed directly by the Shannon estimate.
+        rate_bps = max(shannon_bps, 1.0)
 
         # Transmission time
         tx_time = (8.0 * float(payload_size_bytes)) / rate_bps
@@ -328,7 +338,8 @@ class SimpleWirelessLatency(LatencyModel):
         if self.jitter_s > 0 and self.rng is not None:
             jitter = self.rng.uniform(-self.jitter_s, self.jitter_s)
 
-        latency = self.base_rtt_s + 2.0 * self.proc_delay_s + tx_time + jitter
+        processing_delay = self._processing_delay_s(payload_size_bytes)
+        latency = processing_delay + tx_time + jitter
         payload_bits = 8.0 * float(payload_size_bytes)
         required_load_bps = (
             max(float(alpha), 0.0) * max(float(nu), 0.0) * payload_bits / max(float(fixed_dt), 1e-6)
@@ -341,10 +352,10 @@ class SimpleWirelessLatency(LatencyModel):
             required_load_bps=float(required_load_bps),
             link_rate_bps=float(link_rate_bps),
             shannon_bps=float(shannon_bps),
-            uplink_bps=float(uplink),
-            downlink_bps=float(downlink),
             bandwidth_hz=float(bandwidth_hz),
             snr_db=float(snr_db),
             feasible=bool(required_load_bps <= link_rate_bps + 1e-9),
             latency_s=float(max(latency, 0.0)),
+            tx_time_s=float(max(tx_time, 0.0)),
+            processing_delay_s=float(processing_delay),
         )

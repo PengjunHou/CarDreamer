@@ -112,15 +112,11 @@ def _load_runtime_module():
     class _NetResource:
         def __init__(
             self,
-            uplink_bps,
-            downlink_bps,
-            bandwidth_hz=10e6,
+            bandwidth_hz,
             tx_power_dbm=20.0,
             noise_figure_db=9.0,
             carrier_freq_hz=5.9e9,
         ):
-            self.uplink_bps = uplink_bps
-            self.downlink_bps = downlink_bps
             self.bandwidth_hz = bandwidth_hz
             self.tx_power_dbm = tx_power_dbm
             self.noise_figure_db = noise_figure_db
@@ -309,6 +305,9 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
         sender_without_evidence = step.candidate_vehicles[1]
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_latent"])
         self.assertEqual(sender_without_evidence.shared_latent, [0.0] * 8)
+        self.assertEqual(sender_without_evidence.shared_image_latent_dim, 4)
+        self.assertEqual(sender_without_evidence.shared_text_latent_dim, 4)
+        self.assertEqual(sender_without_evidence.shared_latent_source, "clip_image_text_concat")
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_summary_raw"])
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_summary_semantic"])
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_confidence"])
@@ -528,8 +527,6 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                     required_load_bps=6400.0,
                     link_rate_bps=3200.0 if not self.feasible else 12800.0,
                     shannon_bps=20000.0,
-                    uplink_bps=12800.0,
-                    downlink_bps=12800.0,
                     bandwidth_hz=1e6,
                     snr_db=12.0,
                     feasible=self.feasible,
@@ -554,7 +551,7 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                 self._drop_on_capacity_exceeded = drop_on_capacity_exceeded
                 self._log_dropped_messages = True
                 self.latency_model = DummyLatencyModel(feasible=feasible)
-                self._default_net_res = RUNTIME.NetResource(uplink_bps=12800.0, downlink_bps=12800.0)
+                self._default_net_res = RUNTIME.NetResource(bandwidth_hz=1e6)
                 self._veh_net_res = {}
                 self._in_flight = []
                 self._received = defaultdict(lambda: deque(maxlen=32))
@@ -609,13 +606,132 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
         self.assertEqual(len(dropped_runtime.enqueued), 0)
         self.assertEqual(dropped_runtime._get_current_comm_step_summary()["attempted_message_count"], 1.0)
         self.assertEqual(dropped_runtime._get_current_comm_step_summary()["dropped_message_count"], 1.0)
-        self.assertEqual(dropped_runtime._get_latest_comm_link_analysis(2)["comm_feasible"], 0.0)
+        dropped_stats = dropped_runtime._get_latest_comm_link_analysis(2)
+        self.assertEqual(dropped_stats["comm_feasible"], 0.0)
+        self.assertNotIn("uplink_bps", dropped_stats)
+        self.assertNotIn("downlink_bps", dropped_stats)
 
         pass_runtime = DummyRuntime(drop_on_capacity_exceeded=False, feasible=False)
         pass_runtime._run_group_communication()
         self.assertEqual(len(pass_runtime.enqueued), 1)
         self.assertEqual(pass_runtime._get_current_comm_step_summary()["attempted_message_count"], 1.0)
         self.assertEqual(pass_runtime._get_current_comm_step_summary()["dropped_message_count"], 0.0)
+
+    def test_runtime_normalizes_oversubscribed_bandwidth_before_analysis(self):
+        class DummyActor:
+            def __init__(self, actor_id: int):
+                self.id = actor_id
+
+            def get_transform(self):
+                return types.SimpleNamespace(
+                    location=types.SimpleNamespace(x=0.0, y=0.0),
+                    rotation=types.SimpleNamespace(yaw=0.0),
+                )
+
+            def get_velocity(self):
+                return types.SimpleNamespace(x=0.0, y=0.0)
+
+        class CapturingLatencyModel:
+            overhead_bytes = 64
+
+            def __init__(self):
+                self.calls = []
+
+            def analyze_transmission(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                return types.SimpleNamespace(
+                    required_load_bps=3200.0,
+                    link_rate_bps=6400.0,
+                    shannon_bps=6400.0,
+                    bandwidth_hz=float(kwargs["sender_res"].bandwidth_hz),
+                    snr_db=12.0,
+                    feasible=True,
+                    latency_s=0.05,
+                    distance_m=5.0,
+                )
+
+            def compute_latency_s(self, **kwargs):
+                return 0.05
+
+        class DummyRuntime(RUNTIME.RightTurnAutoRuntimeMixin):
+            def __init__(self):
+                self.ego = DummyActor(1)
+                self.group_vehs = [DummyActor(2), DummyActor(3), DummyActor(4)]
+                self.groups = {0: {1, 2, 3, 4}}
+                self._time_step = 4
+                self._world = types.SimpleNamespace(
+                    _settings=types.SimpleNamespace(fixed_delta_seconds=0.1)
+                )
+                self._collaboration_policy_id = "P3"
+                self._collaboration_bandwidth_floor = 0.1
+                self._drop_on_capacity_exceeded = False
+                self._log_dropped_messages = True
+                self.latency_model = CapturingLatencyModel()
+                self._default_net_res = RUNTIME.NetResource(bandwidth_hz=20e6)
+                self._veh_net_res = {}
+                self._in_flight = []
+                self._received = defaultdict(lambda: deque(maxlen=32))
+                self._actor_cache = {}
+                self._comm_link_analysis_by_sender = {}
+                self._comm_step_summary = {}
+                self._comm_step_summary_step = -1
+                self._policy_prev_comm_summary = {}
+                self.enqueued = []
+
+            def _compute_current_policy_action(self):
+                return self._normalize_runtime_policy_action(
+                    RUNTIME.CollaborationAction(
+                        alpha={2: 1.0, 3: 1.0, 4: 1.0},
+                        nu={2: 1.0, 3: 1.0, 4: 1.0},
+                        bandwidth={2: 0.5, 3: 0.5, 4: 0.5},
+                    )
+                )
+
+            def _advance_policy_send_schedule(self):
+                return {2: True, 3: True, 4: True}
+
+            def _get_current_policy_decision(self):
+                return {"policy_id": "P3", "reason": "fixed_policy_mode", "overridden": False}
+
+            def _compute_current_payload_decisions(self):
+                return {
+                    sender_id: types.SimpleNamespace(
+                        payload_type="tokens",
+                        payload_encoder_id="tokens_v1",
+                        reason="default_tokens",
+                        overridden=False,
+                    )
+                    for sender_id in (2, 3, 4)
+                }
+
+            def _build_group_actor_map(self):
+                return {1: self.ego, 2: self.group_vehs[0], 3: self.group_vehs[1], 4: self.group_vehs[2]}
+
+            def _make_payload(self, sender, payload_decision):
+                return {
+                    "feat": [1.0, 2.0],
+                    "sender_id": int(sender.id),
+                    "payload_type": payload_decision.payload_type,
+                    "payload_encoder_id": payload_decision.payload_encoder_id,
+                    "data": b"payload",
+                    "data_nbytes": 7,
+                }
+
+            def _enqueue_message(self, **kwargs):
+                self.enqueued.append(dict(kwargs))
+
+        runtime = DummyRuntime()
+        runtime._run_group_communication()
+
+        self.assertEqual(len(runtime.enqueued), 3)
+        self.assertEqual(len(runtime.latency_model.calls), 3)
+        for call in runtime.latency_model.calls:
+            self.assertAlmostEqual(call["sender_res"].bandwidth_hz, 20e6 / 3.0)
+            self.assertAlmostEqual(call["receiver_res"].bandwidth_hz, 20e6 / 3.0)
+            self.assertEqual(call["out_degree"], 1)
+            self.assertEqual(call["in_degree"], 1)
+        for item in runtime.enqueued:
+            self.assertAlmostEqual(item["payload"]["policy_action"]["bandwidth"], 1.0 / 3.0)
 
 if __name__ == "__main__":
     unittest.main()
