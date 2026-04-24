@@ -90,8 +90,14 @@ if torch_is_available():
             super().__init__()
             self.config = config
             self.task_stat_dim = 2  # mean + max task relevance per vehicle
+            self.shared_latent_valid_dim = 1
+            self.shared_latent_start = 5
+            self.shared_latent_stop = self.shared_latent_start + int(config.shared_state_dim)
 
-            self.state_input = nn.Linear(config.node_dim + self.task_stat_dim, config.hidden_dim)
+            self.state_input = nn.Linear(
+                config.node_dim + self.task_stat_dim + self.shared_latent_valid_dim,
+                config.hidden_dim,
+            )
             self.action_input = nn.Linear(config.action_dim, config.hidden_dim)
             self.vehicle_exogenous_input = nn.Linear(config.vehicle_exogenous_dim, config.hidden_dim)
             self.ego_state_input = nn.Linear(config.ego_state_dim, config.hidden_dim)
@@ -182,6 +188,7 @@ if torch_is_available():
             task_relevance = _as_tensor(batch["task_relevance"]).float()
             edge_attr = _as_tensor(batch["edge_attr"]).float()
             edge_mask = _as_tensor(batch["edge_mask"]).float()
+            history_shared_latent_mask = _as_tensor(batch.get("history_shared_latent_mask", 1.0)).float()
             history_mask = _as_tensor(batch.get("history_mask", torch.ones(state_node_features.shape[:2]))).float()
             future_action_features = _as_tensor(batch.get("future_action_features", 0.0)).float()
             future_vehicle_exogenous_features = _as_tensor(batch.get("future_vehicle_exogenous_features", 0.0)).float()
@@ -208,6 +215,26 @@ if torch_is_available():
                 edge_index = edge_index[0]
 
             batch_size, history_len, num_nodes, _ = state_node_features.shape
+            if history_shared_latent_mask.dim() == 0 or (
+                history_shared_latent_mask.dim() == 1 and history_shared_latent_mask.numel() == 1
+            ):
+                history_shared_latent_mask = torch.ones(
+                    (batch_size, history_len, num_nodes),
+                    dtype=state_node_features.dtype,
+                    device=state_node_features.device,
+                )
+            elif history_shared_latent_mask.dim() == 2:
+                history_shared_latent_mask = history_shared_latent_mask.unsqueeze(0)
+            history_shared_latent_mask = history_shared_latent_mask.to(
+                dtype=state_node_features.dtype,
+                device=state_node_features.device,
+            )
+            shared_latent_mask_expanded = history_shared_latent_mask.unsqueeze(-1)
+            gated_state_node_features = state_node_features.clone()
+            gated_state_node_features[:, :, :, self.shared_latent_start:self.shared_latent_stop] = (
+                gated_state_node_features[:, :, :, self.shared_latent_start:self.shared_latent_stop]
+                * shared_latent_mask_expanded
+            )
             task_stats = torch.stack(
                 [
                     task_relevance.mean(dim=-1),
@@ -225,7 +252,16 @@ if torch_is_available():
                 x = self.step_fuser(
                     torch.cat(
                         [
-                            self.state_input(torch.cat([state_node_features[:, tidx, :, :], task_stats[:, tidx, :, :]], dim=-1)),
+                            self.state_input(
+                                torch.cat(
+                                    [
+                                        gated_state_node_features[:, tidx, :, :],
+                                        task_stats[:, tidx, :, :],
+                                        history_shared_latent_mask[:, tidx, :].unsqueeze(-1),
+                                    ],
+                                    dim=-1,
+                                )
+                            ),
                             self.action_input(action_features[:, tidx, :, :]),
                             self.vehicle_exogenous_input(vehicle_exogenous_features[:, tidx, :, :]),
                             ego_embed,
@@ -397,6 +433,7 @@ def compute_emulation_loss(
     future_mask = _as_tensor(batch["future_mask"]).float()
     query_mask = _as_tensor(batch["query_mask"]).float()
     future_node_mask = _as_tensor(batch.get("future_node_mask", 1.0)).float()
+    future_shared_latent_mask = _as_tensor(batch.get("future_shared_latent_mask", 1.0)).float()
 
     if sender_collab_target.dim() == 3:
         raw_state_target = raw_state_target.unsqueeze(0)
@@ -410,8 +447,17 @@ def compute_emulation_loss(
             future_node_mask = torch.ones_like(sender_collab_target[:, :, :, 0])
         elif future_node_mask.dim() == 2:
             future_node_mask = future_node_mask.unsqueeze(0)
+        if not torch.is_tensor(batch.get("future_shared_latent_mask")):
+            future_shared_latent_mask = torch.ones_like(sender_collab_target[:, :, :, 0])
+        elif future_shared_latent_mask.dim() == 2:
+            future_shared_latent_mask = future_shared_latent_mask.unsqueeze(0)
+    elif future_shared_latent_mask.dim() == 0 or (
+        future_shared_latent_mask.dim() == 1 and future_shared_latent_mask.numel() == 1
+    ):
+        future_shared_latent_mask = torch.ones_like(future_node_mask)
 
     node_mask = future_mask[:, :, None, None] * future_node_mask[:, :, :, None]
+    shared_state_mask = node_mask * future_shared_latent_mask[:, :, :, None]
     sender_mask = node_mask * query_mask[:, None, None, :]
     ego_mask = future_mask[:, :, None] * query_mask[:, None, :]
 
@@ -425,7 +471,7 @@ def compute_emulation_loss(
     shared_loss = _masked_regression_loss(
         shared_state_pred,
         shared_state_target,
-        node_mask,
+        shared_state_mask,
         loss_type=loss_type,
         delta=delta,
     )

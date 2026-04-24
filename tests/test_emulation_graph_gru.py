@@ -118,6 +118,8 @@ class EmulationGraphGRUTest(unittest.TestCase):
         self.assertEqual(sample["target_sender_gain"].shape, (5, 3, 6))
         self.assertEqual(sample["target_ego_sc"].shape, (5, 6))
         self.assertEqual(sample["future_node_mask"].shape, (5, 3))
+        self.assertEqual(sample["history_shared_latent_mask"].shape, (8, 3))
+        self.assertEqual(sample["future_shared_latent_mask"].shape, (5, 3))
         self.assertEqual(sample["query_mask"].sum(), 6.0)
         self.assertEqual(sample["node_mask"].shape, (8, 3))
         self.assertTrue(np.any(sample["task_relevance"] > 0.0))
@@ -135,7 +137,7 @@ class EmulationGraphGRUTest(unittest.TestCase):
         dataset = DATASET.CanonicalEmulationDataset([episode], history_len=4, horizon=3)
         sample = dataset[6]
         config = MODEL.GraphGRUEmulationConfig(
-            node_dim=sample["node_features"].shape[-1],
+            node_dim=sample["state_node_features"].shape[-1],
             query_dim=sample["query_features"].shape[-1],
             history_len=4,
             horizon=3,
@@ -155,6 +157,71 @@ class EmulationGraphGRUTest(unittest.TestCase):
 
         losses = MODEL.compute_emulation_loss(outputs, sample)
         self.assertTrue(torch.isfinite(losses["loss"]))
+
+    @unittest.skipUnless(MODEL.torch_is_available(), "PyTorch is not installed in this environment.")
+    def test_shared_latent_masks_gate_loss_but_not_node_presence(self):
+        import copy
+        import torch
+
+        episode = SYNTHETIC.generate_synthetic_canonical_episode(
+            scene_type="right_turn",
+            num_steps=12,
+            num_vehicles=3,
+            seed=17,
+        )
+        missing_vehicle = copy.deepcopy(episode.steps[3].candidate_vehicles[0])
+        shared_dim = len(missing_vehicle.shared_latent)
+        self.assertGreater(shared_dim, 0)
+
+        history_vehicle = episode.steps[2].candidate_vehicles[0]
+        history_vehicle.shared_latent = [0.0] * shared_dim
+        history_vehicle.component_valid_mask["shared_latent"] = False
+
+        future_vehicle = episode.steps[3].candidate_vehicles[0]
+        future_vehicle.shared_latent = [0.0] * shared_dim
+        future_vehicle.component_valid_mask["shared_latent"] = False
+
+        dataset = DATASET.CanonicalEmulationDataset([episode], history_len=4, horizon=3)
+        sample = dataset[2]
+        self.assertEqual(float(sample["history_shared_latent_mask"][-1, 0]), 0.0)
+        self.assertEqual(float(sample["future_shared_latent_mask"][0, 0]), 0.0)
+        self.assertEqual(float(sample["future_node_mask"][0, 0]), 1.0)
+
+        config = MODEL.GraphGRUEmulationConfig(
+            node_dim=sample["state_node_features"].shape[-1],
+            query_dim=sample["query_features"].shape[-1],
+            history_len=4,
+            horizon=3,
+            hidden_dim=32,
+            raw_state_dim=sample["target_raw_state"].shape[-1],
+            shared_state_dim=sample["target_shared_state"].shape[-1],
+        )
+        net = MODEL.GraphGRUEmulationModel(config)
+        outputs = net(sample)
+        losses = MODEL.compute_emulation_loss(outputs, sample)
+        self.assertTrue(torch.isfinite(losses["shared_state_loss"]))
+
+        masked_sample = copy.deepcopy(sample)
+        masked_sample["future_shared_latent_mask"] = sample["future_shared_latent_mask"].copy()
+        masked_sample["target_shared_state"] = sample["target_shared_state"].copy()
+        masked_sample["target_shared_state"][0, 0] = 1.0
+        masked_sample["future_shared_latent_mask"][0, 0] = 0.0
+        unmasked_sample = copy.deepcopy(masked_sample)
+        unmasked_sample["future_shared_latent_mask"][0, 0] = 1.0
+
+        masked_losses = MODEL.compute_emulation_loss(outputs, masked_sample)
+        unmasked_losses = MODEL.compute_emulation_loss(outputs, unmasked_sample)
+        self.assertTrue(torch.isfinite(masked_losses["loss"]))
+        self.assertTrue(torch.isfinite(unmasked_losses["loss"]))
+        self.assertAlmostEqual(
+            float(masked_losses["raw_state_loss"]),
+            float(unmasked_losses["raw_state_loss"]),
+            places=6,
+        )
+        self.assertNotEqual(
+            float(masked_losses["shared_state_loss"]),
+            float(unmasked_losses["shared_state_loss"]),
+        )
 
 
 if __name__ == "__main__":

@@ -156,7 +156,8 @@ def pack_vehicle_shared_state_target(vehicle: CandidateVehicleState) -> np.ndarr
     if not vehicle.shared_latent:
         raise ValueError(
             "Episode contains compact-summary-only shared state. "
-            "Strict shared-latent mode requires per-vehicle shared_latent."
+            "Strict shared-latent mode requires per-vehicle shared_latent. "
+            "Please regenerate or re-export the episode with fixed-width shared_latent vectors."
         )
     return np.asarray(vehicle.shared_latent, dtype=np.float32).reshape(-1)
 

@@ -114,7 +114,7 @@ class EmulationVisualizationTest(unittest.TestCase):
         dataset = DATASET.CanonicalEmulationDataset([episode], history_len=4, horizon=3)
         sample = dataset[0]
         model_config = MODEL.GraphGRUEmulationConfig(
-            node_dim=int(sample["node_features"].shape[-1]),
+            node_dim=int(sample["state_node_features"].shape[-1]),
             query_dim=int(sample["query_features"].shape[-1]),
             edge_attr_dim=int(sample["edge_attr"].shape[-1]),
             history_len=4,

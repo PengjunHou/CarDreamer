@@ -196,6 +196,52 @@ class EmulationTrainingTest(unittest.TestCase):
             self.assertTrue(Path(summary["best_checkpoint"]).exists())
             self.assertEqual(summary["num_episodes"], len(POLICY.list_policy_ids()))
 
+    @unittest.skipUnless(TRAINING.torch_is_available(), "PyTorch is required for the training smoke test.")
+    def test_train_one_epoch_with_missing_shared_latent_masks(self):
+        episode = SYNTHETIC.generate_synthetic_canonical_episode(
+            scene_type="right_turn",
+            num_steps=12,
+            num_vehicles=3,
+            seed=23,
+        )
+        shared_dim = len(episode.steps[3].candidate_vehicles[0].shared_latent)
+        episode.steps[2].candidate_vehicles[0].shared_latent = [0.0] * shared_dim
+        episode.steps[2].candidate_vehicles[0].component_valid_mask["shared_latent"] = False
+        episode.steps[3].candidate_vehicles[0].shared_latent = [0.0] * shared_dim
+        episode.steps[3].candidate_vehicles[0].component_valid_mask["shared_latent"] = False
+
+        config = TRAINING.EmulationTrainingConfig(
+            history_len=4,
+            horizon=2,
+            batch_size=2,
+            hidden_dim=16,
+            num_graph_layers=1,
+            report_every=0,
+            device="cpu",
+        )
+        train_dataset, _, _, _ = TRAINING.build_dataset_splits([episode], config)
+        self.assertIsNotNone(train_dataset)
+        loader, _ = TRAINING.build_dataloaders(train_dataset, None, config)
+        batch = next(iter(loader))
+        self.assertIn("history_shared_latent_mask", batch)
+        self.assertIn("future_shared_latent_mask", batch)
+
+        model, _ = TRAINING.make_model_from_dataset(train_dataset, config)
+        optimizer = TRAINING.AdamW(
+            model.parameters(),
+            lr=float(config.learning_rate),
+            weight_decay=float(config.weight_decay),
+        )
+        metrics, _ = TRAINING.train_one_epoch(
+            model,
+            loader,
+            optimizer,
+            device="cpu",
+            config=config,
+        )
+        self.assertIn("shared_state_loss", metrics)
+        self.assertGreaterEqual(float(metrics["shared_state_loss"]), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

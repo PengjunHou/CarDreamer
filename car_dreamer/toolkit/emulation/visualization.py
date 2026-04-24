@@ -358,7 +358,7 @@ def _build_model_from_checkpoint_payload(
     else:
         train_config = dict(payload.get("train_config", {}))
         model_config = GraphGRUEmulationConfig(
-            node_dim=int(np.asarray(sample["node_features"]).shape[-1]),
+            node_dim=int(np.asarray(sample["state_node_features"]).shape[-1]),
             query_dim=int(np.asarray(sample["query_features"]).shape[-1]),
             edge_attr_dim=int(np.asarray(sample["edge_attr"]).shape[-1]),
             hidden_dim=int(train_config.get("hidden_dim", 64)),
