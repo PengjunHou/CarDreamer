@@ -62,44 +62,6 @@ _SCENE_DESCRIPTION_POSITIVE_PATTERNS: Tuple[re.Pattern[str], ...] = (
 
 
 class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
-    def _build_vehicle_shared_latent_payload(
-        self,
-        actor_id: int,
-        *,
-        image: Any,
-        scene_description: str = "",
-    ) -> Dict[str, Any]:
-        mode = str(getattr(self, "_vlm_shared_latent_mode", "")).strip().lower()
-        if mode not in {"clip_image_text_concat", "qwen_hidden_mean_pool", "qwen_hidden_concat"}:
-            return {
-                "shared_latent": [],
-                "shared_image_latent_dim": 0,
-                "shared_text_latent_dim": 0,
-                "shared_latent_source": "",
-                "shared_latent_valid": False,
-                "scene_description": str(scene_description).strip(),
-            }
-
-        image_pil = self._coerce_to_pil_image(image)
-        scene_description = str(scene_description).strip()
-        if image_pil is not None and not scene_description:
-            try:
-                scene_description = self._compute_single_image_description(
-                    image_pil,
-                    cache_key=("scene_description", int(actor_id)),
-                )
-            except Exception:
-                scene_description = ""
-        latent_payload = self._compute_clip_shared_latent(
-            image=image_pil,
-            scene_description=scene_description,
-            cache_key=("shared_latent", int(actor_id)),
-        )
-        return {
-            **latent_payload,
-            "scene_description": scene_description,
-        }
-
     def _runtime_message_to_predictor_dict(self, msg: Any) -> Dict[str, Any]:
         fixed_dt = float(self._config.world.fixed_delta_seconds)
         received_age_steps = max(int(self._time_step) - int(getattr(msg, "created_step", self._time_step)), 0)
@@ -144,11 +106,6 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             transform = actor.get_transform()
             velocity = actor.get_velocity()
             actor_id = int(actor.id)
-            actor_obs = self.group_obs.get(actor_id, {})
-            latent_payload = self._build_vehicle_shared_latent_payload(
-                actor_id,
-                image=actor_obs.get(self._vlm_image_obs_key),
-            )
             policy_action = {}
             payload_action = {}
             runtime_comm_stats = {}
@@ -178,12 +135,6 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                     "payload_action": payload_action,
                     "runtime_comm_stats": runtime_comm_stats,
                     "policy_id": str(shared_meta.get("policy_id", getattr(self, "_collaboration_policy_id", ""))),
-                    "shared_latent": list(latent_payload.get("shared_latent", [])),
-                    "shared_image_latent_dim": int(latent_payload.get("shared_image_latent_dim", 0)),
-                    "shared_text_latent_dim": int(latent_payload.get("shared_text_latent_dim", 0)),
-                    "shared_latent_source": str(latent_payload.get("shared_latent_source", "")),
-                    "shared_latent_valid": bool(latent_payload.get("shared_latent_valid", False)),
-                    "scene_description": str(latent_payload.get("scene_description", "")).strip(),
                 }
             )
         return candidate_vehicle_states

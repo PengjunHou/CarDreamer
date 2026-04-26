@@ -203,11 +203,6 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                     "vehicle_id": 101,
                     "pose": {"x": 8.0, "y": 1.5, "yaw_rad": 0.1},
                     "velocity": {"vx": 5.5, "vy": 0.1},
-                    "shared_latent": [0.1, 0.2, 0.3, 0.4, 0.7, 0.6, 0.5, 0.4],
-                    "shared_image_latent_dim": 4,
-                    "shared_text_latent_dim": 4,
-                    "shared_latent_source": "clip_image_text_concat",
-                    "shared_latent_valid": True,
                     "selected_infos": [
                         {
                             "sender_id": 101,
@@ -236,11 +231,6 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                     "vehicle_id": 202,
                     "pose": {"x": -6.0, "y": -2.0, "yaw_rad": -0.2},
                     "velocity": {"vx": 3.2, "vy": 0.0},
-                    "shared_latent": [0.0] * 8,
-                    "shared_image_latent_dim": 4,
-                    "shared_text_latent_dim": 4,
-                    "shared_latent_source": "clip_image_text_concat",
-                    "shared_latent_valid": False,
                     "selected_infos": [],
                     "window_messages": [
                         {"received_age_s": 0.5, "latency_s": 0.2, "payload_bytes": 256, "distance_m": 6.5},
@@ -281,11 +271,6 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
         self.assertEqual(set(step.ego_sc.keys()), set(question_ids))
 
         sender_with_evidence = step.candidate_vehicles[0]
-        self.assertTrue(sender_with_evidence.component_valid_mask["shared_latent"])
-        self.assertEqual(len(sender_with_evidence.shared_latent), 8)
-        self.assertEqual(sender_with_evidence.shared_image_latent_dim, 4)
-        self.assertEqual(sender_with_evidence.shared_text_latent_dim, 4)
-        self.assertEqual(sender_with_evidence.shared_latent_source, "clip_image_text_concat")
         self.assertTrue(sender_with_evidence.component_valid_mask["shared_summary_raw"])
         self.assertTrue(sender_with_evidence.component_valid_mask["shared_summary_semantic"])
         self.assertGreater(sum(sender_with_evidence.shared_summary_raw), 0.0)
@@ -303,11 +288,6 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
         self.assertEqual(step.communication_stats["dropped_message_count"], 1.0)
 
         sender_without_evidence = step.candidate_vehicles[1]
-        self.assertFalse(sender_without_evidence.component_valid_mask["shared_latent"])
-        self.assertEqual(sender_without_evidence.shared_latent, [0.0] * 8)
-        self.assertEqual(sender_without_evidence.shared_image_latent_dim, 4)
-        self.assertEqual(sender_without_evidence.shared_text_latent_dim, 4)
-        self.assertEqual(sender_without_evidence.shared_latent_source, "clip_image_text_concat")
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_summary_raw"])
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_summary_semantic"])
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_confidence"])
@@ -343,11 +323,6 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                     "vehicle_id": 101,
                     "pose": {"x": 7.0, "y": 0.5, "yaw_rad": 0.0},
                     "velocity": {"vx": 4.0, "vy": 0.0},
-                    "shared_latent": [0.11, 0.22, 0.33, 0.44, 0.55, 0.66, 0.77, 0.88],
-                    "shared_image_latent_dim": 4,
-                    "shared_text_latent_dim": 4,
-                    "shared_latent_source": "clip_image_text_concat",
-                    "shared_latent_valid": True,
                     "selected_infos": [
                         {
                             "sender_id": 101,
@@ -441,11 +416,6 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                     "vehicle_id": 7,
                     "pose": {"x": 4.0, "y": 0.0, "yaw_rad": 0.0},
                     "velocity": {"vx": 0.0, "vy": 0.0},
-                    "shared_latent": [0.0] * 8,
-                    "shared_image_latent_dim": 4,
-                    "shared_text_latent_dim": 4,
-                    "shared_latent_source": "clip_image_text_concat",
-                    "shared_latent_valid": True,
                     "selected_infos": [],
                     "window_messages": [],
                     "shared_source": "raw",
@@ -472,11 +442,6 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
                     "vehicle_id": 7,
                     "pose": {"x": 4.0, "y": 0.0, "yaw_rad": 0.0},
                     "velocity": {"vx": 0.0, "vy": 0.0},
-                    "shared_latent": [0.0] * 8,
-                    "shared_image_latent_dim": 4,
-                    "shared_text_latent_dim": 4,
-                    "shared_latent_source": "clip_image_text_concat",
-                    "shared_latent_valid": True,
                     "selected_infos": [],
                     "window_messages": [],
                     "shared_source": "raw",

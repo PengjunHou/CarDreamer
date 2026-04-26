@@ -192,21 +192,8 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self._vlm_enable_multi_query_scoring = bool(
             getattr(vlm_cfg, "enable_multi_query_scoring", True)
         )
-        self._vlm_shared_latent_mode = str(
-            getattr(vlm_cfg, "shared_latent_mode", "clip_image_text_concat")
-        )
-        self._vlm_shared_latent_model_name = str(
-            getattr(vlm_cfg, "shared_latent_model_name", "openai/clip-vit-large-patch14")
-        )
-        self._vlm_shared_latent_local_files_only = bool(
-            getattr(vlm_cfg, "shared_latent_local_files_only", self._vlm_local_files_only)
-        )
-
         self._vlm_model = None
         self._vlm_processor: Optional[AutoProcessor] = None
-        self._shared_latent_clip_model = None
-        self._shared_latent_clip_processor = None
-        self._shared_latent_text_embedding_cache: Dict[str, Any] = {}
         self._vlm_records: List[Dict[str, Any]] = []
         self._vlm_last_eval: Dict[str, Any] = {}
         self._vlm_step_cache: Dict[str, Any] = {}

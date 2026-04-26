@@ -111,11 +111,6 @@ def build_runtime_emulation_step(
         )
         shared_confidence = float(shared_summary_semantic[3]) if selected_infos else 0.0
         intent_summary = _infer_intent_summary(scene_type, delta_yaw, delta_vel)
-        shared_latent = [float(x) for x in candidate.get("shared_latent", [])]
-        shared_image_latent_dim = int(candidate.get("shared_image_latent_dim", 0))
-        shared_text_latent_dim = int(candidate.get("shared_text_latent_dim", 0))
-        shared_latent_source = str(candidate.get("shared_latent_source", ""))
-        has_shared_latent = bool(candidate.get("shared_latent_valid", False)) and bool(shared_latent)
         task_relevance = {
             query.query_id: compute_task_relevance(sender_region, ego_region, query.required_region)
             for query in queries
@@ -136,10 +131,6 @@ def build_runtime_emulation_step(
                 delta_pos=delta_pos,
                 delta_vel=delta_vel,
                 delta_yaw=delta_yaw,
-                shared_latent=shared_latent,
-                shared_image_latent_dim=shared_image_latent_dim,
-                shared_text_latent_dim=shared_text_latent_dim,
-                shared_latent_source=shared_latent_source,
                 shared_summary_raw=shared_summary_raw,
                 shared_summary_semantic=shared_summary_semantic,
                 shared_confidence=shared_confidence,
@@ -150,7 +141,6 @@ def build_runtime_emulation_step(
                     "delta_pos": True,
                     "delta_vel": True,
                     "delta_yaw": True,
-                    "shared_latent": has_shared_latent,
                     "shared_summary_raw": has_selected_evidence,
                     "shared_summary_semantic": has_selected_evidence,
                     "shared_confidence": has_selected_evidence,
@@ -178,7 +168,6 @@ def build_runtime_emulation_step(
                     "env_step": int(env_step),
                     "shared_source": shared_source,
                     "has_selected_evidence": has_selected_evidence,
-                    "shared_latent_valid": has_shared_latent,
                     "policy_id": str(candidate.get("policy_id", policy_id)),
                     "payload_type": payload_type,
                     "payload_encoder_id": payload_encoder_id,

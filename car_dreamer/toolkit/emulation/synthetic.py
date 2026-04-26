@@ -111,20 +111,6 @@ def generate_synthetic_canonical_episode(
                 float(intent_summary[2]),
                 float(intent_summary[3]),
             ]
-            shared_image_latent = [
-                float(np.clip(pos[0] / 20.0, -1.0, 1.0)),
-                float(np.clip(pos[1] / 10.0, -1.0, 1.0)),
-                float(np.clip(vel[0], -1.0, 1.0)),
-                float(np.clip(vel[1], -1.0, 1.0)),
-            ]
-            shared_text_latent = [
-                float(q_conf),
-                float(np.clip(complementarity, 0.0, 1.0)),
-                float(np.clip(accessibility, 0.0, 1.0)),
-                float(np.clip(distance_m / 25.0, 0.0, 1.0)),
-            ]
-            shared_latent = shared_image_latent + shared_text_latent
-
             # s_collab scalar for policy decisions
             task_relevance_vals: Dict[str, float] = {}
             sender_collab: Dict[str, float] = {}
@@ -148,9 +134,6 @@ def generate_synthetic_canonical_episode(
                 "shared_summary_semantic": shared_summary_semantic,
                 "shared_confidence": q_conf,
                 "intent_summary": intent_summary,
-                "shared_latent": shared_latent,
-                "shared_image_latent_dim": len(shared_image_latent),
-                "shared_text_latent_dim": len(shared_text_latent),
                 "complementarity": complementarity,
                 "accessibility": accessibility,
                 "observable_region": sender_region,
@@ -191,10 +174,6 @@ def generate_synthetic_canonical_episode(
                     delta_pos=v["delta_pos"],
                     delta_vel=v["delta_vel"],
                     delta_yaw=v["delta_yaw"],
-                    shared_latent=v["shared_latent"],
-                    shared_image_latent_dim=v["shared_image_latent_dim"],
-                    shared_text_latent_dim=v["shared_text_latent_dim"],
-                    shared_latent_source="clip_image_text_concat",
                     shared_summary_raw=v["shared_summary_raw"],
                     shared_summary_semantic=v["shared_summary_semantic"],
                     shared_confidence=v["shared_confidence"],
@@ -205,7 +184,6 @@ def generate_synthetic_canonical_episode(
                         "delta_pos": True,
                         "delta_vel": True,
                         "delta_yaw": True,
-                        "shared_latent": True,
                         "shared_summary_raw": True,
                         "shared_summary_semantic": True,
                         "shared_confidence": True,

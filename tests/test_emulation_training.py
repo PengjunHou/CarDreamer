@@ -71,7 +71,7 @@ class EmulationTrainingTest(unittest.TestCase):
         self.assertGreaterEqual(len(val_idx), 1)
         self.assertGreaterEqual(len(train_idx), 1)
 
-    def test_old_vlm_logs_raise_for_strict_shared_latent_mode(self):
+    def test_old_vlm_logs_build_dataset_with_compact_summary(self):
         real_source = TRAINING.EpisodeSource(
             path=str(REPO_ROOT / "data" / "vlm_records_terminated_step_96.json"),
             scene_type="right_turn",
@@ -81,10 +81,11 @@ class EmulationTrainingTest(unittest.TestCase):
         SCHEMA.validate_episode_record(episodes[0])
 
         config = TRAINING.EmulationTrainingConfig(history_len=4, horizon=3, val_ratio=0.5, seed=1)
-        with self.assertRaisesRegex(ValueError, "shared_latent"):
-            TRAINING.build_dataset_splits(episodes, config)
+        train_dataset, val_dataset, _, _ = TRAINING.build_dataset_splits(episodes, config)
+        self.assertIsNotNone(train_dataset)
+        self.assertIsNone(val_dataset)
 
-    def test_build_dataset_splits_from_strict_shared_latent_episodes(self):
+    def test_build_dataset_splits_from_compact_summary_episodes(self):
         episodes = TRAINING.load_episodes_from_sources(
             [],
             synthetic_episodes=2,
@@ -197,18 +198,25 @@ class EmulationTrainingTest(unittest.TestCase):
             self.assertEqual(summary["num_episodes"], len(POLICY.list_policy_ids()))
 
     @unittest.skipUnless(TRAINING.torch_is_available(), "PyTorch is required for the training smoke test.")
-    def test_train_one_epoch_with_missing_shared_latent_masks(self):
+    def test_train_one_epoch_with_compact_summary_shared_state(self):
         episode = SYNTHETIC.generate_synthetic_canonical_episode(
             scene_type="right_turn",
             num_steps=12,
             num_vehicles=3,
             seed=23,
         )
-        shared_dim = len(episode.steps[3].candidate_vehicles[0].shared_latent)
-        episode.steps[2].candidate_vehicles[0].shared_latent = [0.0] * shared_dim
-        episode.steps[2].candidate_vehicles[0].component_valid_mask["shared_latent"] = False
-        episode.steps[3].candidate_vehicles[0].shared_latent = [0.0] * shared_dim
-        episode.steps[3].candidate_vehicles[0].component_valid_mask["shared_latent"] = False
+        episode.steps[2].candidate_vehicles[0].shared_summary_raw = [0.0] * 8
+        episode.steps[2].candidate_vehicles[0].shared_summary_semantic = [0.0] * 8
+        episode.steps[2].candidate_vehicles[0].shared_confidence = 0.0
+        episode.steps[2].candidate_vehicles[0].component_valid_mask["shared_summary_raw"] = False
+        episode.steps[2].candidate_vehicles[0].component_valid_mask["shared_summary_semantic"] = False
+        episode.steps[2].candidate_vehicles[0].component_valid_mask["shared_confidence"] = False
+        episode.steps[3].candidate_vehicles[0].shared_summary_raw = [0.0] * 8
+        episode.steps[3].candidate_vehicles[0].shared_summary_semantic = [0.0] * 8
+        episode.steps[3].candidate_vehicles[0].shared_confidence = 0.0
+        episode.steps[3].candidate_vehicles[0].component_valid_mask["shared_summary_raw"] = False
+        episode.steps[3].candidate_vehicles[0].component_valid_mask["shared_summary_semantic"] = False
+        episode.steps[3].candidate_vehicles[0].component_valid_mask["shared_confidence"] = False
 
         config = TRAINING.EmulationTrainingConfig(
             history_len=4,
@@ -223,8 +231,8 @@ class EmulationTrainingTest(unittest.TestCase):
         self.assertIsNotNone(train_dataset)
         loader, _ = TRAINING.build_dataloaders(train_dataset, None, config)
         batch = next(iter(loader))
-        self.assertIn("history_shared_latent_mask", batch)
-        self.assertIn("future_shared_latent_mask", batch)
+        self.assertNotIn("history_shared_latent_mask", batch)
+        self.assertNotIn("future_shared_latent_mask", batch)
 
         model, _ = TRAINING.make_model_from_dataset(train_dataset, config)
         optimizer = TRAINING.AdamW(

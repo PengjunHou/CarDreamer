@@ -18,7 +18,6 @@ def get_component_valid_mask_layout() -> Tuple[str, ...]:
         "delta_pos",
         "delta_vel",
         "delta_yaw",
-        "shared_latent",
         "shared_summary_raw",
         "shared_summary_semantic",
         "shared_confidence",
@@ -29,20 +28,32 @@ def get_component_valid_mask_layout() -> Tuple[str, ...]:
     )
 
 
-def get_node_feature_layout(shared_latent_dim: int) -> Dict[str, slice]:
+def get_node_feature_layout(shared_state_dim: int) -> Dict[str, slice]:
     """Return named slices for each block in the packed node feature vector."""
     cursor = 0
     layout: Dict[str, slice] = {}
     layout["x_raw"] = slice(cursor, cursor + 5)        # delta_pos(2) + delta_vel(2) + delta_yaw(1)
     cursor += 5
-    layout["shared_latent"] = slice(cursor, cursor + shared_latent_dim)
-    cursor += shared_latent_dim
-    layout["x_shared"] = slice(layout["shared_latent"].start, layout["shared_latent"].stop)
+    layout["shared_state"] = slice(cursor, cursor + shared_state_dim)
+    cursor += shared_state_dim
+    layout["x_shared"] = slice(layout["shared_state"].start, layout["shared_state"].stop)
     layout["x_derived"] = slice(cursor, cursor + 2)    # complementarity + accessibility
     cursor += 2
     layout["action"] = slice(cursor, cursor + 8)       # alpha + nu + bandwidth + beta_one_hot[5]
     cursor += 8
     return layout
+
+
+def pack_vehicle_shared_state_features(vehicle: CandidateVehicleState) -> np.ndarray:
+    return np.concatenate(
+        [
+            np.asarray(vehicle.shared_summary_raw, dtype=np.float32).reshape(-1),
+            np.asarray(vehicle.shared_summary_semantic, dtype=np.float32).reshape(-1),
+            np.asarray([float(vehicle.shared_confidence)], dtype=np.float32),
+            np.asarray(vehicle.intent_summary, dtype=np.float32).reshape(-1),
+        ],
+        axis=0,
+    )
 
 
 def get_vehicle_exogenous_feature_keys() -> Tuple[str, ...]:
@@ -80,7 +91,7 @@ def build_observable_region(
 def pack_vehicle_node_state(vehicle: CandidateVehicleState) -> np.ndarray:
     """Pack all per-vehicle features into a flat float32 vector.
 
-    Layout: [x_raw(5) | shared_latent | x_derived(2) | action(8)]
+    Layout: [x_raw(5) | shared_state_summary(21) | x_derived(2) | action(8)]
 
     The action block (alpha, nu, bandwidth, beta_one_hot) encodes the policy decision u_t
     applied to this vehicle, enabling policy-conditioned dynamics learning.
@@ -97,7 +108,7 @@ def pack_vehicle_node_state(vehicle: CandidateVehicleState) -> np.ndarray:
             ],
             dtype=np.float32,
         ),
-        np.asarray(vehicle.shared_latent, dtype=np.float32).reshape(-1),
+        pack_vehicle_shared_state_features(vehicle),
         np.asarray([float(vehicle.complementarity), float(vehicle.accessibility)], dtype=np.float32),
         np.concatenate(
             [
@@ -123,7 +134,7 @@ def pack_vehicle_state_features(vehicle: CandidateVehicleState) -> np.ndarray:
             ],
             dtype=np.float32,
         ),
-        np.asarray(vehicle.shared_latent, dtype=np.float32).reshape(-1),
+        pack_vehicle_shared_state_features(vehicle),
         np.asarray([float(vehicle.complementarity), float(vehicle.accessibility)], dtype=np.float32),
     ]
     return np.concatenate(blocks, axis=0)
@@ -153,13 +164,7 @@ def pack_vehicle_raw_state_target(vehicle: CandidateVehicleState) -> np.ndarray:
 
 
 def pack_vehicle_shared_state_target(vehicle: CandidateVehicleState) -> np.ndarray:
-    if not vehicle.shared_latent:
-        raise ValueError(
-            "Episode contains compact-summary-only shared state. "
-            "Strict shared-latent mode requires per-vehicle shared_latent. "
-            "Please regenerate or re-export the episode with fixed-width shared_latent vectors."
-        )
-    return np.asarray(vehicle.shared_latent, dtype=np.float32).reshape(-1)
+    return pack_vehicle_shared_state_features(vehicle)
 
 
 def pack_vehicle_exogenous_features(vehicle: CandidateVehicleState) -> np.ndarray:

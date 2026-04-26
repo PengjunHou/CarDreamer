@@ -193,9 +193,6 @@ env:
     score_max_new_tokens: 512
     enable_step_cache: True
     enable_multi_query_scoring: True
-    shared_latent_mode: "qwen_hidden_mean_pool"
-    shared_latent_model_name: "openai/clip-vit-large-patch14"
-    shared_latent_local_files_only: False
 
   communication: # V2V communication global default settings
     group_update_period: 20   # how often to recompute groups (steps)

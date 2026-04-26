@@ -52,10 +52,6 @@ class CandidateVehicleState:
     bandwidth: float = 0.0   # allocated bandwidth (normalized, 0..1)
     payload_type: str = "tokens"
     payload_encoder_id: str = "tokens_v1"
-    shared_latent: List[float] = field(default_factory=list)
-    shared_image_latent_dim: int = 0
-    shared_text_latent_dim: int = 0
-    shared_latent_source: str = ""
 
 
 @dataclass
@@ -122,10 +118,6 @@ def episode_from_dict(payload: Dict[str, Any]) -> CanonicalEpisodeRecord:
                 delta_pos=tuple(item["delta_pos"]),
                 delta_vel=tuple(item["delta_vel"]),
                 delta_yaw=float(item["delta_yaw"]),
-                shared_latent=[float(x) for x in item.get("shared_latent", [])],
-                shared_image_latent_dim=int(item.get("shared_image_latent_dim", 0)),
-                shared_text_latent_dim=int(item.get("shared_text_latent_dim", 0)),
-                shared_latent_source=str(item.get("shared_latent_source", "")),
                 shared_summary_raw=[float(x) for x in item.get("shared_summary_raw", [])],
                 shared_summary_semantic=[float(x) for x in item.get("shared_summary_semantic", [])],
                 shared_confidence=float(item.get("shared_confidence", 0.0)),
@@ -201,12 +193,6 @@ def validate_episode_record(episode: CanonicalEpisodeRecord) -> None:
                 raise ValueError("shared_summary_semantic must be non-empty.")
             if not vehicle.intent_summary:
                 raise ValueError("intent_summary must be non-empty.")
-            if vehicle.shared_latent:
-                expected_dim = int(vehicle.shared_image_latent_dim) + int(vehicle.shared_text_latent_dim)
-                if expected_dim <= 0:
-                    raise ValueError("shared_latent dims must be positive when shared_latent is present.")
-                if len(vehicle.shared_latent) != expected_dim:
-                    raise ValueError("shared_latent length must match image/text latent dims.")
             if not str(vehicle.payload_type or "").strip():
                 raise ValueError("payload_type must be non-empty.")
             if not str(vehicle.payload_encoder_id or "").strip():

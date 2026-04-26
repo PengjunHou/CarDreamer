@@ -59,13 +59,11 @@ class CanonicalEmulationDataset:
         self.history_len = max(int(history_len), 1)
         self.horizon = max(int(horizon), 1)
         self.episodes = list(episodes)
-        self._require_shared_latent_support()
         self.episode_indices = [self._build_episode_index(episode) for episode in self.episodes]
         self.max_nodes = int(max_nodes or max(len(index.node_ids) for index in self.episode_indices))
         self.max_queries = int(max_queries or max(len(index.query_ids) for index in self.episode_indices))
         self.edge_index = build_fully_connected_edge_index(self.max_nodes, include_self=False)
         self.component_mask_dim = len(get_component_valid_mask_layout())
-        self.shared_latent_mask_index = get_component_valid_mask_layout().index("shared_latent")
         (
             self.raw_node_dim,
             self.state_node_dim,
@@ -78,20 +76,6 @@ class CanonicalEmulationDataset:
             self.query_dim,
         ) = self._infer_feature_dims()
         self.samples = self._build_sample_index()
-
-    def _require_shared_latent_support(self) -> None:
-        for episode in self.episodes:
-            for step in episode.steps:
-                for vehicle in step.candidate_vehicles:
-                    if vehicle.shared_latent:
-                        continue
-                    raise ValueError(
-                        "Episode "
-                        f"{episode.episode_id} step {step.step} vehicle {vehicle.vehicle_id} "
-                        "is missing shared_latent. Old compact-summary-only data is not supported "
-                        "in strict shared-latent mode. Please regenerate or re-export "
-                        "with fixed-width shared_latent vectors."
-                    )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -113,7 +97,6 @@ class CanonicalEmulationDataset:
             (self.history_len, self.max_nodes, self.component_mask_dim),
             dtype=np.float32,
         )
-        history_shared_latent_mask = np.zeros((self.history_len, self.max_nodes), dtype=np.float32)
         node_mask = np.zeros((self.history_len, self.max_nodes), dtype=np.float32)
         task_relevance = np.zeros((self.history_len, self.max_nodes, self.max_queries), dtype=np.float32)
         history_mask = np.zeros((self.history_len,), dtype=np.float32)
@@ -145,7 +128,6 @@ class CanonicalEmulationDataset:
                 action_features[slot],
                 vehicle_exogenous_features[slot],
                 component_valid_mask[slot],
-                history_shared_latent_mask[slot],
                 node_mask[slot],
                 task_relevance[slot],
             )
@@ -160,7 +142,6 @@ class CanonicalEmulationDataset:
 
         future_mask = np.zeros((self.horizon,), dtype=np.float32)
         future_node_mask = np.zeros((self.horizon, self.max_nodes), dtype=np.float32)
-        future_shared_latent_mask = np.zeros((self.horizon, self.max_nodes), dtype=np.float32)
         future_action_features = np.zeros((self.horizon, self.max_nodes, self.action_dim), dtype=np.float32)
         future_vehicle_exogenous_features = np.zeros(
             (self.horizon, self.max_nodes, self.vehicle_exogenous_dim),
@@ -193,9 +174,6 @@ class CanonicalEmulationDataset:
                 if slot is None or slot >= self.max_nodes:
                     continue
                 future_node_mask[offset, slot] = 1.0
-                future_shared_latent_mask[offset, slot] = 1.0 if bool(
-                    vehicle.component_valid_mask.get("shared_latent", False)
-                ) else 0.0
                 future_action_features[offset, slot] = pack_vehicle_action_features(vehicle)
                 future_vehicle_exogenous_features[offset, slot] = pack_vehicle_exogenous_features(vehicle)
                 target_raw_state[offset, slot] = pack_vehicle_raw_state_target(vehicle)
@@ -224,7 +202,6 @@ class CanonicalEmulationDataset:
             "ego_state_features": ego_state_features,
             "step_exogenous_features": step_exogenous_features,
             "component_valid_mask": component_valid_mask,
-            "history_shared_latent_mask": history_shared_latent_mask,
             "node_mask": node_mask,
             "edge_index": self.edge_index.copy(),
             "edge_attr": edge_attr,
@@ -234,7 +211,6 @@ class CanonicalEmulationDataset:
             "task_relevance": task_relevance,
             "future_mask": future_mask,
             "future_node_mask": future_node_mask,
-            "future_shared_latent_mask": future_shared_latent_mask,
             "future_action_features": future_action_features,
             "future_vehicle_exogenous_features": future_vehicle_exogenous_features,
             "future_step_exogenous_features": future_step_exogenous_features,
@@ -320,7 +296,6 @@ class CanonicalEmulationDataset:
         action_features: np.ndarray,
         vehicle_exogenous_features: np.ndarray,
         component_valid_mask: np.ndarray,
-        history_shared_latent_mask: np.ndarray,
         node_mask: np.ndarray,
         task_relevance: np.ndarray,
     ) -> None:
@@ -333,7 +308,6 @@ class CanonicalEmulationDataset:
             action_features[slot] = pack_vehicle_action_features(vehicle)
             vehicle_exogenous_features[slot] = pack_vehicle_exogenous_features(vehicle)
             component_valid_mask[slot] = pack_component_valid_mask(vehicle)
-            history_shared_latent_mask[slot] = component_valid_mask[slot, self.shared_latent_mask_index]
             node_mask[slot] = 1.0
             for qidx, query in enumerate(step.queries[: task_relevance.shape[1]]):
                 task_relevance[slot, qidx] = float(vehicle.query_task_relevance.get(query.query_id, 0.0))
