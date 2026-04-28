@@ -60,13 +60,13 @@ class EmulationGraphGRUTest(unittest.TestCase):
 
         vehicle = reloaded.steps[0].candidate_vehicles[0]
         node_feature = FEATURES.pack_vehicle_node_state(vehicle)
-        self.assertEqual(node_feature.shape[0], 36)
+        self.assertEqual(node_feature.shape[0], 35)
         self.assertEqual(len(vehicle.query_task_relevance), len(reloaded.steps[0].queries))
         self.assertEqual(len(vehicle.shared_summary_raw), 8)
         self.assertEqual(len(vehicle.shared_summary_semantic), 8)
         self.assertEqual(len(vehicle.intent_summary), 4)
         shared_summary = FEATURES.pack_vehicle_shared_state_features(vehicle)
-        self.assertEqual(shared_summary.shape[0], 21)
+        self.assertEqual(shared_summary.shape[0], 20)
         self.assertEqual(vehicle.payload_type, "tokens")
 
     def test_adapter_builds_canonical_episode_from_real_vlm_log(self):
@@ -107,11 +107,13 @@ class EmulationGraphGRUTest(unittest.TestCase):
         dataset = DATASET.CanonicalEmulationDataset([episode], history_len=8, horizon=5)
         sample = dataset[9]
 
-        self.assertEqual(sample["node_features"].shape, (8, 3, 36))
-        self.assertEqual(sample["state_node_features"].shape, (8, 3, 28))
+        self.assertEqual(sample["node_features"].shape, (8, 3, 35))
+        self.assertEqual(sample["state_node_features"].shape, (8, 3, 27))
         self.assertEqual(sample["action_features"].shape, (8, 3, 8))
         self.assertEqual(sample["target_raw_state"].shape, (5, 3, 5))
-        self.assertEqual(sample["target_shared_state"].shape, (5, 3, 21))
+        self.assertEqual(sample["target_shared_state"].shape, (5, 3, 20))
+        self.assertEqual(sample["query_features"].shape, (6, 14))
+        self.assertEqual(sample["component_valid_mask"].shape, (8, 3, 9))
         self.assertEqual(sample["task_relevance"].shape, (8, 3, 6))
         self.assertEqual(sample["target_sender_collab"].shape, (5, 3, 6))
         self.assertEqual(sample["target_sender_gain"].shape, (5, 3, 6))
@@ -119,7 +121,18 @@ class EmulationGraphGRUTest(unittest.TestCase):
         self.assertEqual(sample["future_node_mask"].shape, (5, 3))
         self.assertEqual(sample["query_mask"].sum(), 6.0)
         self.assertEqual(sample["node_mask"].shape, (8, 3))
+        self.assertNotIn("future_vehicle_exogenous_features", sample)
+        self.assertNotIn("future_step_exogenous_features", sample)
         self.assertTrue(np.any(sample["task_relevance"] > 0.0))
+
+    def test_task_relevance_keeps_overlap_inside_ego_region(self):
+        sender_region = SCHEMA.RegionBox(center=(0.0, 0.0), size=(4.0, 4.0), yaw=0.0)
+        ego_region = SCHEMA.RegionBox(center=(0.0, 0.0), size=(10.0, 10.0), yaw=0.0)
+        required_region = SCHEMA.RegionBox(center=(0.0, 0.0), size=(2.0, 2.0), yaw=0.0)
+
+        relevance = FEATURES.compute_task_relevance(sender_region, ego_region, required_region, resolution=5)
+
+        self.assertGreater(relevance, 0.0)
 
     @unittest.skipUnless(MODEL.torch_is_available(), "PyTorch is not installed in this environment.")
     def test_model_forward_and_loss(self):
@@ -169,18 +182,14 @@ class EmulationGraphGRUTest(unittest.TestCase):
         history_vehicle = episode.steps[2].candidate_vehicles[0]
         history_vehicle.shared_summary_raw = [0.0] * len(history_vehicle.shared_summary_raw)
         history_vehicle.shared_summary_semantic = [0.0] * len(history_vehicle.shared_summary_semantic)
-        history_vehicle.shared_confidence = 0.0
         history_vehicle.component_valid_mask["shared_summary_raw"] = False
         history_vehicle.component_valid_mask["shared_summary_semantic"] = False
-        history_vehicle.component_valid_mask["shared_confidence"] = False
 
         future_vehicle = episode.steps[3].candidate_vehicles[0]
         future_vehicle.shared_summary_raw = [0.0] * len(future_vehicle.shared_summary_raw)
         future_vehicle.shared_summary_semantic = [0.0] * len(future_vehicle.shared_summary_semantic)
-        future_vehicle.shared_confidence = 0.0
         future_vehicle.component_valid_mask["shared_summary_raw"] = False
         future_vehicle.component_valid_mask["shared_summary_semantic"] = False
-        future_vehicle.component_valid_mask["shared_confidence"] = False
 
         dataset = DATASET.CanonicalEmulationDataset([episode], history_len=4, horizon=3)
         sample = dataset[2]

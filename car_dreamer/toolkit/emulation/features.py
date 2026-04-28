@@ -20,7 +20,6 @@ def get_component_valid_mask_layout() -> Tuple[str, ...]:
         "delta_yaw",
         "shared_summary_raw",
         "shared_summary_semantic",
-        "shared_confidence",
         "intent_summary",
         "complementarity",
         "accessibility",
@@ -49,7 +48,6 @@ def pack_vehicle_shared_state_features(vehicle: CandidateVehicleState) -> np.nda
         [
             np.asarray(vehicle.shared_summary_raw, dtype=np.float32).reshape(-1),
             np.asarray(vehicle.shared_summary_semantic, dtype=np.float32).reshape(-1),
-            np.asarray([float(vehicle.shared_confidence)], dtype=np.float32),
             np.asarray(vehicle.intent_summary, dtype=np.float32).reshape(-1),
         ],
         axis=0,
@@ -91,7 +89,7 @@ def build_observable_region(
 def pack_vehicle_node_state(vehicle: CandidateVehicleState) -> np.ndarray:
     """Pack all per-vehicle features into a flat float32 vector.
 
-    Layout: [x_raw(5) | shared_state_summary(21) | x_derived(2) | action(8)]
+    Layout: [x_raw(5) | shared_state_summary(20) | x_derived(2) | action(8)]
 
     The action block (alpha, nu, bandwidth, beta_one_hot) encodes the policy decision u_t
     applied to this vehicle, enabling policy-conditioned dynamics learning.
@@ -209,20 +207,7 @@ def pack_component_valid_mask(vehicle: CandidateVehicleState) -> np.ndarray:
 
 
 def pack_query_features(query: QueryRecord) -> np.ndarray:
-    region = query.required_region
-    base = np.asarray(query.query_embedding_input, dtype=np.float32).reshape(-1)
-    region_features = np.asarray(
-        [
-            float(region.center[0]),
-            float(region.center[1]),
-            float(region.size[0]),
-            float(region.size[1]),
-            math.cos(float(region.yaw)),
-            math.sin(float(region.yaw)),
-        ],
-        dtype=np.float32,
-    )
-    return np.concatenate([base, region_features], axis=0)
+    return np.asarray(query.query_embedding_input, dtype=np.float32).reshape(-1)
 
 
 def compute_accessibility(distance_m: float, latency_s: float, lambda_d: float = 0.03, lambda_tau: float = 1.25) -> float:
@@ -239,16 +224,11 @@ def compute_complementarity(sender_region: RegionBox, ego_region: RegionBox, eps
 
 
 def compute_task_relevance(sender_region: RegionBox, ego_region: RegionBox, required_region: RegionBox, eps: float = 1e-6, resolution: int = 9) -> float:
+    del ego_region
     sender_points = sample_region_points(sender_region, resolution=resolution)
     if sender_points.size == 0:
         return 0.0
-    sender_additional = sender_points[~_points_in_region(sender_points, ego_region)]
-    if sender_additional.size == 0:
-        return 0.0
-    required_points = sample_region_points(required_region, resolution=resolution)
-    if required_points.size == 0:
-        return 0.0
-    hits = _points_in_region(sender_additional, required_region)
+    hits = _points_in_region(sender_points, required_region)
     return float(hits.mean()) / (1.0 + float(eps))
 
 

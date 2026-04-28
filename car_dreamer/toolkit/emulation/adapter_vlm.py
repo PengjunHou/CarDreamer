@@ -105,7 +105,7 @@ def adapt_vlm_records_to_canonical_episode(
             complementarity = compute_complementarity(sender_region, ego_region)
             accessibility = compute_accessibility(distance_m, latency_s)
 
-            raw_summary, semantic_summary, shared_confidence = _summarize_sender_observations(
+            raw_summary, semantic_summary = _summarize_sender_observations(
                 step_sender_data[sender_id]["per_query"],
             )
             intent_summary = _infer_intent_summary(scene_type, delta_yaw, delta_vel)
@@ -131,7 +131,6 @@ def adapt_vlm_records_to_canonical_episode(
                     delta_yaw=delta_yaw,
                     shared_summary_raw=raw_summary,
                     shared_summary_semantic=semantic_summary,
-                    shared_confidence=shared_confidence,
                     intent_summary=intent_summary,
                     complementarity=complementarity,
                     accessibility=accessibility,
@@ -141,7 +140,6 @@ def adapt_vlm_records_to_canonical_episode(
                         "delta_yaw": True,
                         "shared_summary_raw": bool(raw_summary),
                         "shared_summary_semantic": bool(semantic_summary),
-                        "shared_confidence": True,
                         "intent_summary": True,
                         "complementarity": True,
                         "accessibility": True,
@@ -338,7 +336,7 @@ def _estimate_velocity(
 
 def _summarize_sender_observations(
     per_query_observations: Mapping[str, Mapping[str, Any]]
-) -> Tuple[List[float], List[float], float]:
+) -> Tuple[List[float], List[float]]:
     observations = list(per_query_observations.values())
     visibility_scores = [_safe_float(obs.get("visibility_score")) for obs in observations]
     answerability_scores = [_safe_float(obs.get("answerability_score")) for obs in observations]
@@ -371,8 +369,7 @@ def _summarize_sender_observations(
         float(max(positive_scores, default=0.0)),
         float(max(negative_scores, default=0.0)),
     ]
-    shared_confidence = _safe_mean(confidences, default=0.0)
-    return raw_summary, semantic_summary, shared_confidence
+    return raw_summary, semantic_summary
 
 
 def _infer_intent_summary(

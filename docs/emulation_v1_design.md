@@ -133,7 +133,7 @@
 当前的车辆节点基础状态对应以下分块：
 
 - `x_raw = [delta_pos, delta_vel, delta_yaw]`
-- `x_shared = [shared_summary_raw, shared_summary_semantic, shared_confidence, intent_summary]`
+- `x_shared = [shared_summary_raw, shared_summary_semantic, intent_summary]`
 - `x_derived = [complementarity, accessibility]`
 
 也就是说，基础 node state 中显式包含：
@@ -243,7 +243,7 @@
 4. 由此构造 `delta_pos / delta_vel / delta_yaw`
 5. 基于可观测区域计算 `complementarity / task_relevance`
 6. 基于距离与 latency 计算 `accessibility`
-7. 从 `per_sensor_scores` 汇总 `shared_summary_raw / shared_summary_semantic / shared_confidence`
+7. 从 `per_sensor_scores` 汇总 `shared_summary_raw / shared_summary_semantic`
 8. 从日志中的 `confidence_gain` 与 sender 权重近似恢复 `sender_gain`
 9. 从 `confidence_with_part2` 或 `ego_plus_shared["confidence"]` 恢复 `ego_sc`
 

@@ -35,7 +35,6 @@ class CandidateVehicleState:
     delta_yaw: float
     shared_summary_raw: List[float]
     shared_summary_semantic: List[float]
-    shared_confidence: float
     intent_summary: List[float]
     complementarity: float
     accessibility: float
@@ -120,7 +119,6 @@ def episode_from_dict(payload: Dict[str, Any]) -> CanonicalEpisodeRecord:
                 delta_yaw=float(item["delta_yaw"]),
                 shared_summary_raw=[float(x) for x in item.get("shared_summary_raw", [])],
                 shared_summary_semantic=[float(x) for x in item.get("shared_summary_semantic", [])],
-                shared_confidence=float(item.get("shared_confidence", 0.0)),
                 intent_summary=[float(x) for x in item.get("intent_summary", [])],
                 complementarity=float(item.get("complementarity", 0.0)),
                 accessibility=float(item.get("accessibility", 0.0)),

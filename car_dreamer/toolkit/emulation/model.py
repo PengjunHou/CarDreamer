@@ -35,7 +35,7 @@ class GraphGRUEmulationConfig:
     ego_state_dim: int = 5
     step_exogenous_dim: int = 2
     raw_state_dim: int = 5
-    shared_state_dim: int = 21
+    shared_state_dim: int = 20
 
 
 if torch_is_available():
@@ -128,10 +128,8 @@ if torch_is_available():
             )
 
             self.transition_action = nn.Linear(config.action_dim, config.hidden_dim)
-            self.transition_vehicle_exogenous = nn.Linear(config.vehicle_exogenous_dim, config.hidden_dim)
-            self.transition_step_exogenous = nn.Linear(config.step_exogenous_dim, config.hidden_dim)
-            self.node_transition = nn.GRUCell(config.hidden_dim * 4, config.hidden_dim)
-            self.global_transition = nn.GRUCell(config.hidden_dim * 3, config.hidden_dim)
+            self.node_transition = nn.GRUCell(config.hidden_dim * 3, config.hidden_dim)
+            self.global_transition = nn.GRUCell(config.hidden_dim * 2, config.hidden_dim)
 
             self.query_encoder = nn.Sequential(
                 nn.Linear(config.query_dim, config.hidden_dim),
@@ -187,8 +185,6 @@ if torch_is_available():
             edge_mask = _as_tensor(batch["edge_mask"]).float()
             history_mask = _as_tensor(batch.get("history_mask", torch.ones(state_node_features.shape[:2]))).float()
             future_action_features = _as_tensor(batch.get("future_action_features", 0.0)).float()
-            future_vehicle_exogenous_features = _as_tensor(batch.get("future_vehicle_exogenous_features", 0.0)).float()
-            future_step_exogenous_features = _as_tensor(batch.get("future_step_exogenous_features", 0.0)).float()
 
             if state_node_features.dim() == 3:
                 state_node_features = state_node_features.unsqueeze(0)
@@ -203,8 +199,6 @@ if torch_is_available():
                 edge_mask = edge_mask.unsqueeze(0)
                 history_mask = history_mask.unsqueeze(0)
                 future_action_features = future_action_features.unsqueeze(0)
-                future_vehicle_exogenous_features = future_vehicle_exogenous_features.unsqueeze(0)
-                future_step_exogenous_features = future_step_exogenous_features.unsqueeze(0)
 
             edge_index = _as_tensor(batch["edge_index"]).long()
             if edge_index.dim() == 3:
@@ -294,12 +288,10 @@ if torch_is_available():
             horizon = min(int(self.config.horizon), int(future_action_features.shape[1]))
             for offset in range(horizon):
                 action_emb = self.transition_action(future_action_features[:, offset, :, :])
-                vehicle_exo_emb = self.transition_vehicle_exogenous(future_vehicle_exogenous_features[:, offset, :, :])
-                step_exo_emb = self.transition_step_exogenous(future_step_exogenous_features[:, offset, :])
                 global_expand = global_latent.unsqueeze(1).expand(-1, num_nodes, -1)
 
                 node_transition_in = torch.cat(
-                    [node_latent, action_emb, vehicle_exo_emb, global_expand + step_exo_emb.unsqueeze(1)],
+                    [node_latent, action_emb, global_expand],
                     dim=-1,
                 )
                 node_latent = self.node_transition(
@@ -314,7 +306,6 @@ if torch_is_available():
                 global_transition_in = torch.cat(
                     [
                         pooled_nodes,
-                        step_exo_emb,
                         _masked_mean(action_emb, rollout_mask),
                     ],
                     dim=-1,

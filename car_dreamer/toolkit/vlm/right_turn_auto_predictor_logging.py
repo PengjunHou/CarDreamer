@@ -109,7 +109,6 @@ def build_runtime_emulation_step(
             question_results=question_results,
             question_ids=ordered_question_ids,
         )
-        shared_confidence = float(shared_summary_semantic[3]) if selected_infos else 0.0
         intent_summary = _infer_intent_summary(scene_type, delta_yaw, delta_vel)
         task_relevance = {
             query.query_id: compute_task_relevance(sender_region, ego_region, query.required_region)
@@ -133,7 +132,6 @@ def build_runtime_emulation_step(
                 delta_yaw=delta_yaw,
                 shared_summary_raw=shared_summary_raw,
                 shared_summary_semantic=shared_summary_semantic,
-                shared_confidence=shared_confidence,
                 intent_summary=intent_summary,
                 complementarity=complementarity,
                 accessibility=accessibility,
@@ -143,7 +141,6 @@ def build_runtime_emulation_step(
                     "delta_yaw": True,
                     "shared_summary_raw": has_selected_evidence,
                     "shared_summary_semantic": has_selected_evidence,
-                    "shared_confidence": has_selected_evidence,
                     "intent_summary": True,
                     "complementarity": True,
                     "accessibility": True,
@@ -352,7 +349,13 @@ def _build_shared_summary_semantic(
         )
     if not per_question:
         return [0.0] * SEMANTIC_SHARED_SUMMARY_DIM
-    return [
+    # shared_summary_semantic 的构造是：
+
+    # 对每个 query
+    # 找出这个 sender_id 对应、且 is_ego=False 的 per_sensor_scores
+    # 如果一个 query 下有多个 sensor，就先对这些 sensor 的各项分数求平均
+    # 再跨所有 query 求平均
+    return [            ## TODO：这里对所有query做平均会不会有问题，损失了query之间的差异性
         _mean(row[index] for row in per_question)
         for index in range(SEMANTIC_SHARED_SUMMARY_DIM)
     ]

@@ -143,11 +143,6 @@ class CanonicalEmulationDataset:
         future_mask = np.zeros((self.horizon,), dtype=np.float32)
         future_node_mask = np.zeros((self.horizon, self.max_nodes), dtype=np.float32)
         future_action_features = np.zeros((self.horizon, self.max_nodes, self.action_dim), dtype=np.float32)
-        future_vehicle_exogenous_features = np.zeros(
-            (self.horizon, self.max_nodes, self.vehicle_exogenous_dim),
-            dtype=np.float32,
-        )
-        future_step_exogenous_features = np.zeros((self.horizon, self.step_exogenous_dim), dtype=np.float32)
         target_sender_collab = np.zeros((self.horizon, self.max_nodes, self.max_queries), dtype=np.float32)
         target_sender_gain = np.zeros((self.horizon, self.max_nodes, self.max_queries), dtype=np.float32)
         target_ego_sc = np.zeros((self.horizon, self.max_queries), dtype=np.float32)
@@ -166,7 +161,6 @@ class CanonicalEmulationDataset:
                 break
             future_mask[offset] = 1.0
             step = episode.steps[future_index]
-            future_step_exogenous_features[offset] = pack_step_exogenous_features(step)
             for qidx, query in enumerate(step.queries[: self.max_queries]):
                 target_ego_sc[offset, qidx] = float(step.ego_sc.get(query.query_id, 0.0))
             for vehicle in step.candidate_vehicles:
@@ -175,7 +169,6 @@ class CanonicalEmulationDataset:
                     continue
                 future_node_mask[offset, slot] = 1.0
                 future_action_features[offset, slot] = pack_vehicle_action_features(vehicle)
-                future_vehicle_exogenous_features[offset, slot] = pack_vehicle_exogenous_features(vehicle)
                 target_raw_state[offset, slot] = pack_vehicle_raw_state_target(vehicle)
                 target_shared_state[offset, slot] = pack_vehicle_shared_state_target(vehicle)
                 for qidx, query in enumerate(step.queries[: self.max_queries]):
@@ -212,8 +205,6 @@ class CanonicalEmulationDataset:
             "future_mask": future_mask,
             "future_node_mask": future_node_mask,
             "future_action_features": future_action_features,
-            "future_vehicle_exogenous_features": future_vehicle_exogenous_features,
-            "future_step_exogenous_features": future_step_exogenous_features,
             "target_raw_state": target_raw_state,
             "target_shared_state": target_shared_state,
             "target_sender_collab": target_sender_collab,

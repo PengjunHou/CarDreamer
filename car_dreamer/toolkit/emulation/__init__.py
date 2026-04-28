@@ -97,6 +97,7 @@ from .visualization import (
     SUPPORTED_METRICS,
     main as visualization_main,
     render_ground_truth_topology_sequences,
+    render_region_overview_sequences,
     render_prediction_comparison_sequences,
 )
 
@@ -195,6 +196,7 @@ __all__ = [
     # visualization
     "SUPPORTED_METRICS",
     "render_ground_truth_topology_sequences",
+    "render_region_overview_sequences",
     "render_prediction_comparison_sequences",
     "visualization_main",
 ]

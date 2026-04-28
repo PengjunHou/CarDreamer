@@ -290,7 +290,7 @@ class RightTurnAutoPredictorLoggingTest(unittest.TestCase):
         sender_without_evidence = step.candidate_vehicles[1]
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_summary_raw"])
         self.assertFalse(sender_without_evidence.component_valid_mask["shared_summary_semantic"])
-        self.assertFalse(sender_without_evidence.component_valid_mask["shared_confidence"])
+        self.assertNotIn("shared_confidence", sender_without_evidence.component_valid_mask)
         self.assertEqual(sender_without_evidence.shared_summary_raw, [0.0] * 8)
         self.assertEqual(sender_without_evidence.shared_summary_semantic, [0.0] * 8)
         self.assertEqual(sender_without_evidence.communication_stats["window_message_count"], 1.0)

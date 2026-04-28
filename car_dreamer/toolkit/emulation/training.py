@@ -312,8 +312,6 @@ def emulation_collate_fn(samples: Sequence[Mapping[str, Any]]) -> Dict[str, Any]
         "future_mask",
         "future_node_mask",
         "future_action_features",
-        "future_vehicle_exogenous_features",
-        "future_step_exogenous_features",
         "target_raw_state",
         "target_shared_state",
         "target_sender_collab",

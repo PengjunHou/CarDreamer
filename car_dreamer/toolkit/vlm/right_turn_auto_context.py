@@ -197,7 +197,7 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
                 break
         return {
             **latest,
-            "scene_description": "\n\n".join(parts),
+            "scene_description": "\n\n".join(parts),    ## TODO：这里Merge会不会有问题，损失时间信息
             "text": texts[-1] if texts else "",
             "image": latest_image,
         }

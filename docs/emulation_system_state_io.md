@@ -71,7 +71,6 @@ Each candidate/member vehicle contains four groups of information:
 2. **Shared state**
    - `shared_summary_raw: List[float]` with length `8`
    - `shared_summary_semantic: List[float]` with length `8`
-   - `shared_confidence: float`
    - `intent_summary: List[float]` with length `4`
 
 3. **Derived collaboration state**
@@ -114,11 +113,11 @@ The current shared state is a **compact summary**, not an observation latent vec
 
 It is always packed in this fixed order:
 
-`shared_summary_raw(8) + shared_summary_semantic(8) + shared_confidence(1) + intent_summary(4)`
+`shared_summary_raw(8) + shared_summary_semantic(8) + intent_summary(4)`
 
 Total:
 
-- `shared_state_dim = 21`
+- `shared_state_dim = 20`
 
 ### 3.3 Per-vehicle action state
 
@@ -240,15 +239,9 @@ For each query, the code collects per-sensor scores for the current non-ego send
 
 Then it averages these 8 values across all queries with available sender evidence.
 
-### 4.1.3 `shared_confidence` in runtime
+`query_task_relevance` now measures the fraction of sampled `sender_region` points that fall inside the query's `required_region`. It does not subtract ego-visible overlap; ego-relative novelty is carried separately by `complementarity`.
 
-Runtime `shared_confidence` is:
-
-- `shared_summary_semantic[3]`
-
-That is, it is the averaged semantic `confidence` value. If there is no selected evidence for the sender, it is set to `0.0`.
-
-### 4.1.4 `intent_summary` in runtime
+### 4.1.3 `intent_summary` in runtime
 
 Runtime `intent_summary` has length `4` and is built by `_infer_intent_summary(...)`.
 
@@ -265,7 +258,7 @@ The logic is heuristic:
 - right turn if `scene_type == right_turn` or `delta_yaw < -0.2`
 - stationary if relative speed `< 0.15`
 
-### 4.1.5 Runtime action and communication fields
+### 4.1.4 Runtime action and communication fields
 
 Runtime also writes:
 
@@ -289,7 +282,6 @@ It still produces the same compact-summary shape:
 
 - `shared_summary_raw(8)`
 - `shared_summary_semantic(8)`
-- `shared_confidence(1)`
 - `intent_summary(4)`
 
 But the **semantic meaning is slightly different** from the runtime path.
@@ -320,11 +312,7 @@ The adapter builds an 8D `semantic_summary`:
 7. max `positive_score`
 8. max `negative_score`
 
-### 4.2.3 Adapter `shared_confidence`
-
-The adapter `shared_confidence` is the mean `confidence` over observations.
-
-### 4.2.4 Important note
+### 4.2.3 Important note
 
 Runtime and adapter paths share the same **shape** and field names, but not perfectly identical semantics for every summary dimension. This is important when mixing data from both sources.
 
@@ -350,13 +338,13 @@ For each sample:
 Layout:
 
 - `x_raw(5)`
-- `x_shared(21)`
+- `x_shared(20)`
 - `x_derived(2)`
 - `action(8)`
 
 So:
 
-- `raw_node_dim = 36`
+- `raw_node_dim = 35`
 
 #### `state_node_features`
 
@@ -365,12 +353,12 @@ So:
 Layout:
 
 - `x_raw(5)`
-- `x_shared(21)`
+- `x_shared(20)`
 - `x_derived(2)`
 
 So:
 
-- `node_dim = 28`
+- `node_dim = 27`
 
 This is the node-state tensor that the current model actually consumes.
 
@@ -411,12 +399,11 @@ From `pack_vehicle_shared_state_target(...)`:
 
 - `shared_summary_raw(8)`
 - `shared_summary_semantic(8)`
-- `shared_confidence(1)`
 - `intent_summary(4)`
 
 So:
 
-- `shared_state_dim = 21`
+- `shared_state_dim = 20`
 
 ### 5.3 Dataset sample keys
 
@@ -424,13 +411,13 @@ Current sample keys are:
 
 **History tensors**
 
-- `node_features`: `[H, N, 36]`
-- `state_node_features`: `[H, N, 28]`
+- `node_features`: `[H, N, 35]`
+- `state_node_features`: `[H, N, 27]`
 - `action_features`: `[H, N, 8]`
 - `vehicle_exogenous_features`: `[H, N, 7]`
 - `ego_state_features`: `[H, 5]`
 - `step_exogenous_features`: `[H, 2]`
-- `component_valid_mask`: `[H, N, 10]`
+- `component_valid_mask`: `[H, N, 9]`
 - `node_mask`: `[H, N]`
 - `task_relevance`: `[H, N, Q]`
 - `edge_attr`: `[H, E, 3]`
@@ -448,15 +435,13 @@ Current sample keys are:
 **Future rollout-condition tensors**
 
 - `future_action_features`: `[T, N, 8]`
-- `future_vehicle_exogenous_features`: `[T, N, 7]`
-- `future_step_exogenous_features`: `[T, 2]`
 - `future_mask`: `[T]`
 - `future_node_mask`: `[T, N]`
 
 **Supervision targets**
 
 - `target_raw_state`: `[T, N, 5]`
-- `target_shared_state`: `[T, N, 21]`
+- `target_shared_state`: `[T, N, 20]`
 - `target_sender_collab`: `[T, N, Q]`
 - `target_sender_gain`: `[T, N, Q]`
 - `target_ego_sc`: `[T, Q]`
@@ -489,25 +474,16 @@ The model primarily consumes:
 During future rollout, the model conditions on:
 
 - `future_action_features`
-- `future_vehicle_exogenous_features`
-- `future_step_exogenous_features`
 
 ### 6.3 Query features
 
 Each query feature is built by `pack_query_features(...)` and contains:
 
 - the query embedding input from `QueryRecord.query_embedding_input`
-- the required-region encoding:
-  - center x
-  - center y
-  - size x
-  - size y
-  - `cos(yaw)`
-  - `sin(yaw)`
 
 So:
 
-- `query_dim = len(query_embedding_input) + 6`
+- `query_dim = len(query_embedding_input)`
 
 ### 6.4 Ego features
 
@@ -541,7 +517,7 @@ This keeps `x_t` and `u_t` factored even though the compatibility `node_features
 ### 7.1 State outputs
 
 - `raw_state`: `[B, T, N, 5]`
-- `shared_state`: `[B, T, N, 21]`
+- `shared_state`: `[B, T, N, 20]`
 
 These correspond to:
 
@@ -628,7 +604,7 @@ Available loss weights:
 
 Current default dimensions in `GraphGRUEmulationConfig` are:
 
-- `shared_state_dim = 21`
+- `shared_state_dim = 20`
 - `action_dim = 8`
 - `vehicle_exogenous_dim = 7`
 - `step_exogenous_dim = 2`
@@ -648,7 +624,7 @@ Paper-style conceptual state maps approximately to:
 
 - ego state: `ego_state`
 - per-vehicle raw state: `delta_pos`, `delta_vel`, `delta_yaw`
-- per-vehicle shared state: compact summary `21D`
+- per-vehicle shared state: compact summary `20D`
 - derived collaboration terms: `complementarity`, `accessibility`, `query_task_relevance`
 
 ### 9.2 Action
@@ -687,4 +663,4 @@ The only active shared-state representation is the compact-summary path describe
 2. `derived_complementarity`, `derived_accessibility`, and `derived_task_relevance` are predicted by the model but are not currently supervised with dedicated dataset targets.
 3. `node_features` is retained mainly as a packed compatibility tensor; the active model path uses `state_node_features` plus separate `action_features`.
 4. The document describes the current right-turn collaboration pipeline only.
-5. `shared_state` now exclusively means the 21D compact summary, not any observation latent representation.
+5. `shared_state` now exclusively means the 20D compact summary, not any observation latent representation.

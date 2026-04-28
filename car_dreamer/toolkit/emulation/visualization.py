@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import glob
+import functools
 import math
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
@@ -10,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .dataset import CanonicalEmulationDataset
 from .model import GraphGRUEmulationConfig, GraphGRUEmulationModel, torch_is_available
-from .schema import CanonicalEpisodeRecord, CanonicalStepRecord, episode_from_dict
+from .schema import CanonicalEpisodeRecord, CanonicalStepRecord, QueryRecord, RegionBox, episode_from_dict
 from .training import load_episode_from_path, resolve_device
 
 try:
@@ -21,16 +24,21 @@ except ImportError:  # pragma: no cover - guarded at runtime
 
 SUPPORTED_METRICS: Tuple[str, ...] = ("sender_collab", "sender_gain")
 DEFAULT_CANVAS_SIZE: Tuple[int, int] = (720, 720)
+DEFAULT_REGION_CANVAS_SIZE: Tuple[int, int] = (1800, 1200)
 DEFAULT_EDGE_WIDTH_RANGE: Tuple[float, float] = (2.0, 12.0)
 DEFAULT_EPSILON = 1e-6
 GT_SUBDIR = "gt"
 COMPARE_SUBDIR = "compare"
+REGIONS_SUBDIR = "regions_overview"
+DEFAULT_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+_POLICY_DIR_RE = re.compile(r"^P\d+$", re.IGNORECASE)
 
 _BACKGROUND = (250, 250, 252)
 _PANEL_BACKGROUND = (255, 255, 255)
 _GRID = (226, 229, 235)
 _TITLE = (32, 35, 43)
 _SUBTITLE = (92, 98, 110)
+_MUTED = (130, 138, 150)
 _EGO_FILL = (196, 59, 51)
 _EGO_OUTLINE = (128, 29, 23)
 _MEMBER_FILL = (68, 114, 196)
@@ -40,6 +48,20 @@ _EDGE_COLORS = {
     "sender_collab": (55, 108, 214),
     "sender_gain": (232, 128, 44),
 }
+_MAIN_PANEL_BACKGROUND = (251, 252, 255, 255)
+_CARD_BACKGROUND = (255, 255, 255, 255)
+_CARD_BORDER = (221, 226, 235, 255)
+_EGO_REGION_FILL = (196, 59, 51, 48)
+_EGO_REGION_OUTLINE = (128, 29, 23, 255)
+_MEMBER_REGION_FILL = (68, 114, 196, 34)
+_MEMBER_REGION_OUTLINE = (49, 85, 158, 190)
+_MEMBER_REGION_HIGHLIGHT_FILL = (55, 108, 214, 54)
+_MEMBER_REGION_HIGHLIGHT_OUTLINE = (34, 61, 108, 255)
+_REQUIRED_REGION_FILL = (231, 177, 72, 56)
+_REQUIRED_REGION_OUTLINE = (176, 121, 24, 255)
+_TABLE_HEADER_FILL = (242, 245, 251, 255)
+_TOP_BADGE_FILL = (237, 242, 252, 255)
+_TOP_BADGE_OUTLINE = (205, 215, 234, 255)
 
 
 def render_ground_truth_topology_sequences(
@@ -103,6 +125,51 @@ def render_ground_truth_topology_sequences(
             summary["gif_paths"].append(str(gif_path))
             metric_counts[query_id] = len(frames)
         summary["frame_counts"][metric] = metric_counts
+    return summary
+
+
+def render_region_overview_sequences(
+    episode_source: str | Path | CanonicalEpisodeRecord | Mapping[str, Any],
+    output_dir: str | Path,
+    *,
+    queries: Sequence[str] | None = None,
+    step_start: int | None = None,
+    step_end: int | None = None,
+    gif_duration_ms: int = 180,
+    canvas_size: Tuple[int, int] = DEFAULT_REGION_CANVAS_SIZE,
+    highlight_top_k: int = 3,
+) -> Dict[str, Any]:
+    episode = _coerce_episode(episode_source)
+    output_dir = Path(output_dir)
+    selected_queries = _resolve_queries(episode, queries)
+    selected_steps = _select_step_indices(episode, step_start=step_start, step_end=step_end)
+    summary: Dict[str, Any] = {
+        "mode": "regions_overview",
+        "output_dir": str(output_dir),
+        "frame_counts": {"regions_overview": len(selected_steps)},
+        "gif_paths": [],
+    }
+    sequence_dir = output_dir / REGIONS_SUBDIR
+    sequence_dir.mkdir(parents=True, exist_ok=True)
+    world_bounds = _collect_region_world_bounds(
+        [episode.steps[index] for index in selected_steps],
+        selected_queries,
+    )
+    frames: List[Image.Image] = []
+    for step_index in selected_steps:
+        frame = _render_region_overview_frame(
+            step=episode.steps[step_index],
+            selected_queries=selected_queries,
+            canvas_size=canvas_size,
+            world_bounds=world_bounds,
+            highlight_top_k=max(int(highlight_top_k), 1),
+        )
+        frame_path = sequence_dir / f"step_{step_index:03d}.png"
+        frame.save(frame_path)
+        frames.append(frame)
+    gif_path = sequence_dir / "sequence.gif"
+    _save_gif(frames, gif_path, duration_ms=int(gif_duration_ms))
+    summary["gif_paths"].append(str(gif_path))
     return summary
 
 
@@ -221,8 +288,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Render emulation topology visualizations from canonical episode JSON."
     )
-    parser.add_argument("--episode", required=True)
+    parser.add_argument("--episode", default="")
+    parser.add_argument(
+        "--episode-glob",
+        nargs="+",
+        default=None,
+        help="Glob pattern(s) that expand to episode JSON files for batch rendering.",
+    )
+    parser.add_argument(
+        "--policy-ids",
+        nargs="+",
+        default=None,
+        help="Policy IDs whose episode JSON files should be rendered in batch.",
+    )
+    parser.add_argument(
+        "--policy-root",
+        default="data",
+        help="Root directory searched when resolving --policy-ids.",
+    )
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--view", choices=("topology", "regions"), default="topology")
     parser.add_argument(
         "--metrics",
         nargs="+",
@@ -237,48 +322,152 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--gif-duration-ms", type=int, default=180)
-    parser.add_argument("--canvas-size", nargs=2, type=int, default=list(DEFAULT_CANVAS_SIZE))
+    parser.add_argument("--canvas-size", nargs=2, type=int, default=None)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
-    canvas_size = (int(args.canvas_size[0]), int(args.canvas_size[1]))
-
-    gt_summary = render_ground_truth_topology_sequences(
-        args.episode,
-        args.output_dir,
-        metrics=args.metrics,
-        queries=args.queries,
-        step_start=args.step_start,
-        step_end=args.step_end,
-        gif_duration_ms=int(args.gif_duration_ms),
-        canvas_size=canvas_size,
+    episode_paths = _resolve_cli_episode_paths(
+        episode=args.episode,
+        episode_globs=args.episode_glob,
+        policy_ids=args.policy_ids,
+        policy_root=args.policy_root,
     )
-    print(
-        "[emulation][viz] rendered ground-truth sequences "
-        f"to {gt_summary['output_dir']}"
-    )
+    batch_mode = len(episode_paths) > 1 or bool(args.episode_glob) or bool(args.policy_ids)
+    if args.canvas_size is None:
+        canvas_size = DEFAULT_REGION_CANVAS_SIZE if args.view == "regions" else DEFAULT_CANVAS_SIZE
+    else:
+        canvas_size = (int(args.canvas_size[0]), int(args.canvas_size[1]))
 
-    if args.checkpoint:
-        compare_summary = render_prediction_comparison_sequences(
-            args.episode,
-            args.checkpoint,
-            args.output_dir,
+    for episode_path in episode_paths:
+        render_output_dir = (
+            _build_batch_output_dir(args.output_dir, episode_path) if batch_mode else Path(args.output_dir)
+        )
+
+        if args.view == "regions":
+            region_summary = render_region_overview_sequences(
+                episode_path,
+                render_output_dir,
+                queries=args.queries,
+                step_start=args.step_start,
+                step_end=args.step_end,
+                gif_duration_ms=int(args.gif_duration_ms),
+                canvas_size=canvas_size,
+            )
+            print(
+                "[emulation][viz] rendered region overview sequences "
+                f"for {episode_path} to {region_summary['output_dir']}"
+            )
+            continue
+
+        gt_summary = render_ground_truth_topology_sequences(
+            episode_path,
+            render_output_dir,
             metrics=args.metrics,
             queries=args.queries,
             step_start=args.step_start,
             step_end=args.step_end,
-            history_len=args.history_len,
-            horizon=args.horizon,
-            device=args.device,
             gif_duration_ms=int(args.gif_duration_ms),
             canvas_size=canvas_size,
         )
         print(
-            "[emulation][viz] rendered prediction comparison sequences "
-            f"to {compare_summary['output_dir']}"
+            "[emulation][viz] rendered ground-truth sequences "
+            f"for {episode_path} to {gt_summary['output_dir']}"
         )
+
+        if args.checkpoint:
+            compare_summary = render_prediction_comparison_sequences(
+                episode_path,
+                args.checkpoint,
+                render_output_dir,
+                metrics=args.metrics,
+                queries=args.queries,
+                step_start=args.step_start,
+                step_end=args.step_end,
+                history_len=args.history_len,
+                horizon=args.horizon,
+                device=args.device,
+                gif_duration_ms=int(args.gif_duration_ms),
+                canvas_size=canvas_size,
+            )
+            print(
+                "[emulation][viz] rendered prediction comparison sequences "
+                f"for {episode_path} to {compare_summary['output_dir']}"
+            )
+
+
+def _resolve_cli_episode_paths(
+    *,
+    episode: str,
+    episode_globs: Sequence[str] | None,
+    policy_ids: Sequence[str] | None,
+    policy_root: str | Path,
+) -> List[Path]:
+    has_episode = bool(str(episode).strip())
+    has_glob = bool(episode_globs)
+    has_policy_ids = bool(policy_ids)
+    selected_modes = int(has_episode) + int(has_glob) + int(has_policy_ids)
+    if selected_modes != 1:
+        raise ValueError("Specify exactly one of --episode, --episode-glob, or --policy-ids.")
+
+    if has_episode:
+        episode_path = Path(str(episode)).expanduser()
+        if not episode_path.exists():
+            raise FileNotFoundError(f"Episode file not found: {episode_path}")
+        return [episode_path.resolve()]
+
+    if has_glob:
+        matches: List[Path] = []
+        for pattern in episode_globs or []:
+            matches.extend(Path(path) for path in glob.glob(str(pattern), recursive=True))
+        unique_matches = _dedupe_and_sort_paths(matches)
+        if not unique_matches:
+            raise FileNotFoundError(f"No episode files matched --episode-glob: {list(episode_globs or [])}")
+        return unique_matches
+
+    return _resolve_policy_episode_paths(policy_ids or [], policy_root=policy_root)
+
+
+def _resolve_policy_episode_paths(
+    policy_ids: Sequence[str],
+    *,
+    policy_root: str | Path,
+) -> List[Path]:
+    root = Path(policy_root).expanduser()
+    matches: List[Path] = []
+    missing_policy_ids: List[str] = []
+    for policy_id in policy_ids:
+        normalized_policy_id = str(policy_id).strip()
+        policy_matches = sorted(root.glob(f"**/{normalized_policy_id}/emulation_episode_*.json"))
+        if not policy_matches:
+            missing_policy_ids.append(normalized_policy_id)
+            continue
+        matches.extend(policy_matches)
+    if missing_policy_ids:
+        missing = ", ".join(missing_policy_ids)
+        raise FileNotFoundError(f"No episode files found for policy ids: {missing}")
+    return _dedupe_and_sort_paths(matches)
+
+
+def _dedupe_and_sort_paths(paths: Sequence[Path]) -> List[Path]:
+    return sorted({path.resolve() for path in paths})
+
+
+def _build_batch_output_dir(base_output_dir: str | Path, episode_path: str | Path) -> Path:
+    base = Path(base_output_dir)
+    episode = Path(episode_path)
+    policy_id = _extract_policy_id_from_path(episode)
+    if policy_id:
+        return base / policy_id / episode.stem
+    return base / episode.stem
+
+
+def _extract_policy_id_from_path(path: str | Path) -> str:
+    for parent in Path(path).parents:
+        if _POLICY_DIR_RE.match(parent.name):
+            return parent.name
+    return ""
 
 
 def _coerce_episode(
@@ -514,6 +703,147 @@ def _compute_position_layout(
     }
 
 
+def _collect_region_world_bounds(
+    steps: Sequence[CanonicalStepRecord],
+    query_ids: Sequence[str],
+) -> Dict[str, float]:
+    points: List[Tuple[float, float]] = [(0.0, 0.0)]
+    selected = {str(query_id) for query_id in query_ids}
+    for step in steps:
+        points.extend(_region_corners(step.ego_state.observable_region))
+        for vehicle in step.candidate_vehicles:
+            points.extend(_region_corners(vehicle.observable_region))
+        for query in step.queries:
+            if str(query.query_id) in selected:
+                points.extend(_region_corners(query.required_region))
+    forwards = [float(point[0]) for point in points]
+    rights = [float(point[1]) for point in points]
+    min_forward = min(forwards) - 2.0
+    max_forward = max(forwards) + 2.0
+    min_right = min(rights) - 2.0
+    max_right = max(rights) + 2.0
+    if max_forward - min_forward < 1.0:
+        max_forward += 0.5
+        min_forward -= 0.5
+    if max_right - min_right < 1.0:
+        max_right += 0.5
+        min_right -= 0.5
+    return {
+        "min_forward": float(min_forward),
+        "max_forward": float(max_forward),
+        "min_right": float(min_right),
+        "max_right": float(max_right),
+    }
+
+
+def _make_world_layout(
+    rect: Tuple[int, int, int, int],
+    world_bounds: Mapping[str, float],
+    *,
+    margin: float = 28.0,
+) -> Dict[str, float]:
+    x0, y0, width, height = [float(value) for value in rect]
+    inner_w = max(width - 2.0 * margin, 1.0)
+    inner_h = max(height - 2.0 * margin, 1.0)
+    lateral_span = max(float(world_bounds["max_right"]) - float(world_bounds["min_right"]), 1e-6)
+    forward_span = max(float(world_bounds["max_forward"]) - float(world_bounds["min_forward"]), 1e-6)
+    scale = min(inner_w / lateral_span, inner_h / forward_span)
+    used_w = lateral_span * scale
+    used_h = forward_span * scale
+    offset_x = x0 + margin + 0.5 * (inner_w - used_w)
+    offset_y = y0 + margin + 0.5 * (inner_h - used_h)
+    return {
+        "x0": x0,
+        "y0": y0,
+        "width": width,
+        "height": height,
+        "margin": margin,
+        "scale": scale,
+        "offset_x": offset_x,
+        "offset_y": offset_y,
+        "min_forward": float(world_bounds["min_forward"]),
+        "max_forward": float(world_bounds["max_forward"]),
+        "min_right": float(world_bounds["min_right"]),
+        "max_right": float(world_bounds["max_right"]),
+    }
+
+
+def _project_world_point(
+    point: Tuple[float, float],
+    layout: Mapping[str, float],
+) -> Tuple[float, float]:
+    forward, right = float(point[0]), float(point[1])
+    return (
+        float(layout["offset_x"]) + (right - float(layout["min_right"])) * float(layout["scale"]),
+        float(layout["offset_y"]) + (float(layout["max_forward"]) - forward) * float(layout["scale"]),
+    )
+
+
+def _region_corners(region: RegionBox) -> List[Tuple[float, float]]:
+    half_forward = 0.5 * float(region.size[0])
+    half_right = 0.5 * float(region.size[1])
+    local = [
+        (-half_forward, -half_right),
+        (half_forward, -half_right),
+        (half_forward, half_right),
+        (-half_forward, half_right),
+    ]
+    c = math.cos(float(region.yaw))
+    s = math.sin(float(region.yaw))
+    corners: List[Tuple[float, float]] = []
+    for forward, right in local:
+        corners.append(
+            (
+                float(region.center[0]) + forward * c - right * s,
+                float(region.center[1]) + forward * s + right * c,
+            )
+        )
+    return corners
+
+
+def _draw_region_box(
+    draw: ImageDraw.ImageDraw,
+    *,
+    region: RegionBox,
+    layout: Mapping[str, float],
+    fill: Tuple[int, int, int, int],
+    outline: Tuple[int, int, int, int],
+    width: int,
+) -> None:
+    polygon = [_project_world_point(point, layout) for point in _region_corners(region)]
+    draw.polygon(polygon, fill=fill, outline=outline)
+    draw.line([*polygon, polygon[0]], fill=outline, width=max(int(width), 1), joint="curve")
+
+
+def _draw_heading_arrow(
+    draw: ImageDraw.ImageDraw,
+    *,
+    region: RegionBox,
+    layout: Mapping[str, float],
+    color: Tuple[int, int, int, int],
+    width: int,
+) -> None:
+    length = max(float(region.size[0]) * 0.38, 1.8)
+    tip = (
+        float(region.center[0]) + length * math.cos(float(region.yaw)),
+        float(region.center[1]) + length * math.sin(float(region.yaw)),
+    )
+    start = _project_world_point(tuple(region.center), layout)
+    end = _project_world_point(tip, layout)
+    draw.line((start[0], start[1], end[0], end[1]), fill=color, width=max(int(width), 1))
+    angle = math.atan2(end[1] - start[1], end[0] - start[0])
+    head_len = max(7.0, 0.018 * float(layout["width"]))
+    left = (
+        end[0] - head_len * math.cos(angle - math.pi / 7.0),
+        end[1] - head_len * math.sin(angle - math.pi / 7.0),
+    )
+    right = (
+        end[0] - head_len * math.cos(angle + math.pi / 7.0),
+        end[1] - head_len * math.sin(angle + math.pi / 7.0),
+    )
+    draw.polygon([end, left, right], fill=color)
+
+
 def _extract_step_metric_values(
     step: CanonicalStepRecord,
     metric: str,
@@ -677,6 +1007,431 @@ def _render_topology_panel(
     return panel
 
 
+def _render_region_overview_frame(
+    *,
+    step: CanonicalStepRecord,
+    selected_queries: Sequence[str],
+    canvas_size: Tuple[int, int],
+    world_bounds: Mapping[str, float],
+    highlight_top_k: int,
+) -> Image.Image:
+    width = int(canvas_size[0])
+    height = int(canvas_size[1])
+    image = Image.new("RGBA", (width, height), color=_BACKGROUND + (255,))
+    draw = ImageDraw.Draw(image)
+
+    padding = 28
+    header_h = 86
+    footer_h = 22
+    body_y = padding + header_h
+    body_h = max(height - body_y - padding - footer_h, 1)
+    gap = 24
+    right_w = min(max(int(width * 0.36), 520), width - 360)
+    left_w = max(width - 2 * padding - gap - right_w, 320)
+    left_rect = (padding, body_y, left_w, body_h)
+    right_rect = (padding + left_w + gap, body_y, right_w, body_h)
+    main_layout = _make_world_layout(left_rect, world_bounds, margin=36.0)
+
+    draw.text(
+        (padding, padding),
+        f"Region Overview | step {int(step.step):03d} | scene={step.scene_type}",
+        fill=_TITLE,
+        font=_load_font(28),
+    )
+    draw.text(
+        (padding, padding + 36),
+        f"episode={step.episode_id} | vehicles={len(step.candidate_vehicles)} | queries={len(selected_queries)}",
+        fill=_SUBTITLE,
+        font=_load_font(16),
+    )
+
+    _draw_panel_background(draw, left_rect, radius=20, fill=_MAIN_PANEL_BACKGROUND, outline=_CARD_BORDER)
+    _draw_reference_grid(draw, main_layout, show_scale=True)
+    _draw_main_region_scene(
+        draw,
+        step=step,
+        layout=main_layout,
+        selected_queries=selected_queries,
+        highlight_top_k=highlight_top_k,
+    )
+
+    _draw_query_cards(
+        image,
+        right_rect=right_rect,
+        step=step,
+        selected_queries=selected_queries,
+        world_bounds=world_bounds,
+    )
+
+    draw.text(
+        (padding, height - padding - 14),
+        "All geometry is shown in the ego-centered BEV frame. Query cards share the same world extent.",
+        fill=_MUTED,
+        font=_load_font(13),
+    )
+    return image.convert("RGB")
+
+
+def _draw_main_region_scene(
+    draw: ImageDraw.ImageDraw,
+    *,
+    step: CanonicalStepRecord,
+    layout: Mapping[str, float],
+    selected_queries: Sequence[str],
+    highlight_top_k: int,
+) -> None:
+    x0 = int(layout["x0"])
+    y0 = int(layout["y0"])
+    draw.text((x0 + 18, y0 + 14), "Observable Regions", fill=_TITLE, font=_load_font(22))
+    draw.text(
+        (x0 + 18, y0 + 44),
+        "Ego region in red, member regions in blue, top collaborative members emphasized.",
+        fill=_SUBTITLE,
+        font=_load_font(15),
+    )
+    _draw_region_box(
+        draw,
+        region=step.ego_state.observable_region,
+        layout=layout,
+        fill=_EGO_REGION_FILL,
+        outline=_EGO_REGION_OUTLINE,
+        width=4,
+    )
+    _draw_heading_arrow(
+        draw,
+        region=step.ego_state.observable_region,
+        layout=layout,
+        color=_EGO_REGION_OUTLINE,
+        width=4,
+    )
+    ego_center = _project_world_point((0.0, 0.0), layout)
+    _draw_node(
+        draw,
+        ego_center,
+        radius=12,
+        fill=_EGO_FILL,
+        outline=_EGO_OUTLINE,
+        label="ego",
+    )
+
+    scores = _mean_sender_collab_by_vehicle(step, selected_queries)
+    highlight_ids = {
+        vehicle_id
+        for vehicle_id, _ in sorted(scores.items(), key=lambda item: item[1], reverse=True)[: max(int(highlight_top_k), 0)]
+    }
+    legend_x = x0 + 18
+    legend_y = y0 + int(layout["height"]) - 72
+    _draw_region_legend(draw, (legend_x, legend_y))
+
+    for vehicle in step.candidate_vehicles:
+        vehicle_id = int(vehicle.vehicle_id)
+        is_highlight = vehicle_id in highlight_ids
+        _draw_region_box(
+            draw,
+            region=vehicle.observable_region,
+            layout=layout,
+            fill=_MEMBER_REGION_HIGHLIGHT_FILL if is_highlight else _MEMBER_REGION_FILL,
+            outline=_MEMBER_REGION_HIGHLIGHT_OUTLINE if is_highlight else _MEMBER_REGION_OUTLINE,
+            width=4 if is_highlight else 2,
+        )
+        _draw_heading_arrow(
+            draw,
+            region=vehicle.observable_region,
+            layout=layout,
+            color=_MEMBER_REGION_HIGHLIGHT_OUTLINE if is_highlight else _MEMBER_REGION_OUTLINE,
+            width=3 if is_highlight else 2,
+        )
+        center = _project_world_point(tuple(vehicle.delta_pos), layout)
+        _draw_node(
+            draw,
+            center,
+            radius=10,
+            fill=_MEMBER_FILL,
+            outline=_MEMBER_OUTLINE,
+            label=f"v{vehicle_id}",
+        )
+        if is_highlight:
+            badge_text = f"{scores.get(vehicle_id, 0.0):.3f}"
+            _draw_query_badge(
+                draw,
+                rect=(int(center[0] + 10), int(center[1] - 10), 56, 22),
+                text=badge_text,
+            )
+
+
+def _draw_query_cards(
+    image: Image.Image,
+    *,
+    right_rect: Tuple[int, int, int, int],
+    step: CanonicalStepRecord,
+    selected_queries: Sequence[str],
+    world_bounds: Mapping[str, float],
+) -> None:
+    draw = ImageDraw.Draw(image)
+    x0, y0, width, height = right_rect
+    draw.text((x0, y0 - 34), "Query-conditioned Required Regions", fill=_TITLE, font=_load_font(22))
+    draw.text(
+        (x0, y0 - 10),
+        "Each card highlights one required region and lists per-member metrics.",
+        fill=_SUBTITLE,
+        font=_load_font(15),
+    )
+
+    query_map = {str(query.query_id): query for query in step.queries}
+    query_records = [query_map[query_id] for query_id in selected_queries if query_id in query_map]
+    if not query_records:
+        return
+    cols = 2 if len(query_records) > 1 else 1
+    rows = int(math.ceil(len(query_records) / float(cols)))
+    gap = 14
+    card_w = int((width - gap * (cols - 1)) / cols)
+    card_h = int((height - gap * (rows - 1)) / rows)
+    for index, query in enumerate(query_records):
+        row = index // cols
+        col = index % cols
+        card_rect = (
+            x0 + col * (card_w + gap),
+            y0 + row * (card_h + gap),
+            card_w,
+            card_h,
+        )
+        _draw_query_card(image, step=step, query=query, card_rect=card_rect, world_bounds=world_bounds)
+
+
+def _draw_query_card(
+    image: Image.Image,
+    *,
+    step: CanonicalStepRecord,
+    query: QueryRecord,
+    card_rect: Tuple[int, int, int, int],
+    world_bounds: Mapping[str, float],
+) -> None:
+    draw = ImageDraw.Draw(image)
+    x0, y0, width, height = card_rect
+    _draw_panel_background(draw, card_rect, radius=18, fill=_CARD_BACKGROUND, outline=_CARD_BORDER)
+    title_font = _load_font(16)
+    body_font = _load_font(13)
+    draw.text((x0 + 14, y0 + 12), str(query.query_id), fill=_TITLE, font=title_font)
+    draw.text(
+        (x0 + 14, y0 + 34),
+        f"required center=({query.required_region.center[0]:.1f}, {query.required_region.center[1]:.1f})",
+        fill=_SUBTITLE,
+        font=body_font,
+    )
+
+    inner_y = y0 + 58
+    inner_h = max(height - 72, 1)
+    mini_w = int(width * 0.42)
+    mini_rect = (x0 + 12, inner_y, mini_w, inner_h)
+    table_rect = (x0 + mini_w + 20, inner_y, width - mini_w - 32, inner_h)
+    mini_layout = _make_world_layout(mini_rect, world_bounds, margin=18.0)
+
+    _draw_reference_grid(draw, mini_layout, show_scale=False, draw_labels=False)
+    _draw_region_box(
+        draw,
+        region=step.ego_state.observable_region,
+        layout=mini_layout,
+        fill=(196, 59, 51, 28),
+        outline=(128, 29, 23, 180),
+        width=2,
+    )
+    _draw_region_box(
+        draw,
+        region=query.required_region,
+        layout=mini_layout,
+        fill=_REQUIRED_REGION_FILL,
+        outline=_REQUIRED_REGION_OUTLINE,
+        width=3,
+    )
+    _draw_heading_arrow(
+        draw,
+        region=step.ego_state.observable_region,
+        layout=mini_layout,
+        color=(128, 29, 23, 180),
+        width=2,
+    )
+    top_vehicle_id = _top_sender_for_query(step, str(query.query_id))
+    for vehicle in step.candidate_vehicles:
+        vehicle_id = int(vehicle.vehicle_id)
+        is_top = vehicle_id == top_vehicle_id
+        _draw_region_box(
+            draw,
+            region=vehicle.observable_region,
+            layout=mini_layout,
+            fill=_MEMBER_REGION_HIGHLIGHT_FILL if is_top else (112, 139, 191, 18),
+            outline=_MEMBER_REGION_HIGHLIGHT_OUTLINE if is_top else (102, 129, 176, 120),
+            width=3 if is_top else 1,
+        )
+        center = _project_world_point(tuple(vehicle.delta_pos), mini_layout)
+        draw.ellipse((center[0] - 4, center[1] - 4, center[0] + 4, center[1] + 4), fill=_MEMBER_FILL)
+    _draw_query_badge(draw, rect=(mini_rect[0] + 10, mini_rect[1] + 10, 74, 24), text="need")
+    _draw_query_metrics_table(draw, rect=table_rect, step=step, query_id=str(query.query_id))
+
+
+def _draw_query_metrics_table(
+    draw: ImageDraw.ImageDraw,
+    *,
+    rect: Tuple[int, int, int, int],
+    step: CanonicalStepRecord,
+    query_id: str,
+) -> None:
+    x0, y0, width, height = rect
+    rows = sorted(
+        step.candidate_vehicles,
+        key=lambda vehicle: float(vehicle.sender_collab.get(query_id, 0.0)),
+        reverse=True,
+    )
+    if not rows:
+        draw.text((x0, y0 + 8), "No candidates", fill=_SUBTITLE, font=_load_font(13))
+        return
+
+    header_h = 26
+    draw.rounded_rectangle((x0, y0, x0 + width, y0 + height), radius=12, outline=(233, 236, 242, 255), width=1)
+    draw.rounded_rectangle((x0, y0, x0 + width, y0 + header_h), radius=12, fill=_TABLE_HEADER_FILL)
+    col_fracs = [0.16, 0.16, 0.16, 0.16, 0.36]
+    headers = ["veh", "comp", "acc", "rel", "collab"]
+    col_x = [x0]
+    cursor = float(x0)
+    for frac in col_fracs[:-1]:
+        cursor += float(width) * frac
+        col_x.append(int(round(cursor)))
+    header_font = _load_font(11)
+    text_font = _load_font(11)
+    for index, label in enumerate(headers):
+        cell_x = col_x[index] + 8
+        draw.text((cell_x, y0 + 7), label, fill=_TITLE, font=header_font)
+
+    row_h = max(int((height - header_h - 8) / max(len(rows), 1)), 18)
+    for row_index, vehicle in enumerate(rows):
+        y = y0 + header_h + row_index * row_h
+        if y + row_h > y0 + height:
+            break
+        if row_index % 2 == 0:
+            draw.rectangle((x0 + 1, y, x0 + width - 1, y + row_h), fill=(250, 251, 254, 255))
+        values = [
+            f"v{int(vehicle.vehicle_id)}",
+            f"{float(vehicle.complementarity):.3f}",
+            f"{float(vehicle.accessibility):.3f}",
+            f"{float(vehicle.query_task_relevance.get(query_id, 0.0)):.3f}",
+            f"{float(vehicle.sender_collab.get(query_id, 0.0)):.3f}",
+        ]
+        for index, value in enumerate(values):
+            draw.text((col_x[index] + 8, y + 4), value, fill=_TEXT, font=text_font)
+
+
+def _draw_panel_background(
+    draw: ImageDraw.ImageDraw,
+    rect: Tuple[int, int, int, int],
+    *,
+    radius: int,
+    fill: Tuple[int, int, int, int],
+    outline: Tuple[int, int, int, int],
+) -> None:
+    x0, y0, width, height = rect
+    draw.rounded_rectangle((x0, y0, x0 + width, y0 + height), radius=radius, fill=fill, outline=outline, width=1)
+
+
+def _draw_reference_grid(
+    draw: ImageDraw.ImageDraw,
+    layout: Mapping[str, float],
+    *,
+    show_scale: bool,
+    draw_labels: bool = True,
+) -> None:
+    x0 = float(layout["x0"])
+    y0 = float(layout["y0"])
+    width = float(layout["width"])
+    height = float(layout["height"])
+    draw.rounded_rectangle((x0, y0, x0 + width, y0 + height), radius=18, outline=_CARD_BORDER, width=1)
+    right_ticks = _grid_ticks(float(layout["min_right"]), float(layout["max_right"]), spacing=5.0)
+    forward_ticks = _grid_ticks(float(layout["min_forward"]), float(layout["max_forward"]), spacing=5.0)
+    for right in right_ticks:
+        px = _project_world_point((0.0, right), layout)[0]
+        draw.line((px, y0 + 1, px, y0 + height - 1), fill=(237, 240, 246, 255), width=1)
+        if draw_labels:
+            draw.text((px + 2, y0 + height - 18), f"{int(right)}", fill=_MUTED, font=_load_font(11))
+    for forward in forward_ticks:
+        py = _project_world_point((forward, 0.0), layout)[1]
+        draw.line((x0 + 1, py, x0 + width - 1, py), fill=(237, 240, 246, 255), width=1)
+        if draw_labels:
+            draw.text((x0 + 6, py - 12), f"{int(forward)}", fill=_MUTED, font=_load_font(11))
+    px0, py0 = _project_world_point((0.0, 0.0), layout)
+    draw.line((x0 + 1, py0, x0 + width - 1, py0), fill=(200, 207, 220, 255), width=2)
+    draw.line((px0, y0 + 1, px0, y0 + height - 1), fill=(200, 207, 220, 255), width=2)
+    if draw_labels:
+        draw.text((px0 + 8, y0 + 8), "ego axes", fill=_SUBTITLE, font=_load_font(12))
+    if show_scale:
+        bar_w = 5.0 * float(layout["scale"])
+        bar_x = x0 + 18
+        bar_y = y0 + height - 24
+        draw.line((bar_x, bar_y, bar_x + bar_w, bar_y), fill=_TEXT, width=3)
+        draw.line((bar_x, bar_y - 4, bar_x, bar_y + 4), fill=_TEXT, width=2)
+        draw.line((bar_x + bar_w, bar_y - 4, bar_x + bar_w, bar_y + 4), fill=_TEXT, width=2)
+        draw.text((bar_x + bar_w + 10, bar_y - 9), "5 m", fill=_TEXT, font=_load_font(12))
+
+
+def _draw_region_legend(
+    draw: ImageDraw.ImageDraw,
+    origin: Tuple[int, int],
+) -> None:
+    x0, y0 = int(origin[0]), int(origin[1])
+    items = [
+        ("ego region", _EGO_REGION_OUTLINE),
+        ("member region", _MEMBER_REGION_OUTLINE),
+        ("highlighted member", _MEMBER_REGION_HIGHLIGHT_OUTLINE),
+    ]
+    for index, (label, color) in enumerate(items):
+        y = y0 + index * 18
+        draw.line((x0, y + 7, x0 + 18, y + 7), fill=color, width=3)
+        draw.text((x0 + 26, y), label, fill=_TEXT, font=_load_font(12))
+
+
+def _draw_query_badge(
+    draw: ImageDraw.ImageDraw,
+    *,
+    rect: Tuple[int, int, int, int],
+    text: str,
+) -> None:
+    x0, y0, width, height = rect
+    draw.rounded_rectangle((x0, y0, x0 + width, y0 + height), radius=8, fill=_TOP_BADGE_FILL, outline=_TOP_BADGE_OUTLINE)
+    bbox = draw.textbbox((0, 0), text, font=_load_font(12))
+    draw.text(
+        (x0 + 0.5 * (width - (bbox[2] - bbox[0])), y0 + 0.5 * (height - (bbox[3] - bbox[1])) - 1),
+        text,
+        fill=_TEXT,
+        font=_load_font(12),
+    )
+
+
+def _mean_sender_collab_by_vehicle(
+    step: CanonicalStepRecord,
+    query_ids: Sequence[str],
+) -> Dict[int, float]:
+    means: Dict[int, float] = {}
+    for vehicle in step.candidate_vehicles:
+        values = [float(vehicle.sender_collab.get(query_id, 0.0)) for query_id in query_ids]
+        means[int(vehicle.vehicle_id)] = float(sum(values) / len(values)) if values else 0.0
+    return means
+
+
+def _top_sender_for_query(step: CanonicalStepRecord, query_id: str) -> int | None:
+    if not step.candidate_vehicles:
+        return None
+    top = max(step.candidate_vehicles, key=lambda vehicle: float(vehicle.sender_collab.get(query_id, 0.0)))
+    return int(top.vehicle_id)
+
+
+def _grid_ticks(start: float, end: float, *, spacing: float) -> List[float]:
+    tick_start = math.floor(start / spacing) * spacing
+    tick_end = math.ceil(end / spacing) * spacing
+    values: List[float] = []
+    current = tick_start
+    while current <= tick_end + 1e-6:
+        values.append(float(current))
+        current += spacing
+    return values
+
+
 def _draw_reference_axes(
     draw: ImageDraw.ImageDraw,
     center: Tuple[float, float],
@@ -755,8 +1510,12 @@ def _slugify(name: str) -> str:
     return "".join(safe).strip("_") or "item"
 
 
-def _load_font():
-    return ImageFont.load_default()
+@functools.lru_cache(maxsize=32)
+def _load_font(size: int = 12):
+    try:
+        return ImageFont.truetype(DEFAULT_FONT_PATH, size=max(int(size), 8))
+    except OSError:
+        return ImageFont.load_default()
 
 
 __all__ = [
@@ -764,5 +1523,6 @@ __all__ = [
     "build_arg_parser",
     "main",
     "render_ground_truth_topology_sequences",
+    "render_region_overview_sequences",
     "render_prediction_comparison_sequences",
 ]

@@ -207,16 +207,12 @@ class EmulationTrainingTest(unittest.TestCase):
         )
         episode.steps[2].candidate_vehicles[0].shared_summary_raw = [0.0] * 8
         episode.steps[2].candidate_vehicles[0].shared_summary_semantic = [0.0] * 8
-        episode.steps[2].candidate_vehicles[0].shared_confidence = 0.0
         episode.steps[2].candidate_vehicles[0].component_valid_mask["shared_summary_raw"] = False
         episode.steps[2].candidate_vehicles[0].component_valid_mask["shared_summary_semantic"] = False
-        episode.steps[2].candidate_vehicles[0].component_valid_mask["shared_confidence"] = False
         episode.steps[3].candidate_vehicles[0].shared_summary_raw = [0.0] * 8
         episode.steps[3].candidate_vehicles[0].shared_summary_semantic = [0.0] * 8
-        episode.steps[3].candidate_vehicles[0].shared_confidence = 0.0
         episode.steps[3].candidate_vehicles[0].component_valid_mask["shared_summary_raw"] = False
         episode.steps[3].candidate_vehicles[0].component_valid_mask["shared_summary_semantic"] = False
-        episode.steps[3].candidate_vehicles[0].component_valid_mask["shared_confidence"] = False
 
         config = TRAINING.EmulationTrainingConfig(
             history_len=4,
@@ -233,6 +229,8 @@ class EmulationTrainingTest(unittest.TestCase):
         batch = next(iter(loader))
         self.assertNotIn("history_shared_latent_mask", batch)
         self.assertNotIn("future_shared_latent_mask", batch)
+        self.assertNotIn("future_vehicle_exogenous_features", batch)
+        self.assertNotIn("future_step_exogenous_features", batch)
 
         model, _ = TRAINING.make_model_from_dataset(train_dataset, config)
         optimizer = TRAINING.AdamW(
