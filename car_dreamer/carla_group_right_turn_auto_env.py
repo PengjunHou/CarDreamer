@@ -173,7 +173,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
             except Exception:
                 self._vlm_shared_conf_weights = {}
 
-        self._vlm_importance_distance_tau = float(getattr(vlm_cfg, "importance_distance_tau", 1.0))
+        self._vlm_importance_distance_tau = float(getattr(vlm_cfg, "importance_distance_tau", 20.0))
         self._vlm_importance_region_weight = float(getattr(vlm_cfg, "importance_region_weight", 1.0))
         self._vlm_importance_facing_weight = float(getattr(vlm_cfg, "importance_facing_weight", 1.0))
         self._vlm_importance_distance_weight = float(getattr(vlm_cfg, "importance_distance_weight", 1.0))

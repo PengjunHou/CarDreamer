@@ -785,7 +785,7 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
         half_fov = 0.5 * math.radians(float(self._vlm_sensor_fov_deg))
 
         sensor_keys: List[str] = []
-        weights: List[float] = []
+        logits: List[float] = []
         details: Dict[str, Dict[str, Any]] = {}
 
         for sensor_key, sensor_score in sensor_mean_scores.items():
@@ -798,7 +798,6 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 float(target_point["x"]) - sensor_x,
             )
             angle_diff_target = self._wrap_angle(sensor_yaw_rad - bearing_to_target_rad)
-            facing_alignment = 0.5 * (1.0 + math.cos(angle_diff_target))
             norm = angle_diff_target / max(half_fov, 1e-6)
             if abs(norm) <= 1.0:
                 fov_alignment = 0.5 * (1.0 + math.cos(0.5 * norm * math.pi))
@@ -806,10 +805,10 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 fov_alignment = 0.0
 
             if sensor_score["is_ego"]:
-                region_alignment = 1.0
+                region_base = 1.0
                 distance_alignment = 1.0
             else:
-                region_alignment = 0.5 * (
+                region_base = 0.5 * (
                     1.0
                     + math.cos(
                         self._wrap_angle(float(feats["bearing_from_ego_rad"]) - target_angle)
@@ -817,18 +816,23 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 )
                 distance_alignment = math.exp(-float(feats["distance_m"]) / tau)
 
-            weight = (
-                self._vlm_importance_region_weight * float(region_alignment)
-                * self._vlm_importance_facing_weight * float(facing_alignment)
-                * float(fov_alignment)
-                * self._vlm_importance_distance_weight * float(distance_alignment)
+            region_alignment = region_base * fov_alignment
+            facing_alignment = fov_alignment
+
+            ego_bias = (
+                float(self._vlm_importance_ego_bias)
+                if sensor_score["is_ego"]
+                else 0.0
             )
-            if sensor_score["is_ego"]:
-                weight += float(self._vlm_importance_ego_bias)
-            weight = max(weight, 0.0)
+            logit = (
+                float(self._vlm_importance_region_weight) * float(region_alignment)
+                + float(self._vlm_importance_facing_weight) * float(facing_alignment)
+                + float(self._vlm_importance_distance_weight) * float(distance_alignment)
+                + ego_bias
+            )
 
             sensor_keys.append(sensor_key)
-            weights.append(weight)
+            logits.append(float(logit))
             details[sensor_key] = {
                 **feats,
                 "target_point_x": float(target_point["x"]),
@@ -847,8 +851,18 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 "fov_alignment": float(fov_alignment),
                 "facing_alignment": float(facing_alignment),
                 "distance_alignment": float(distance_alignment),
-                "importance_weight": float(weight),
+                "raw_logit": float(logit),
             }
+
+        if logits:
+            max_logit = max(logits)
+            exps = [math.exp(l - max_logit) for l in logits]
+            denom = sum(exps) or 1.0
+            weights = [e / denom for e in exps]
+        else:
+            weights = []
+        for sensor_key, w in zip(sensor_keys, weights):
+            details[sensor_key]["importance_weight"] = float(w)
 
         per_sensor: Dict[str, Dict[str, Any]] = {}
         per_sender_positive: Dict[int, float] = defaultdict(float)

@@ -12,8 +12,9 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from .dataset import CanonicalEmulationDataset
+from .features import build_observable_region
 from .model import GraphGRUEmulationConfig, GraphGRUEmulationModel, torch_is_available
-from .schema import CanonicalEpisodeRecord, CanonicalStepRecord, QueryRecord, RegionBox, episode_from_dict
+from .schema import CanonicalEpisodeRecord, CanonicalStepRecord, EgoState, QueryRecord, RegionBox, episode_from_dict
 from .training import load_episode_from_path, resolve_device
 
 try:
@@ -30,6 +31,7 @@ DEFAULT_EPSILON = 1e-6
 GT_SUBDIR = "gt"
 COMPARE_SUBDIR = "compare"
 REGIONS_SUBDIR = "regions_overview"
+WORLD_REGIONS_SUBDIR = "regions_overview_world"
 DEFAULT_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 _POLICY_DIR_RE = re.compile(r"^P\d+$", re.IGNORECASE)
 
@@ -173,6 +175,539 @@ def render_region_overview_sequences(
     return summary
 
 
+# --------------------------------------------------------------------------------------
+# World-frame region overview
+# --------------------------------------------------------------------------------------
+
+def _short_query_label(query_id: str) -> str:
+    """Return a compact directional tag (e.g. 'FL') for a query id like 'clg_left_front_vehicle'.
+
+    Falls back to the full id if no directional words are present.
+    """
+    qid = str(query_id).lower()
+    has_left = "left" in qid
+    has_right = "right" in qid
+    has_front = "front" in qid or "forward" in qid
+    has_rear = "rear" in qid or "back" in qid
+    parts = []
+    if has_front:
+        parts.append("F")
+    elif has_rear:
+        parts.append("R")
+    if has_left:
+        parts.append("L")
+    elif has_right:
+        parts.append("R")
+    if not parts:
+        return str(query_id)
+    if len(parts) == 1:
+        # disambiguate single 'R': rear vs right
+        if parts[0] == "R" and has_rear:
+            return "REAR"
+        if parts[0] == "R" and has_right:
+            return "RIGHT"
+        if parts[0] == "F":
+            return "FRONT"
+        if parts[0] == "L":
+            return "LEFT"
+    # F+R alone is ambiguous (front+right vs rear). Disambiguate by checking has_front.
+    if parts == ["F", "R"]:
+        return "FR" if has_front else "RR"
+    return "".join(parts)
+
+
+def _ego_lookahead_from_region(region: RegionBox) -> float:
+    return float(math.hypot(float(region.center[0]), float(region.center[1])))
+
+
+def _vehicle_lookahead_from_region(region: RegionBox, delta_pos: Sequence[float]) -> float:
+    dx = float(region.center[0]) - float(delta_pos[0])
+    dy = float(region.center[1]) - float(delta_pos[1])
+    return float(math.hypot(dx, dy))
+
+
+def _ego_world_region(ego: EgoState) -> RegionBox:
+    lookahead = _ego_lookahead_from_region(ego.observable_region)
+    return build_observable_region(
+        ego.pose_xy,
+        float(ego.yaw),
+        range_m=float(ego.observable_region.size[0]),
+        width_m=float(ego.observable_region.size[1]),
+        lookahead_m=lookahead,
+    )
+
+
+def _vehicle_world_region(vehicle, ego: EgoState) -> RegionBox:
+    world_pos = (
+        float(ego.pose_xy[0]) + float(vehicle.delta_pos[0]),
+        float(ego.pose_xy[1]) + float(vehicle.delta_pos[1]),
+    )
+    world_yaw = float(ego.yaw) + float(vehicle.delta_yaw)
+    lookahead = _vehicle_lookahead_from_region(vehicle.observable_region, vehicle.delta_pos)
+    return build_observable_region(
+        world_pos,
+        world_yaw,
+        range_m=float(vehicle.observable_region.size[0]),
+        width_m=float(vehicle.observable_region.size[1]),
+        lookahead_m=lookahead,
+    )
+
+
+def _query_world_region(query: QueryRecord, ego: EgoState) -> RegionBox:
+    cos_y = math.cos(float(ego.yaw))
+    sin_y = math.sin(float(ego.yaw))
+    cx = float(query.required_region.center[0])
+    cy = float(query.required_region.center[1])
+    wx = float(ego.pose_xy[0]) + cx * cos_y - cy * sin_y
+    wy = float(ego.pose_xy[1]) + cx * sin_y + cy * cos_y
+    return RegionBox(
+        center=(wx, wy),
+        size=tuple(query.required_region.size),
+        yaw=float(query.required_region.yaw) + float(ego.yaw),
+    )
+
+
+def _vehicle_world_position(vehicle, ego: EgoState) -> Tuple[float, float]:
+    return (
+        float(ego.pose_xy[0]) + float(vehicle.delta_pos[0]),
+        float(ego.pose_xy[1]) + float(vehicle.delta_pos[1]),
+    )
+
+
+def _step_world_geometry(
+    step: CanonicalStepRecord,
+) -> Tuple[RegionBox, List[Tuple[int, RegionBox, Tuple[float, float]]], List[Tuple[str, RegionBox]]]:
+    ego_region = _ego_world_region(step.ego_state)
+    vehicles = [
+        (
+            int(vehicle.vehicle_id),
+            _vehicle_world_region(vehicle, step.ego_state),
+            _vehicle_world_position(vehicle, step.ego_state),
+        )
+        for vehicle in step.candidate_vehicles
+    ]
+    queries = [(str(q.query_id), _query_world_region(q, step.ego_state)) for q in step.queries]
+    return ego_region, vehicles, queries
+
+
+def _collect_world_region_bounds(
+    steps: Sequence[CanonicalStepRecord],
+    query_ids: Sequence[str],
+) -> Dict[str, float]:
+    points: List[Tuple[float, float]] = []
+    selected = {str(query_id) for query_id in query_ids}
+    for step in steps:
+        ego_region, vehicles_world, queries_world = _step_world_geometry(step)
+        points.append(tuple(step.ego_state.pose_xy))
+        points.extend(_region_corners(ego_region))
+        for _, region_world, world_pos in vehicles_world:
+            points.append(world_pos)
+            points.extend(_region_corners(region_world))
+        for query_id, region_world in queries_world:
+            if query_id in selected:
+                points.extend(_region_corners(region_world))
+    if not points:
+        points = [(0.0, 0.0)]
+    forwards = [float(p[0]) for p in points]
+    rights = [float(p[1]) for p in points]
+    min_forward = min(forwards) - 4.0
+    max_forward = max(forwards) + 4.0
+    min_right = min(rights) - 4.0
+    max_right = max(rights) + 4.0
+    if max_forward - min_forward < 1.0:
+        max_forward += 0.5
+        min_forward -= 0.5
+    if max_right - min_right < 1.0:
+        max_right += 0.5
+        min_right -= 0.5
+    return {
+        "min_forward": float(min_forward),
+        "max_forward": float(max_forward),
+        "min_right": float(min_right),
+        "max_right": float(max_right),
+    }
+
+
+def render_world_region_overview_sequences(
+    episode_source: str | Path | CanonicalEpisodeRecord | Mapping[str, Any],
+    output_dir: str | Path,
+    *,
+    queries: Sequence[str] | None = None,
+    step_start: int | None = None,
+    step_end: int | None = None,
+    gif_duration_ms: int = 180,
+    canvas_size: Tuple[int, int] = DEFAULT_REGION_CANVAS_SIZE,
+    highlight_top_k: int = 3,
+) -> Dict[str, Any]:
+    """Render each step's regions in the world coordinate frame.
+
+    Unlike `render_region_overview_sequences`, ego does NOT stay at the origin.
+    The camera covers the full world span of the episode and ego moves
+    along its actual trajectory (e.g. through a right turn). Useful for
+    sanity-checking that ego motion and shared sensor positioning look right.
+    """
+    episode = _coerce_episode(episode_source)
+    output_dir = Path(output_dir)
+    selected_queries = _resolve_queries(episode, queries)
+    selected_steps = _select_step_indices(episode, step_start=step_start, step_end=step_end)
+    summary: Dict[str, Any] = {
+        "mode": "regions_overview_world",
+        "output_dir": str(output_dir),
+        "frame_counts": {"regions_overview_world": len(selected_steps)},
+        "gif_paths": [],
+    }
+    sequence_dir = output_dir / WORLD_REGIONS_SUBDIR
+    sequence_dir.mkdir(parents=True, exist_ok=True)
+    world_bounds = _collect_world_region_bounds(
+        [episode.steps[index] for index in selected_steps],
+        selected_queries,
+    )
+    frames: List[Image.Image] = []
+    for step_index in selected_steps:
+        frame = _render_world_region_frame(
+            step=episode.steps[step_index],
+            selected_queries=selected_queries,
+            canvas_size=canvas_size,
+            world_bounds=world_bounds,
+            highlight_top_k=max(int(highlight_top_k), 1),
+        )
+        frame_path = sequence_dir / f"step_{step_index:03d}.png"
+        frame.save(frame_path)
+        frames.append(frame)
+    gif_path = sequence_dir / "sequence.gif"
+    _save_gif(frames, gif_path, duration_ms=int(gif_duration_ms))
+    summary["gif_paths"].append(str(gif_path))
+    return summary
+
+
+def _render_world_region_frame(
+    *,
+    step: CanonicalStepRecord,
+    selected_queries: Sequence[str],
+    canvas_size: Tuple[int, int],
+    world_bounds: Mapping[str, float],
+    highlight_top_k: int,
+) -> Image.Image:
+    width = int(canvas_size[0])
+    height = int(canvas_size[1])
+    image = Image.new("RGBA", (width, height), color=_BACKGROUND + (255,))
+    draw = ImageDraw.Draw(image)
+
+    padding = 28
+    header_h = 86
+    footer_h = 22
+    body_y = padding + header_h
+    body_h = max(height - body_y - padding - footer_h, 1)
+    gap = 24
+    right_w = min(max(int(width * 0.36), 520), width - 360)
+    left_w = max(width - 2 * padding - gap - right_w, 320)
+    left_rect = (padding, body_y, left_w, body_h)
+    right_rect = (padding + left_w + gap, body_y, right_w, body_h)
+    main_layout = _make_world_layout(left_rect, world_bounds, margin=36.0)
+
+    draw.text(
+        (padding, padding),
+        f"World-frame Regions | step {int(step.step):03d} | scene={step.scene_type}",
+        fill=_TITLE,
+        font=_load_font(28),
+    )
+    ego = step.ego_state
+    draw.text(
+        (padding, padding + 36),
+        (
+            f"episode={step.episode_id} | ego_world=({ego.pose_xy[0]:.1f}, {ego.pose_xy[1]:.1f}) "
+            f"| ego_yaw={math.degrees(float(ego.yaw)):.1f}deg | vehicles={len(step.candidate_vehicles)}"
+        ),
+        fill=_SUBTITLE,
+        font=_load_font(16),
+    )
+
+    _draw_panel_background(draw, left_rect, radius=20, fill=_MAIN_PANEL_BACKGROUND, outline=_CARD_BORDER)
+    _draw_reference_grid(draw, main_layout, show_scale=True)
+    _draw_world_region_scene(
+        draw,
+        step=step,
+        layout=main_layout,
+        selected_queries=selected_queries,
+        highlight_top_k=highlight_top_k,
+    )
+
+    _draw_world_query_cards(
+        image,
+        right_rect=right_rect,
+        step=step,
+        selected_queries=selected_queries,
+        world_bounds=world_bounds,
+    )
+
+    draw.text(
+        (padding, height - padding - 14),
+        "Geometry is in the world frame; ego moves along its real trajectory.",
+        fill=_MUTED,
+        font=_load_font(13),
+    )
+    return image.convert("RGB")
+
+
+def _draw_world_query_cards(
+    image: Image.Image,
+    *,
+    right_rect: Tuple[int, int, int, int],
+    step: CanonicalStepRecord,
+    selected_queries: Sequence[str],
+    world_bounds: Mapping[str, float],
+) -> None:
+    draw = ImageDraw.Draw(image)
+    x0, y0, width, height = right_rect
+    draw.text((x0, y0 - 34), "Query-conditioned Required Regions (world)", fill=_TITLE, font=_load_font(22))
+    draw.text(
+        (x0, y0 - 10),
+        "Each card shows one required region in the world frame and lists per-member metrics.",
+        fill=_SUBTITLE,
+        font=_load_font(15),
+    )
+
+    query_map = {str(query.query_id): query for query in step.queries}
+    query_records = [query_map[qid] for qid in selected_queries if qid in query_map]
+    if not query_records:
+        return
+    cols = 2 if len(query_records) > 1 else 1
+    rows = int(math.ceil(len(query_records) / float(cols)))
+    gap = 14
+    card_w = int((width - gap * (cols - 1)) / cols)
+    card_h = int((height - gap * (rows - 1)) / rows)
+
+    ego_world_region, vehicles_world, queries_world = _step_world_geometry(step)
+    query_world_map = {qid: region for qid, region in queries_world}
+
+    for index, query in enumerate(query_records):
+        row = index // cols
+        col = index % cols
+        card_rect = (
+            x0 + col * (card_w + gap),
+            y0 + row * (card_h + gap),
+            card_w,
+            card_h,
+        )
+        _draw_world_query_card(
+            image,
+            step=step,
+            query=query,
+            ego_world_region=ego_world_region,
+            vehicles_world=vehicles_world,
+            query_required_world=query_world_map.get(str(query.query_id)),
+            card_rect=card_rect,
+            world_bounds=world_bounds,
+        )
+
+
+def _draw_world_query_card(
+    image: Image.Image,
+    *,
+    step: CanonicalStepRecord,
+    query: QueryRecord,
+    ego_world_region: RegionBox,
+    vehicles_world: Sequence[Tuple[int, RegionBox, Tuple[float, float]]],
+    query_required_world: RegionBox | None,
+    card_rect: Tuple[int, int, int, int],
+    world_bounds: Mapping[str, float],
+) -> None:
+    draw = ImageDraw.Draw(image)
+    x0, y0, width, height = card_rect
+    _draw_panel_background(draw, card_rect, radius=18, fill=_CARD_BACKGROUND, outline=_CARD_BORDER)
+    title_font = _load_font(16)
+    body_font = _load_font(13)
+    draw.text((x0 + 14, y0 + 12), str(query.query_id), fill=_TITLE, font=title_font)
+    if query_required_world is not None:
+        draw.text(
+            (x0 + 14, y0 + 34),
+            (
+                f"required (world)=({query_required_world.center[0]:.1f}, "
+                f"{query_required_world.center[1]:.1f})"
+            ),
+            fill=_SUBTITLE,
+            font=body_font,
+        )
+
+    inner_y = y0 + 58
+    inner_h = max(height - 72, 1)
+    mini_w = int(width * 0.42)
+    mini_rect = (x0 + 12, inner_y, mini_w, inner_h)
+    table_rect = (x0 + mini_w + 20, inner_y, width - mini_w - 32, inner_h)
+    mini_layout = _make_world_layout(mini_rect, world_bounds, margin=18.0)
+
+    _draw_reference_grid(draw, mini_layout, show_scale=False, draw_labels=False)
+    _draw_region_box(
+        draw,
+        region=ego_world_region,
+        layout=mini_layout,
+        fill=(196, 59, 51, 28),
+        outline=(128, 29, 23, 180),
+        width=2,
+    )
+    if query_required_world is not None:
+        _draw_region_box(
+            draw,
+            region=query_required_world,
+            layout=mini_layout,
+            fill=_REQUIRED_REGION_FILL,
+            outline=_REQUIRED_REGION_OUTLINE,
+            width=3,
+        )
+    _draw_heading_arrow(
+        draw,
+        region=ego_world_region,
+        layout=mini_layout,
+        color=(128, 29, 23, 180),
+        width=2,
+    )
+    top_vehicle_id = _top_sender_for_query(step, str(query.query_id))
+    for vehicle_id, region_world, world_pos in vehicles_world:
+        is_top = vehicle_id == top_vehicle_id
+        _draw_region_box(
+            draw,
+            region=region_world,
+            layout=mini_layout,
+            fill=_MEMBER_REGION_HIGHLIGHT_FILL if is_top else (112, 139, 191, 18),
+            outline=_MEMBER_REGION_HIGHLIGHT_OUTLINE if is_top else (102, 129, 176, 120),
+            width=3 if is_top else 1,
+        )
+        center = _project_world_point(world_pos, mini_layout)
+        draw.ellipse((center[0] - 4, center[1] - 4, center[0] + 4, center[1] + 4), fill=_MEMBER_FILL)
+    _draw_query_badge(draw, rect=(mini_rect[0] + 10, mini_rect[1] + 10, 74, 24), text="need")
+    _draw_query_metrics_table(draw, rect=table_rect, step=step, query_id=str(query.query_id))
+
+
+def _draw_world_region_scene(
+    draw: ImageDraw.ImageDraw,
+    *,
+    step: CanonicalStepRecord,
+    layout: Mapping[str, float],
+    selected_queries: Sequence[str],
+    highlight_top_k: int,
+) -> None:
+    x0 = int(layout["x0"])
+    y0 = int(layout["y0"])
+    draw.text((x0 + 18, y0 + 14), "Observable Regions (world frame)", fill=_TITLE, font=_load_font(22))
+    draw.text(
+        (x0 + 18, y0 + 44),
+        "Ego region in red, member regions in blue, top collaborative members emphasized.",
+        fill=_SUBTITLE,
+        font=_load_font(15),
+    )
+
+    ego_world_region, vehicles_world, queries_world = _step_world_geometry(step)
+
+    selected = {str(qid) for qid in selected_queries}
+    label_font = _load_font(15)
+    for query_id, region_world in queries_world:
+        if query_id not in selected:
+            continue
+        _draw_region_box(
+            draw,
+            region=region_world,
+            layout=layout,
+            fill=_REQUIRED_REGION_FILL,
+            outline=_REQUIRED_REGION_OUTLINE,
+            width=2,
+        )
+        label_text = _short_query_label(query_id)
+        if label_text:
+            cx, cy = _project_world_point(tuple(region_world.center), layout)
+            try:
+                bbox = draw.textbbox((0, 0), label_text, font=label_font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            except AttributeError:
+                tw, th = (8 * len(label_text), 14)
+            pad = 4
+            draw.rounded_rectangle(
+                (
+                    cx - tw / 2 - pad,
+                    cy - th / 2 - pad,
+                    cx + tw / 2 + pad,
+                    cy + th / 2 + pad,
+                ),
+                radius=6,
+                fill=(255, 248, 224, 220),
+                outline=_REQUIRED_REGION_OUTLINE,
+                width=1,
+            )
+            draw.text(
+                (cx - tw / 2, cy - th / 2),
+                label_text,
+                fill=(110, 75, 12),
+                font=label_font,
+            )
+
+    _draw_region_box(
+        draw,
+        region=ego_world_region,
+        layout=layout,
+        fill=_EGO_REGION_FILL,
+        outline=_EGO_REGION_OUTLINE,
+        width=4,
+    )
+    _draw_heading_arrow(
+        draw,
+        region=ego_world_region,
+        layout=layout,
+        color=_EGO_REGION_OUTLINE,
+        width=4,
+    )
+    ego_center = _project_world_point(tuple(step.ego_state.pose_xy), layout)
+    _draw_node(
+        draw,
+        ego_center,
+        radius=12,
+        fill=_EGO_FILL,
+        outline=_EGO_OUTLINE,
+        label="ego",
+    )
+
+    scores = _mean_sender_collab_by_vehicle(step, selected_queries)
+    highlight_ids = {
+        vid
+        for vid, _ in sorted(scores.items(), key=lambda item: item[1], reverse=True)[: max(int(highlight_top_k), 0)]
+    }
+    legend_x = x0 + 18
+    legend_y = y0 + int(layout["height"]) - 72
+    _draw_region_legend(draw, (legend_x, legend_y))
+
+    for vehicle_id, region_world, world_pos in vehicles_world:
+        is_highlight = vehicle_id in highlight_ids
+        _draw_region_box(
+            draw,
+            region=region_world,
+            layout=layout,
+            fill=_MEMBER_REGION_HIGHLIGHT_FILL if is_highlight else _MEMBER_REGION_FILL,
+            outline=_MEMBER_REGION_HIGHLIGHT_OUTLINE if is_highlight else _MEMBER_REGION_OUTLINE,
+            width=4 if is_highlight else 2,
+        )
+        _draw_heading_arrow(
+            draw,
+            region=region_world,
+            layout=layout,
+            color=_MEMBER_REGION_HIGHLIGHT_OUTLINE if is_highlight else _MEMBER_REGION_OUTLINE,
+            width=3 if is_highlight else 2,
+        )
+        center = _project_world_point(world_pos, layout)
+        _draw_node(
+            draw,
+            center,
+            radius=10,
+            fill=_MEMBER_FILL,
+            outline=_MEMBER_OUTLINE,
+            label=f"v{vehicle_id}",
+        )
+        if is_highlight:
+            badge_text = f"{scores.get(vehicle_id, 0.0):.3f}"
+            _draw_query_badge(
+                draw,
+                rect=(int(center[0] + 10), int(center[1] - 10), 56, 22),
+                text=badge_text,
+            )
+
+
 def render_prediction_comparison_sequences(
     episode_source: str | Path | CanonicalEpisodeRecord | Mapping[str, Any],
     checkpoint_path: str | Path,
@@ -307,7 +842,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Root directory searched when resolving --policy-ids.",
     )
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--view", choices=("topology", "regions"), default="topology")
+    parser.add_argument(
+        "--view",
+        choices=("topology", "regions", "world-regions"),
+        default="topology",
+    )
     parser.add_argument(
         "--metrics",
         nargs="+",
@@ -336,7 +875,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     batch_mode = len(episode_paths) > 1 or bool(args.episode_glob) or bool(args.policy_ids)
     if args.canvas_size is None:
-        canvas_size = DEFAULT_REGION_CANVAS_SIZE if args.view == "regions" else DEFAULT_CANVAS_SIZE
+        if args.view in ("regions", "world-regions"):
+            canvas_size = DEFAULT_REGION_CANVAS_SIZE
+        else:
+            canvas_size = DEFAULT_CANVAS_SIZE
     else:
         canvas_size = (int(args.canvas_size[0]), int(args.canvas_size[1]))
 
@@ -358,6 +900,22 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(
                 "[emulation][viz] rendered region overview sequences "
                 f"for {episode_path} to {region_summary['output_dir']}"
+            )
+            continue
+
+        if args.view == "world-regions":
+            world_summary = render_world_region_overview_sequences(
+                episode_path,
+                render_output_dir,
+                queries=args.queries,
+                step_start=args.step_start,
+                step_end=args.step_end,
+                gif_duration_ms=int(args.gif_duration_ms),
+                canvas_size=canvas_size,
+            )
+            print(
+                "[emulation][viz] rendered world-frame region sequences "
+                f"for {episode_path} to {world_summary['output_dir']}"
             )
             continue
 
