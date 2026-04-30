@@ -73,7 +73,7 @@ def adapt_vlm_records_to_canonical_episode(
             raise ValueError(f"Could not infer ego pose for step {step}.")
 
         ego_velocity = _estimate_velocity(sensor_tracks["ego_pose"], step, dt)
-        ego_region = build_observable_region((0.0, 0.0), 0.0, range_m=16.0, width_m=9.0, lookahead_m=8.0)
+        ego_region = build_observable_region((0.0, 0.0), 0.0, range_m=24.0, width_m=12.0, lookahead_m=12.0)
         ego_state = EgoState(
             pose_xy=(float(ego_pose["x"]), float(ego_pose["y"])),
             velocity_xy=ego_velocity,

@@ -72,17 +72,17 @@ def make_required_region(scene_type: str, query_id: str) -> RegionBox:
             return RegionBox(center=(2.0, 3.5), size=(12.0, 4.0), yaw=0.0)
         return RegionBox(center=(14.0, 0.0), size=(18.0, 5.0), yaw=0.0)
     if "left_rear" in qid:
-        return RegionBox(center=(-8.0, -3.0), size=(10.0, 4.0), yaw=0.0)
+        return RegionBox(center=(-12.0, -4.0), size=(15.0, 5.0), yaw=0.0)
     if "right_rear" in qid:
-        return RegionBox(center=(-8.0, 3.0), size=(10.0, 4.0), yaw=0.0)
+        return RegionBox(center=(-12.0, 4.0), size=(15.0, 5.0), yaw=0.0)
     if "right_front" in qid:
-        return RegionBox(center=(10.0, 3.0), size=(12.0, 4.0), yaw=0.0)
+        return RegionBox(center=(15.0, 4.0), size=(18.0, 5.0), yaw=0.0)
     if "left_front" in qid:
-        return RegionBox(center=(10.0, -3.0), size=(12.0, 4.0), yaw=0.0)
+        return RegionBox(center=(15.0, -4.0), size=(18.0, 5.0), yaw=0.0)
     if "rear" in qid:
-        return RegionBox(center=(-8.0, 0.0), size=(10.0, 4.5), yaw=0.0)
+        return RegionBox(center=(-12.0, 0.0), size=(15.0, 6.0), yaw=0.0)
     if "front" in qid or "forward" in qid:
-        return RegionBox(center=(14.0, 0.0), size=(18.0, 5.0), yaw=0.0)
+        return RegionBox(center=(21.0, 0.0), size=(27.0, 6.0), yaw=0.0)
     return RegionBox(center=(8.0, 0.0), size=(12.0, 4.0), yaw=0.0)
 
 

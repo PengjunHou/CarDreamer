@@ -831,8 +831,15 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 + ego_bias
             )
 
+            # Hard spatial gate: when there is no spatial overlap with the target
+            # (region_alignment is region_base * fov_alignment, so it is also 0
+            # whenever fov_alignment is), the sender cannot physically observe
+            # this query. Force its softmax weight to 0 by setting logit to -inf.
+            spatial_gate = float(region_alignment * fov_alignment)
+            spatially_gated = spatial_gate < 1e-3
+
             sensor_keys.append(sensor_key)
-            logits.append(float(logit))
+            logits.append(float("-inf") if spatially_gated else float(logit))
             details[sensor_key] = {
                 **feats,
                 "target_point_x": float(target_point["x"]),
@@ -851,14 +858,24 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 "fov_alignment": float(fov_alignment),
                 "facing_alignment": float(facing_alignment),
                 "distance_alignment": float(distance_alignment),
+                "spatial_gate": spatial_gate,
+                "spatially_gated": bool(spatially_gated),
                 "raw_logit": float(logit),
             }
 
         if logits:
-            max_logit = max(logits)
-            exps = [math.exp(l - max_logit) for l in logits]
-            denom = sum(exps) or 1.0
-            weights = [e / denom for e in exps]
+            finite_logits = [l for l in logits if not math.isinf(l)]
+            if finite_logits:
+                max_logit = max(finite_logits)
+                exps = [
+                    math.exp(l - max_logit) if not math.isinf(l) else 0.0
+                    for l in logits
+                ]
+                denom = sum(exps) or 1.0
+                weights = [e / denom for e in exps]
+            else:
+                # Every sensor was spatially gated out — nothing can contribute.
+                weights = [0.0 for _ in logits]
         else:
             weights = []
         for sensor_key, w in zip(sensor_keys, weights):

@@ -76,9 +76,9 @@ def get_step_exogenous_feature_keys() -> Tuple[str, ...]:
 def build_observable_region(
     delta_pos: Sequence[float],
     delta_yaw: float,
-    range_m: float = 18.0,
-    width_m: float = 10.0,
-    lookahead_m: float = 7.0,
+    range_m: float = 27.0,
+    width_m: float = 13.0,
+    lookahead_m: float = 11.0,
 ) -> RegionBox:
     dx, dy = float(delta_pos[0]), float(delta_pos[1])
     forward = (math.cos(float(delta_yaw)), math.sin(float(delta_yaw)))
