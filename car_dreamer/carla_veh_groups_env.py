@@ -95,20 +95,23 @@ class CarlaVehGroupsEnv(CarlaWptFixedEnv):
         self._default_net_res = NetResource(bandwidth_hz=bandwidth_hz)
 
         # Latency model
-        proc_delay_s = float(getattr(comm_cfg, "proc_delay_s", 0.0005))
-        proc_delay_per_kb_s = float(getattr(comm_cfg, "proc_delay_per_kb_s", 0.0001))
-        distance_decay_m = float(getattr(comm_cfg, "distance_decay_m", 60.0))
-        min_rate_factor = float(getattr(comm_cfg, "min_rate_factor", 0.2))
+        overhead_base_s = float(getattr(comm_cfg, "overhead_base_s", 0.030))
+        overhead_per_kb_s = float(getattr(comm_cfg, "overhead_per_kb_s", 0.0015))
+        pathloss_model = str(getattr(comm_cfg, "pathloss_model", "urban_los"))
+        margin_db = float(getattr(comm_cfg, "margin_db", 10.0))
+        margin_sigma_db = float(getattr(comm_cfg, "margin_sigma_db", 0.0))
         jitter_s = float(getattr(comm_cfg, "jitter_s", 0.0))
+        overhead_bytes = int(getattr(comm_cfg, "overhead_bytes", 64))
 
         self.latency_model: LatencyModel = SimpleWirelessLatency(
-            proc_delay_s=proc_delay_s,
-            proc_delay_per_kb_s=proc_delay_per_kb_s,
-            distance_decay_m=distance_decay_m,
-            min_rate_factor=min_rate_factor,
+            overhead_base_s=overhead_base_s,
+            overhead_per_kb_s=overhead_per_kb_s,
+            pathloss_model=pathloss_model,
+            margin_db=margin_db,
+            margin_sigma_db=margin_sigma_db,
             jitter_s=jitter_s,
             rng=self._rng,
-            overhead_bytes=64,  # You can adjust overhead_bytes as needed
+            overhead_bytes=overhead_bytes,
         )
 
         # Optional hook to build your cooperative perception payload

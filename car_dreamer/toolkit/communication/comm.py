@@ -194,60 +194,79 @@ class LatencyModel:
         raise NotImplementedError
 
 
+_PATHLOSS_COEFS: Dict[str, Tuple[float, float, float]] = {
+    # name: (intercept_db, beta_d, gamma_fc) for PL = intercept + beta_d*log10(d_m) + gamma_fc*log10(fc_GHz)
+    # 3GPP TR 37.885 V2V channel models.
+    "urban_los":   (38.77, 16.7, 18.2),
+    "urban_nlos":  (36.85, 30.0, 18.9),
+    "highway_los": (32.40, 20.0, 20.0),
+}
+
+
 class SimpleWirelessLatency(LatencyModel):
     """
-    A simple V2V latency model:
-        latency = processing_delay(payload_size) + tx_time
+    Two-segment V2V latency model:
+        latency = t_overhead + t_tx + jitter
+        t_overhead  = overhead_base_s + overhead_per_kb_s * payload_kb
+        t_tx        = 8 * payload_bytes / shannon_bps
+        shannon_bps = B_alloc * log2(1 + SNR_linear)
+        SNR_dB      = Pt - PL(d, fc) - N0(B_alloc) - margin_db
+        PL(d, fc)   = intercept + beta_d * log10(d_m) + gamma_fc * log10(fc_GHz)
 
-    tx_time is computed using a Shannon-capacity-like rate:
-      C = B * log2(1 + SNR)
+    `t_overhead` lumps all application-layer / MAC-layer overhead that is
+    insensitive to the physical channel (encoding, serialization, decoding,
+    resource selection). `t_tx` carries the SNR-driven part of the latency
+    and is the only term that depends on distance and bandwidth allocation.
 
-    Where:
-        - Effective bandwidth B uses the sender/receiver bandwidth shares
-          allocated by policy, then applies distance degradation:
-          B = min(sender_B, receiver_B) * distance_factor
-        - SNR is estimated with a free-space path loss + noise floor model:
-            Pr(dBm) = Pt(dBm) - FSPL(dB)
-            N(dBm)  = -174 + 10log10(B) + NF
-            SNR(dB) = Pr - N
+    `pathloss_model` selects the 3GPP coefficients (urban_los, urban_nlos,
+    highway_los). `margin_db` lumps shadow fading / vehicle blockage / RF
+    implementation losses into one configurable knob; if `margin_sigma_db`
+    is positive, the margin is sampled per call as N(margin_db, sigma^2).
 
-    The `out_degree`/`in_degree` arguments are kept for API compatibility,
-    but the current member->ego runtime path no longer applies degree-based
-    contention after policy allocation. distance_factor is retained to capture
-    non-ideal attenuation/conditions.
+    The `out_degree`/`in_degree` arguments are kept for API compatibility
+    but no longer applied after policy bandwidth allocation. Bandwidth
+    sharing across selected members must come from the upstream allocator
+    (each `NetResource` carries that member's already-allocated share).
     """
 
     def __init__(
         self,
-        base_rtt_s: float = 0.0,
-        proc_delay_s: float = 0.0005,
-        proc_delay_per_kb_s: float = 0.0001,
-        distance_decay_m: float = 100.0,
-        min_rate_factor: float = 0.2,
+        overhead_base_s: float = 0.030,
+        overhead_per_kb_s: float = 0.0015,
+        pathloss_model: str = "urban_los",
+        margin_db: float = 10.0,
+        margin_sigma_db: float = 0.0,
         jitter_s: float = 0.0,
         rng: Optional[random.Random] = None,
-        overhead_bytes: int = 120,
+        overhead_bytes: int = 64,
     ):
-        # Deprecated: kept only for backward-compatible construction.
-        # The fixed RTT contribution is intentionally removed from latency.
-        self.base_rtt_s = 0.0
-        self._legacy_base_rtt_s = float(base_rtt_s)
-        self.proc_delay_s = float(proc_delay_s)
-        self.proc_delay_per_kb_s = float(proc_delay_per_kb_s)
-        self.distance_decay_m = float(distance_decay_m)
-        self.min_rate_factor = float(min_rate_factor)
+        self.overhead_base_s = float(overhead_base_s)
+        self.overhead_per_kb_s = float(overhead_per_kb_s)
+        if pathloss_model not in _PATHLOSS_COEFS:
+            raise ValueError(
+                f"unknown pathloss_model={pathloss_model!r}; expected one of {list(_PATHLOSS_COEFS)}"
+            )
+        self.pathloss_model = str(pathloss_model)
+        self._pathloss_coefs = _PATHLOSS_COEFS[self.pathloss_model]
+        self.margin_db = float(margin_db)
+        self.margin_sigma_db = float(margin_sigma_db)
         self.jitter_s = float(jitter_s)
         self.rng = rng
         self.overhead_bytes = int(overhead_bytes)
 
-    def _processing_delay_s(self, payload_size_bytes: int) -> float:
+    def _overhead_s(self, payload_size_bytes: int) -> float:
         payload_kb = max(float(payload_size_bytes), 0.0) / 1024.0
-        per_side_delay = max(
-            float(self.proc_delay_s) + float(self.proc_delay_per_kb_s) * payload_kb,
-            0.0,
-        )
-        # Model sender + receiver processing with the same size-aware cost.
-        return 2.0 * per_side_delay
+        return max(self.overhead_base_s + self.overhead_per_kb_s * payload_kb, 0.0)
+
+    def _path_loss_db(self, d_m: float, fc_hz: float) -> float:
+        intercept, beta_d, gamma_fc = self._pathloss_coefs
+        fc_ghz = max(float(fc_hz) / 1e9, 1e-3)
+        return intercept + beta_d * math.log10(max(d_m, 1.0)) + gamma_fc * math.log10(fc_ghz)
+
+    def _sample_margin_db(self) -> float:
+        if self.margin_sigma_db <= 0.0 or self.rng is None:
+            return self.margin_db
+        return self.margin_db + self.rng.gauss(0.0, self.margin_sigma_db)
 
     def compute_latency_s(
         self,
@@ -291,44 +310,33 @@ class SimpleWirelessLatency(LatencyModel):
     ) -> LinkCapacityAnalysis:
         d = _dist_m(sender, receiver)
 
-        # Keep these parameters for API compatibility even though the current
-        # member->ego runtime path does not apply degree-based splitting here.
+        # Kept for API compatibility; bandwidth contention is upstream now.
         out_degree = max(int(out_degree), 1)
         in_degree = max(int(in_degree), 1)
         del out_degree, in_degree
 
-        # distance attenuation factor (keep your original factor)
-        distance_factor = math.exp(-d / max(self.distance_decay_m, 1e-6))
-        distance_factor = max(self.min_rate_factor, float(distance_factor))
-
         # ---- Shannon capacity part ----
-        # Effective bandwidth from the already-allocated policy share, degraded
-        # by distance but not split again by link degree.
+        # Effective bandwidth = policy-allocated share (sender ∩ receiver).
         B_sender = max(float(sender_res.bandwidth_hz), 1.0)
         B_receiver = max(float(receiver_res.bandwidth_hz), 1.0)
-        bandwidth_hz = min(B_sender, B_receiver) * distance_factor
-        bandwidth_hz = max(bandwidth_hz, 1.0)
+        bandwidth_hz = max(min(B_sender, B_receiver), 1.0)
 
-        # Free-space path loss (FSPL)
-        # FSPL(dB) = 20log10(d_km) + 20log10(f_MHz) + 32.44
-        d_km = max(d, 1.0) / 1000.0
-        f_mhz = float(sender_res.carrier_freq_hz) / 1e6
-        fspl_db = 20.0 * math.log10(d_km) + 20.0 * math.log10(f_mhz) + 32.44
+        # 3GPP V2V path loss (selected by self.pathloss_model)
+        pathloss_db = self._path_loss_db(d, float(sender_res.carrier_freq_hz))
 
         # Received power (dBm)
-        pr_dbm = float(sender_res.tx_power_dbm) - fspl_db
+        pr_dbm = float(sender_res.tx_power_dbm) - pathloss_db
 
         # Noise floor (dBm): -174 dBm/Hz + 10log10(B) + NF
         noise_dbm = -174.0 + 10.0 * math.log10(bandwidth_hz) + float(receiver_res.noise_figure_db)
 
-        # SNR
-        snr_db = pr_dbm - noise_dbm
+        # SNR with lumped fading / blockage / implementation margin
+        margin_db = self._sample_margin_db()
+        snr_db = pr_dbm - noise_dbm - margin_db
         snr_linear = 10.0 ** (snr_db / 10.0)
 
         # Shannon capacity (bps)
         shannon_bps = bandwidth_hz * math.log2(1.0 + max(snr_linear, 0.0))
-
-        # Final usable rate is governed directly by the Shannon estimate.
         rate_bps = max(shannon_bps, 1.0)
 
         # Transmission time
@@ -338,7 +346,7 @@ class SimpleWirelessLatency(LatencyModel):
         if self.jitter_s > 0 and self.rng is not None:
             jitter = self.rng.uniform(-self.jitter_s, self.jitter_s)
 
-        processing_delay = self._processing_delay_s(payload_size_bytes)
+        processing_delay = self._overhead_s(payload_size_bytes)
         latency = processing_delay + tx_time + jitter
         payload_bits = 8.0 * float(payload_size_bytes)
         required_load_bps = (
