@@ -171,6 +171,9 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
             "selected_sender_ids": [info["sender_id"] for info in shared_infos],
             "window_s": 0.0,
             "sampling_strategy": "raw_current",
+            "per_sender_unmerged_infos": {
+                int(info["sender_id"]): [dict(info)] for info in shared_infos
+            },
         }
         return shared_images, shared_infos, meta
 
@@ -209,6 +212,7 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
         window_msgs = self._get_received_messages_in_window(receiver_id, self._vlm_received_window_s)
         grouped = self._group_messages_by_sender(window_msgs)
         per_sender_infos: Dict[int, List[Dict[str, Any]]] = {}
+        per_sender_unmerged_infos: Dict[int, List[Dict[str, Any]]] = {}
 
         for sender_id, msgs in grouped.items():
             msgs = sorted(msgs, key=lambda m: (int(m.deliver_step), int(m.created_step)))
@@ -233,10 +237,17 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
                     infos.append(info)
             if infos:
                 per_sender_infos[int(sender_id)] = [self._merge_sender_infos(infos)]
+                per_sender_unmerged_infos[int(sender_id)] = list(infos)
 
         per_sender_infos = self._cap_total_shared_infos(
             per_sender_infos, self._vlm_max_total_shared_images
         )
+        # Drop senders from the un-merged map that were capped out, so both maps stay in sync.
+        per_sender_unmerged_infos = {
+            sid: infos
+            for sid, infos in per_sender_unmerged_infos.items()
+            if sid in per_sender_infos
+        }
         shared_infos: List[Dict[str, Any]] = []
         for sender_id in sorted(per_sender_infos.keys()):
             shared_infos.extend(per_sender_infos[sender_id])
@@ -248,6 +259,7 @@ class RightTurnAutoVLMContextMixin(RightTurnAutoVLMPromptMixin):
             "selected_sender_ids": [info["sender_id"] for info in shared_infos],
             "window_s": self._vlm_received_window_s,
             "sampling_strategy": self._vlm_sampling_strategy,
+            "per_sender_unmerged_infos": per_sender_unmerged_infos,
         }
         if should_log_periodic(
             int(self._time_step),

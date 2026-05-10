@@ -1236,6 +1236,281 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             ego_pose,
         )
 
+    # ---------------------------------------------------------------- #
+    # Per-message scoring with persistent cache + age-weighted aggregation.
+    #
+    # Goal: avoid the frame-to-frame flicker caused by (a) merging K messages'
+    # captions into a single text block whose composition rotates each step and
+    # (b) feeding that rotating text to a discrete classifier with no smoothing.
+    # We instead score each message independently (cached by message identity
+    # and converted query text), then combine per (sender, query) with weights
+    # exp(-age / tau). Categorical fields are derived from the continuous
+    # weighted means (continuous-belief), so the support_strength /
+    # visibility / answerability buckets only flip when the underlying
+    # weighted average crosses a threshold.
+    # ---------------------------------------------------------------- #
+
+    def _get_per_message_score_cache(self) -> Dict[Any, Dict[str, Dict[str, Any]]]:
+        cache = getattr(self, "_per_message_score_cache", None)
+        if cache is None:
+            cache = {}
+            self._per_message_score_cache = cache
+        return cache
+
+    def _aggregate_per_message_scorings(
+        self,
+        per_message_results: List[Tuple[Dict[str, Any], float]],
+        tau_s: float,
+    ) -> Dict[str, Any]:
+        """Age-weighted continuous-belief aggregation.
+
+        per_message_results: list of (raw_scoring_dict, age_seconds).
+        """
+        if not per_message_results:
+            return self._default_question_score(reason="no messages to aggregate")
+
+        tau = max(float(tau_s), 1e-6)
+        weights = [math.exp(-max(float(age), 0.0) / tau) for _, age in per_message_results]
+        total_w = sum(weights)
+        if total_w <= 0.0:
+            weights = [1.0 for _ in per_message_results]
+            total_w = float(len(per_message_results))
+
+        def wmean(field: str, default: float = 0.0) -> float:
+            return sum(
+                w * float((s or {}).get(field, default))
+                for (s, _), w in zip(per_message_results, weights)
+            ) / total_w
+
+        pos = max(0.0, min(1.0, wmean("positive_score")))
+        neg = max(0.0, min(1.0, wmean("negative_score")))
+        unk = max(0.0, min(1.0, wmean("unknown_score", 0.1)))
+        evidence = max(0.0, min(1.0, wmean("evidence")))
+        confidence = max(0.0, min(1.0, wmean("confidence")))
+        belief = max(-1.0, min(1.0, wmean("belief")))
+        ambiguity = max(0.0, min(1.0, wmean("ambiguity", 1.0)))
+        answerability_score = max(0.0, min(1.0, wmean("answerability_score")))
+        # visibility_score may not be in raw VLM output; fall back to evidence-like default.
+        visibility_score = max(0.0, min(1.0, wmean("visibility_score", default=0.0)))
+
+        if pos >= max(neg, unk) and pos >= 0.15:
+            answer = "positive"
+        elif neg >= unk and neg >= 0.15:
+            answer = "negative"
+        else:
+            answer = "uncertain"
+
+        if visibility_score >= 0.85:
+            visibility_status = "visible"
+        elif visibility_score >= 0.3:
+            visibility_status = "partial"
+        else:
+            visibility_status = "not_visible"
+
+        if answerability_score >= 0.75:
+            question_answerability = "answerable"
+        elif answerability_score >= 0.25:
+            question_answerability = "partially_answerable"
+        else:
+            question_answerability = "not_answerable"
+
+        base = max(pos, neg)
+        if base >= 0.8:
+            support_strength = "strong"
+        elif base >= 0.5:
+            support_strength = "moderate"
+        elif base >= 0.15:
+            support_strength = "weak"
+        else:
+            support_strength = "none"
+
+        latest_idx = min(range(len(per_message_results)), key=lambda i: per_message_results[i][1])
+        latest_scoring = per_message_results[latest_idx][0] or {}
+
+        return {
+            "positive_score": float(pos),
+            "negative_score": float(neg),
+            "unknown_score": float(unk),
+            "uncertainty": float(unk),
+            "answer": answer,
+            "reason": str(latest_scoring.get("reason", "")),
+            "belief": float(belief),
+            "evidence": float(evidence),
+            "ambiguity": float(ambiguity),
+            "confidence": float(confidence),
+            "visibility_status": visibility_status,
+            "question_answerability": question_answerability,
+            "answerability_score": float(answerability_score),
+            "visibility_score": float(visibility_score),
+            "support_strength": support_strength,
+            "raw_text": str(latest_scoring.get("raw_text", "")),
+            "raw_vlm_json": dict(latest_scoring.get("raw_vlm_json", {})),
+        }
+
+    def _evaluate_messages_for_sender(
+        self,
+        msg_infos: List[Dict[str, Any]],
+        question_cfgs: List[Dict[str, Any]],
+        ego_pose: Dict[str, float],
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+        """Score K messages for one sender (with cache), return age-weighted aggregated
+        per-query scores plus debug info (concatenated scene_description / language_evidence
+        for logging, converted query cfgs)."""
+        if not msg_infos:
+            empty = {
+                str(q["id"]): self._default_question_score(reason="no messages for sender")
+                for q in question_cfgs
+            }
+            return empty, {}
+
+        # One converted-query set per sender per step, computed off the latest message's pose.
+        latest_msg = min(msg_infos, key=lambda m: float(m.get("received_age_s", 0.0)))
+        sensor_question_cfgs, converted_by_id = self._get_question_cfgs_for_sensor(
+            question_cfgs, latest_msg, ego_pose
+        )
+        converted_query_texts = tuple(str(cfg.get("query", "")) for cfg in sensor_question_cfgs)
+
+        tau_s = float(getattr(self, "_vlm_age_decay_tau_s", 0.5))
+        cache = self._get_per_message_score_cache()
+
+        per_question_results: Dict[str, List[Tuple[Dict[str, Any], float]]] = {
+            str(q["id"]): [] for q in question_cfgs
+        }
+        evaluation_mode = "no_messages"
+        scene_parts: List[str] = []
+        le_parts: List[str] = []
+
+        msgs_newest_first = sorted(msg_infos, key=lambda m: float(m.get("received_age_s", 0.0)))
+        for msg_info in msgs_newest_first:
+            sender_id = int(msg_info.get("sender_id", -1))
+            created_step = int(msg_info.get("created_step", -1))
+            scene_description = str(msg_info.get("scene_description", "")).strip()
+            language_evidence = self._compose_caption_only_evidence(scene_description)
+
+            cache_key = (created_step, sender_id, converted_query_texts)
+            if cache_key in cache:
+                scores_by_id = dict(cache[cache_key])
+                mode = "caption_then_language_multi_query_cached"
+            elif not language_evidence:
+                scores_by_id = {
+                    str(q["id"]): self._default_question_score(reason="empty_evidence_for_message")
+                    for q in question_cfgs
+                }
+                mode = "empty_evidence"
+            else:
+                try:
+                    scores_by_id = self._score_multi_questions_from_language_evidence(
+                        language_evidence, sensor_question_cfgs
+                    )
+                    mode = "caption_then_language_multi_query"
+                except Exception as exc:
+                    VLM_SCORING_LOGGER.exception(
+                        "Per-message VLM scoring failed sender=%d created_step=%d: %s",
+                        sender_id, created_step, exc,
+                    )
+                    scores_by_id = {
+                        str(q["id"]): self._default_question_score(reason=f"vlm_error:{exc}")
+                        for q in question_cfgs
+                    }
+                    mode = "caption_then_language_multi_query_error"
+                cache[cache_key] = dict(scores_by_id)
+
+            age_s = float(msg_info.get("received_age_s", 0.0))
+            for q_id, scoring in scores_by_id.items():
+                per_question_results[str(q_id)].append((dict(scoring), age_s))
+            if mode != "empty_evidence":
+                evaluation_mode = mode
+            if scene_description:
+                label = "[latest]" if age_s < 0.01 else f"[age={age_s:.2f}s]"
+                scene_parts.append(f"{label}\n{scene_description}")
+            if language_evidence:
+                label = "[latest]" if age_s < 0.01 else f"[age={age_s:.2f}s]"
+                le_parts.append(f"{label}\n{language_evidence}")
+
+        aggregated: Dict[str, Dict[str, Any]] = {}
+        for q_id, items in per_question_results.items():
+            aggregated[q_id] = self._aggregate_per_message_scorings(items, tau_s)
+
+        debug = {
+            "converted_by_id": converted_by_id,
+            "sensor_question_cfgs": sensor_question_cfgs,
+            "scene_description": "\n\n".join(scene_parts),
+            "language_evidence": "\n\n".join(le_parts),
+            "evaluation_mode": (
+                evaluation_mode + "_age_weighted"
+                if evaluation_mode != "no_messages"
+                else evaluation_mode
+            ),
+        }
+        return aggregated, debug
+
+    def _evaluate_sender_messages_aggregated(
+        self,
+        msg_infos: List[Dict[str, Any]],
+        question_cfgs: List[Dict[str, Any]],
+        ego_pose: Dict[str, float],
+    ) -> Dict[str, Dict[str, Any]]:
+        """One sensor_record per (sender, query), backed by per-message scoring + age-weighted
+        continuous aggregation (replaces the merge-then-score path for shared senders)."""
+        aggregated_scores_by_id, debug_info = self._evaluate_messages_for_sender(
+            msg_infos, question_cfgs, ego_pose
+        )
+
+        latest_msg = min(msg_infos, key=lambda m: float(m.get("received_age_s", 0.0)))
+        pose = self._normalize_pose_dict(latest_msg.get("pose"))
+        representative_sensor_info: Dict[str, Any] = {
+            "sender_id": int(latest_msg["sender_id"]),
+            "sensor_name": str(latest_msg.get("sensor_name", "cam0")),
+            "image": latest_msg.get("image"),
+            "img_emb": latest_msg.get("img_emb"),
+            "scene_description": debug_info.get("scene_description", ""),
+            "text": str(latest_msg.get("text", "")).strip(),
+            "pose": pose,
+            "sensor_yaw_rad": math.radians(float(pose.get("yaw", 0.0))),
+            "received_age_s": float(latest_msg.get("received_age_s", 0.0)),
+            "is_ego": False,
+        }
+
+        converted_by_id = debug_info.get("converted_by_id") or {}
+        scene_description = debug_info.get("scene_description", "")
+        language_evidence = debug_info.get("language_evidence", "")
+        evaluation_mode = debug_info.get(
+            "evaluation_mode", "caption_then_language_multi_query_age_weighted"
+        )
+
+        sensor_records: Dict[str, Dict[str, Any]] = {}
+        for question_cfg in question_cfgs:
+            question_id = str(question_cfg["id"])
+            scoring = dict(
+                aggregated_scores_by_id.get(question_id)
+                or self._default_question_score(
+                    reason=f"missing_aggregated_score_for_{question_id}"
+                )
+            )
+            scoring = self._apply_scene_description_consistency_override(
+                question_cfg,
+                representative_sensor_info,
+                scene_description,
+                scoring,
+                converted_by_id.get(question_id),
+            )
+            used_for_aggregation, skip_reason = self._should_use_sensor_for_question(
+                question_cfg,
+                representative_sensor_info,
+                scoring,
+            )
+            sensor_records[question_id] = self._build_sensor_score_record(
+                representative_sensor_info,
+                scene_description,
+                language_evidence,
+                scoring,
+                converted_by_id.get(question_id),
+                evaluation_mode,
+                used_for_aggregation,
+                skip_reason,
+            )
+        return sensor_records
+
     def _evaluate_all_questions_multi(
         self,
         question_cfgs: List[Dict[str, Any]],
@@ -1245,8 +1520,6 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
         shared_meta: Dict[str, Any],
     ) -> Dict[str, Dict[str, Any]]:
         ego_sensor_infos = self._build_ego_sensor_instances(ego_image)
-        shared_sensor_infos = self._build_shared_sensor_instances(shared_infos)
-        all_sensor_infos = ego_sensor_infos + shared_sensor_infos
 
         ego_tf = self.ego.get_transform()
         ego_pose = {
@@ -1255,11 +1528,35 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
             "yaw": float(ego_tf.rotation.yaw),
         }
         per_question_scores: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        for sensor_info in all_sensor_infos:
+
+        for sensor_info in ego_sensor_infos:
             sensor_records = self._evaluate_sensor_questions(sensor_info, question_cfgs, ego_pose)
             for question_cfg in question_cfgs:
                 question_id = str(question_cfg["id"])
                 per_question_scores[question_id].append(sensor_records[question_id])
+
+        per_sender_unmerged = shared_meta.get("per_sender_unmerged_infos") or {}
+        if per_sender_unmerged:
+            for sender_id in sorted(per_sender_unmerged.keys()):
+                msg_infos = list(per_sender_unmerged[int(sender_id)])
+                if not msg_infos:
+                    continue
+                sensor_records = self._evaluate_sender_messages_aggregated(
+                    msg_infos, question_cfgs, ego_pose
+                )
+                for question_cfg in question_cfgs:
+                    question_id = str(question_cfg["id"])
+                    per_question_scores[question_id].append(sensor_records[question_id])
+        else:
+            # Fallback for callers that didn't populate the un-merged map.
+            shared_sensor_infos = self._build_shared_sensor_instances(shared_infos)
+            for sensor_info in shared_sensor_infos:
+                sensor_records = self._evaluate_sensor_questions(
+                    sensor_info, question_cfgs, ego_pose
+                )
+                for question_cfg in question_cfgs:
+                    question_id = str(question_cfg["id"])
+                    per_question_scores[question_id].append(sensor_records[question_id])
 
         return {
             str(question_cfg["id"]): self._build_question_result_from_sensor_records(

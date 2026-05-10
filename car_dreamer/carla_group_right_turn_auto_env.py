@@ -69,7 +69,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
             {
                 "communication.comm_period": 2,
                 "vlm.eval_period": 3,
-                "vlm.max_images_per_sender_for_inference": 2,
+                "vlm.max_images_per_sender_for_inference": 4,
                 "vlm.max_total_shared_images": 6,
                 "vlm.max_msgs_per_sender": 6,
             }
@@ -155,13 +155,14 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self._vlm_image_obs_key = str(getattr(vlm_cfg, "image_obs_key", "camera"))
         self._vlm_local_files_only = bool(getattr(vlm_cfg, "local_files_only", False))
         self._vlm_shared_source = str(getattr(vlm_cfg, "shared_source", "received_feat"))
-        self._vlm_received_window_s = float(getattr(vlm_cfg, "received_window_s", 2.0))
+        self._vlm_received_window_s = float(getattr(vlm_cfg, "received_window_s", 1.0))
         self._vlm_max_msgs_per_sender = int(getattr(vlm_cfg, "max_msgs_per_sender", 20))
         self._vlm_max_images_per_sender_for_inference = int(
             getattr(vlm_cfg, "max_images_per_sender_for_inference", 4)
         )
-        self._vlm_sampling_strategy = str(getattr(vlm_cfg, "sampling_strategy", "uniform"))
+        self._vlm_sampling_strategy = str(getattr(vlm_cfg, "sampling_strategy", "latest"))
         self._vlm_max_total_shared_images = int(getattr(vlm_cfg, "max_total_shared_images", 12))
+        self._vlm_age_decay_tau_s = float(getattr(vlm_cfg, "age_decay_tau_s", 0.5))
 
         self._vlm_ego_conf_weight = float(getattr(vlm_cfg, "ego_conf_weight", 1.0))
         self._vlm_default_shared_conf_weight = float(getattr(vlm_cfg, "shared_conf_weight", 1.0))
