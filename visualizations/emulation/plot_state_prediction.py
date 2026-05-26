@@ -37,15 +37,16 @@ Available states (--state):
 
 Run --list-states to print the registry without running anything.
 
-Usage:
-    conda run -n cardreamer_gnn python visualize_state_prediction.py \
+Usage (from repo root):
+
+    conda run -n cardreamer_gnn python visualizations/emulation/plot_state_prediction.py \
         --checkpoint logdir/emulation/fixed_20260430/checkpoint_best.pt \
         --episode data/emulation_fixed_20260430/P3/emulation_episode_terminated_step_101.json \
         --state complementarity \
         --out-dir logdir/state_pred_viz
 
     # per-(vehicle, query) state needs a query id from the episode:
-    conda run -n cardreamer_gnn python visualize_state_prediction.py \
+    conda run -n cardreamer_gnn python visualizations/emulation/plot_state_prediction.py \
         --checkpoint logdir/emulation/fixed_20260430/checkpoint_best.pt \
         --episode data/emulation_fixed_20260430/P3/emulation_episode_terminated_step_101.json \
         --state sender_collab --query-id clg_front_vehicle
@@ -53,9 +54,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import sys
-import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -63,8 +62,9 @@ from typing import Any, Callable, Dict, List, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parent
-EMULATION_ROOT = REPO_ROOT / "car_dreamer" / "toolkit" / "emulation"
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from visualizations._common import load_emulation_modules  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -162,43 +162,6 @@ def _build_state_registry() -> Dict[str, StateSpec]:
 
 
 STATE_REGISTRY = _build_state_registry()
-
-
-# --------------------------------------------------------------------------- #
-# Module loading
-# --------------------------------------------------------------------------- #
-
-
-def _ensure_pkg(name: str, path: Path) -> None:
-    if name in sys.modules:
-        return
-    module = types.ModuleType(name)
-    module.__path__ = [str(path)]
-    sys.modules[name] = module
-
-
-def _load(full_name: str, file_name: str):
-    if full_name in sys.modules:
-        return sys.modules[full_name]
-    spec = importlib.util.spec_from_file_location(full_name, EMULATION_ROOT / file_name)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[full_name] = module
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_emulation_modules():
-    _ensure_pkg("car_dreamer", REPO_ROOT / "car_dreamer")
-    _ensure_pkg("car_dreamer.toolkit", REPO_ROOT / "car_dreamer" / "toolkit")
-    _ensure_pkg("car_dreamer.toolkit.emulation", EMULATION_ROOT)
-    _load("car_dreamer.toolkit.emulation.schema", "schema.py")
-    _load("car_dreamer.toolkit.emulation.features", "features.py")
-    _load("car_dreamer.toolkit.emulation.queries", "queries.py")
-    dataset_mod = _load("car_dreamer.toolkit.emulation.dataset", "dataset.py")
-    training = _load("car_dreamer.toolkit.emulation.training", "training.py")
-    model_mod = _load("car_dreamer.toolkit.emulation.model", "model.py")
-    return dataset_mod, training, model_mod
 
 
 def _to_batch_tensor(sample: Dict[str, Any], torch):
@@ -486,7 +449,7 @@ def main() -> None:
     spec = STATE_REGISTRY[args.state]
 
     torch = sys.modules.get("torch") or __import__("torch")
-    dataset_mod, training, model_mod = _load_emulation_modules()
+    dataset_mod, training, model_mod = load_emulation_modules()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

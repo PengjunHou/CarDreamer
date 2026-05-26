@@ -1,37 +1,35 @@
+"""CLI wrapper for ``car_dreamer.toolkit.emulation.visualization.main``.
+
+Renders ground-truth topology, region overview, world-region overview, and
+prediction-comparison GIFs/PNGs from canonical emulation episode JSON. The
+actual rendering code lives at ``car_dreamer/toolkit/emulation/visualization.py``
+— this file just dodges carla imports by loading that module directly, then
+hands argv to its ``main()``.
+
+Usage (from repo root):
+
+    python visualizations/emulation/render_topology.py \\
+        --episode data/.../emulation_episode_*.json \\
+        --output-dir logdir/topology_viz
+
+    # Batch render across policies P*/ under a root:
+    python visualizations/emulation/render_topology.py \\
+        --policy-ids P1 P2 P3 --policy-root data/emulation_fixed_20260430 \\
+        --output-dir logdir/topology_viz
+
+    # Add --checkpoint to also render prediction-comparison GIFs.
+
+See ``--help`` for the full flag set.
+"""
 from __future__ import annotations
 
-import importlib.util
 import sys
-import types
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-REPO_ROOT = Path(__file__).resolve().parent
-EMULATION_ROOT = REPO_ROOT / "car_dreamer" / "toolkit" / "emulation"
-
-
-def _ensure_pkg(name: str, path: Path) -> None:
-    if name in sys.modules:
-        return
-    module = types.ModuleType(name)
-    module.__path__ = [str(path)]
-    sys.modules[name] = module
-
-
-def _load_visualization_module():
-    _ensure_pkg("car_dreamer", REPO_ROOT / "car_dreamer")
-    _ensure_pkg("car_dreamer.toolkit", REPO_ROOT / "car_dreamer" / "toolkit")
-    _ensure_pkg("car_dreamer.toolkit.emulation", EMULATION_ROOT)
-    full_name = "car_dreamer.toolkit.emulation.visualization"
-    if full_name in sys.modules:
-        return sys.modules[full_name]
-    spec = importlib.util.spec_from_file_location(full_name, EMULATION_ROOT / "visualization.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[full_name] = module
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+from visualizations._common import load_visualization_module  # noqa: E402
 
 
 if __name__ == "__main__":
-    _load_visualization_module().main()
+    load_visualization_module().main()

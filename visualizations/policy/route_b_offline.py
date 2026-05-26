@@ -5,8 +5,8 @@ metrics the runtime EpisodeMetrics produces, plus a re-applied
 ConfidenceTracker trace for visualization. Writes CSV summaries and PNG
 figures to ``--out-dir``.
 
-Usage:
-    python scripts/route_b_offline_analysis.py \
+Usage (from repo root):
+    python visualizations/policy/route_b_offline.py \
         --data-dir data/emulation_fixed_20260511 \
         --out-dir data/route_b_analysis
 

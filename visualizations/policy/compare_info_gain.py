@@ -15,8 +15,8 @@ script saves:
   - <out_dir>/policy_information_gain_overall.png
         Mean confidence_gain per policy (averaged across all questions).
 
-Usage:
-    python compare_policy_information_gain.py \
+Usage (from repo root):
+    python visualizations/policy/compare_info_gain.py \
         --root data/emulation_fixed_20260430 \
         --out-dir logdir/policy_info_gain
 """

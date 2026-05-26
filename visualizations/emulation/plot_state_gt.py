@@ -1,25 +1,25 @@
 """Plot ground-truth time-series for any registered state without needing a trained model.
 
-Mirrors `visualize_state_prediction.py` but only renders the GT panel by reading
-`vehicle.shared_summary_semantic[k]` (and friends) directly from the episode JSON.
+Mirrors ``plot_state_prediction.py`` but only renders the GT panel by reading
+``vehicle.shared_summary_semantic[k]`` (and friends) directly from the episode
+JSON.
 
-Usage:
-    conda run -n cardreamer_gnn python visualize_state_gt_only.py \\
+Usage (from repo root):
+
+    conda run -n cardreamer_gnn python visualizations/emulation/plot_state_gt.py \\
         --episode data/emulation_fixed_2026059/P3/right_turn_episode_000004.json \\
         --state positive_score_mean \\
         --out-dir logdir/state_gt_viz
 
     # per-(vehicle, query) state needs a query id from the episode:
-    conda run -n cardreamer_gnn python visualize_state_gt_only.py \\
+    conda run -n cardreamer_gnn python visualizations/emulation/plot_state_gt.py \\
         --episode data/emulation_fixed_2026059/P3/right_turn_episode_000004.json \\
         --state sender_collab --query-id clg_front_vehicle
 """
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import sys
-import types
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,8 +28,9 @@ from typing import Any, Callable, Dict, List, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parent
-EMULATION_ROOT = REPO_ROOT / "car_dreamer" / "toolkit" / "emulation"
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from visualizations._common import load_training_module  # noqa: E402
 
 
 @dataclass
@@ -92,35 +93,6 @@ def _build_state_registry() -> Dict[str, GTSpec]:
 
 
 STATE_REGISTRY = _build_state_registry()
-
-
-def _ensure_pkg(name: str, path: Path) -> None:
-    if name in sys.modules:
-        return
-    module = types.ModuleType(name)
-    module.__path__ = [str(path)]
-    sys.modules[name] = module
-
-
-def _load(full_name: str, file_name: str):
-    if full_name in sys.modules:
-        return sys.modules[full_name]
-    spec = importlib.util.spec_from_file_location(full_name, EMULATION_ROOT / file_name)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[full_name] = module
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_training_module():
-    _ensure_pkg("car_dreamer", REPO_ROOT / "car_dreamer")
-    _ensure_pkg("car_dreamer.toolkit", REPO_ROOT / "car_dreamer" / "toolkit")
-    _ensure_pkg("car_dreamer.toolkit.emulation", EMULATION_ROOT)
-    _load("car_dreamer.toolkit.emulation.schema", "schema.py")
-    _load("car_dreamer.toolkit.emulation.features", "features.py")
-    _load("car_dreamer.toolkit.emulation.queries", "queries.py")
-    return _load("car_dreamer.toolkit.emulation.training", "training.py")
 
 
 def _render(
@@ -231,7 +203,7 @@ def main() -> None:
         parser.error("--episode is required (unless --list-states).")
 
     spec = STATE_REGISTRY[args.state]
-    training = _load_training_module()
+    training = load_training_module()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

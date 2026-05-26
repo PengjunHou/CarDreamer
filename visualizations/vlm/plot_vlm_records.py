@@ -1,3 +1,20 @@
+"""Visualize VLM records (vlm_records_*.json / .jsonl): per-sensor scores,
+sensor alignment metrics, ego-only vs ego+collaborator confidence breakdowns.
+
+Outputs (under ``--output_dir``):
+    confidence_table.csv, sensor_alignment_table.csv
+    avg_confidence_comparison_by_question.png   (bar chart per question)
+    timeseries_confidence_<qid>.png             (one PNG per question)
+    timeseries_confidence_gain_<qid>.png
+    timeseries_{facing,region,distance,fov}_alignment_<qid>.png
+    timeseries_confidence_contribution_<qid>.png
+
+Usage (from repo root):
+
+    python visualizations/vlm/plot_vlm_records.py \\
+        --input data/.../vlm_records_terminated_step_NNN.json \\
+        --output_dir logdir/vlm_viz
+"""
 import argparse
 import json
 from pathlib import Path
