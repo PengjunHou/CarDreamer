@@ -25,6 +25,7 @@ from .toolkit import (
     payload_fn_llm,
 )
 from .toolkit.vlm import RightTurnAutoVLMMixin
+from .toolkit.control import ConfidenceTracker, ControlModulator, EpisodeMetrics
 from .toolkit.emulation.policy import RuleBasedPolicySelector, build_default_policy_registry, get_policy
 
 
@@ -49,6 +50,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self._init_vlm_config()
         self._init_collaboration_policy()
         self._init_runtime_flags()
+        self._init_route_b()
         if self._vlm_enabled:
             self._init_vlm()
 
@@ -68,7 +70,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self._config = self._config.update(
             {
                 "communication.comm_period": 2,
-                "vlm.eval_period": 3,
+                "vlm.eval_period": 1,
                 "vlm.max_images_per_sender_for_inference": 4,
                 "vlm.max_total_shared_images": 6,
                 "vlm.max_msgs_per_sender": 6,
@@ -163,6 +165,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self._vlm_sampling_strategy = str(getattr(vlm_cfg, "sampling_strategy", "latest"))
         self._vlm_max_total_shared_images = int(getattr(vlm_cfg, "max_total_shared_images", 12))
         self._vlm_age_decay_tau_s = float(getattr(vlm_cfg, "age_decay_tau_s", 0.5))
+        self._vlm_semantic_ema_alpha = float(getattr(vlm_cfg, "semantic_ema_alpha", 0.4))
 
         self._vlm_ego_conf_weight = float(getattr(vlm_cfg, "ego_conf_weight", 1.0))
         self._vlm_default_shared_conf_weight = float(getattr(vlm_cfg, "shared_conf_weight", 1.0))
@@ -251,6 +254,52 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
             self._collaboration_bandwidth_floor,
         )
 
+    def _init_route_b(self) -> None:
+        cfg = getattr(self._config, "route_b", None)
+        conf_cfg = getattr(cfg, "confidence", None) if cfg is not None else None
+        ctrl_cfg = getattr(cfg, "control", None) if cfg is not None else None
+        metr_cfg = getattr(cfg, "metrics", None) if cfg is not None else None
+
+        self._route_b_enabled = bool(getattr(cfg, "enabled", True)) if cfg is not None else True
+
+        question_weights_raw = (
+            getattr(conf_cfg, "question_weights", None) if conf_cfg is not None else None
+        )
+        if isinstance(question_weights_raw, dict):
+            question_weights = {str(k): float(v) for k, v in question_weights_raw.items()}
+        else:
+            question_weights = {}
+
+        self._confidence_tracker = ConfidenceTracker(
+            ema_alpha=float(getattr(conf_cfg, "ema_alpha", 0.15)) if conf_cfg is not None else 0.15,
+            max_delta_per_step=float(getattr(conf_cfg, "max_delta_per_step", 0.05)) if conf_cfg is not None else 0.05,
+            c_min=float(getattr(conf_cfg, "c_min", 0.1)) if conf_cfg is not None else 0.1,
+            c_max=float(getattr(conf_cfg, "c_max", 1.0)) if conf_cfg is not None else 1.0,
+            c_init=float(getattr(conf_cfg, "c_init", 0.5)) if conf_cfg is not None else 0.5,
+            question_weights=question_weights,
+            source_field=str(getattr(conf_cfg, "source", "ego_plus_shared")) if conf_cfg is not None else "ego_plus_shared",
+        )
+
+        self._control_modulator = ControlModulator(
+            v_min_kmh=float(getattr(ctrl_cfg, "v_min_kmh", 8.0)) if ctrl_cfg is not None else 8.0,
+            v_max_kmh=float(getattr(ctrl_cfg, "v_max_kmh", 30.0)) if ctrl_cfg is not None else 30.0,
+            d_base_m=float(getattr(ctrl_cfg, "d_base_m", 5.0)) if ctrl_cfg is not None else 5.0,
+            beta_threshold=float(getattr(ctrl_cfg, "beta_threshold", 1.0)) if ctrl_cfg is not None else 1.0,
+            modulate_brake=bool(getattr(ctrl_cfg, "modulate_brake", False)) if ctrl_cfg is not None else False,
+            max_brake_base=float(getattr(ctrl_cfg, "max_brake_base", 0.5)) if ctrl_cfg is not None else 0.5,
+        )
+
+        world_cfg = getattr(self._config, "world", None)
+        dt = float(getattr(world_cfg, "fixed_delta_seconds", 0.1)) if world_cfg is not None else 0.1
+
+        self._episode_metrics = EpisodeMetrics(
+            dt=dt,
+            t_max_steps=int(getattr(metr_cfg, "t_max_steps", 800)) if metr_cfg is not None else 800,
+            npc_conflict_max_dist_m=float(getattr(metr_cfg, "npc_conflict_max_dist_m", 30.0)) if metr_cfg is not None else 30.0,
+            npc_conflict_fov_deg=float(getattr(metr_cfg, "npc_conflict_fov_deg", 180.0)) if metr_cfg is not None else 180.0,
+        )
+        self._episode_metrics_finalized = False
+
     def _begin_emulation_logging_episode(self) -> None:
         self._emulation_episode_index += 1
         self._emulation_episode_id = (
@@ -316,8 +365,20 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         del action
         if self.agent is None:
             raise RuntimeError("BasicAgent is not initialized. Call reset() before step().")
+        c_out = self._confidence_tracker.update(
+            int(self._time_step), getattr(self, "_vlm_last_eval", None)
+        )
+        if self._route_b_enabled:
+            self._control_modulator.apply(self.agent, c_out)
         control = self.agent.run_step()
         self.ego.apply_control(control)
+        self._episode_metrics.record(
+            t=int(self._time_step),
+            ego=self.ego,
+            control=control,
+            confidence=float(c_out),
+            npcs=list(self.group_vehs),
+        )
 
     def get_state(self):
         self._state = {"ego_waypoints": self.waypoints, "timesteps": self._time_step}
@@ -327,7 +388,32 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self.get_state()
         _, reward, terminated, truncated, info = super().step(action)
         info = self._merge_step_info(info, requested_action=action)
+        try:
+            r_dest = float(info.get("r_destination", 0.0))
+        except (TypeError, ValueError):
+            r_dest = 0.0
+        if r_dest > 0.0:
+            self._episode_metrics.mark_completed(int(self._time_step))
+        try:
+            r_coll = float(info.get("r_collision", 0.0))
+        except (TypeError, ValueError):
+            r_coll = 0.0
+        if r_coll < 0.0:
+            self._episode_metrics.mark_collided()
         info = self._handle_episode_end(terminated, truncated, info)
+        if (terminated or truncated) and not self._episode_metrics_finalized:
+            metric_result = self._episode_metrics.finalize()
+            info["route_b_metrics"] = metric_result
+            self._episode_metrics_finalized = True
+            AUTO_ENV_LOGGER.info(
+                "Route-B metrics finalized step=%d policy_id=%s mean_speed_kmh=%.3f completion_time_s=%.3f mean_confidence=%.3f total_bw_bytes=%.0f",
+                self._time_step,
+                getattr(self, "_collaboration_policy_id", ""),
+                metric_result.get("mean_speed_kmh", 0.0),
+                metric_result.get("completion_time_s", 0.0),
+                metric_result.get("mean_confidence", 0.0),
+                metric_result.get("total_bandwidth_bytes", 0.0),
+            )
         if terminated or truncated:
             AUTO_ENV_LOGGER.info(
                 "Episode ended step=%d reward=%.4f terminated=%s truncated=%s info_keys=%s",

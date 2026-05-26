@@ -202,8 +202,51 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
                 ),
             },
         )
+        self._apply_semantic_ema_in_place(step_record)
         self._emulation_episode_steps.append(step_record)
         self._emulation_step_counter += 1
+
+    def _apply_semantic_ema_in_place(self, step_record: Any) -> None:
+        """Smooth `shared_summary_semantic` across eval-steps with a per-vehicle EMA.
+
+        Solves the residual flicker that age-weighted aggregation can't fix —
+        i.e., when all K messages in the window agree on a (mistaken) judgment
+        like "not_answerable", the per-step output collapses to 0; without
+        cross-step memory we can't tell that this is a one-frame VLM artifact
+        rather than a real change. EMA blends with the previous eval-step's
+        smoothed value, attenuating those single-frame collapses. State is
+        keyed by `(episode_id, vehicle_id)` so it auto-resets across episodes.
+        """
+        alpha = float(getattr(self, "_vlm_semantic_ema_alpha", 0.4))
+        if alpha >= 1.0 or alpha <= 0.0:
+            return  # No-op when alpha is out of (0,1).
+
+        prev_state: Dict[int, List[float]] = getattr(self, "_prev_shared_semantic_by_vehicle", None)
+        if prev_state is None:
+            prev_state = {}
+            self._prev_shared_semantic_by_vehicle = prev_state
+
+        prev_episode_id = getattr(self, "_prev_emulation_episode_id_for_ema", None)
+        current_episode_id = str(getattr(self, "_emulation_episode_id", ""))
+        if prev_episode_id != current_episode_id:
+            prev_state.clear()
+            self._prev_emulation_episode_id_for_ema = current_episode_id
+
+        for vehicle in getattr(step_record, "candidate_vehicles", []) or []:
+            vid = int(getattr(vehicle, "vehicle_id", -1))
+            raw = list(getattr(vehicle, "shared_summary_semantic", []) or [])
+            if not raw:
+                continue
+            prev = prev_state.get(vid)
+            if prev and len(prev) == len(raw):
+                smoothed = [
+                    alpha * float(raw[i]) + (1.0 - alpha) * float(prev[i])
+                    for i in range(len(raw))
+                ]
+            else:
+                smoothed = [float(x) for x in raw]
+            prev_state[vid] = list(smoothed)
+            vehicle.shared_summary_semantic = smoothed
 
     def _is_rear_question(self, question_cfg: Dict[str, Any]) -> bool:
         qid = str(question_cfg.get("id", "")).lower()
@@ -1290,8 +1333,11 @@ class RightTurnAutoVLMScoringMixin(RightTurnAutoVLMContextMixin):
         belief = max(-1.0, min(1.0, wmean("belief")))
         ambiguity = max(0.0, min(1.0, wmean("ambiguity", 1.0)))
         answerability_score = max(0.0, min(1.0, wmean("answerability_score")))
-        # visibility_score may not be in raw VLM output; fall back to evidence-like default.
-        visibility_score = max(0.0, min(1.0, wmean("visibility_score", default=0.0)))
+        # visibility_score is *not* in the per-message VLM output (only the
+        # categorical visibility_status is). Derive a sane continuous proxy
+        # from the weighted-mean uncertainty so that downstream consumers
+        # (and our own categorical label below) get a meaningful value.
+        visibility_score = max(0.0, min(1.0, 1.0 - unk))
 
         if pos >= max(neg, unk) and pos >= 0.15:
             answer = "positive"

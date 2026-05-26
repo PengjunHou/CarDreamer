@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover - guarded at runtime
 
 
 SUPPORTED_METRICS: Tuple[str, ...] = ("sender_collab", "sender_gain")
-DEFAULT_CANVAS_SIZE: Tuple[int, int] = (720, 720)
+DEFAULT_CANVAS_SIZE: Tuple[int, int] = (720, 540)
 DEFAULT_REGION_CANVAS_SIZE: Tuple[int, int] = (1800, 1200)
 DEFAULT_EDGE_WIDTH_RANGE: Tuple[float, float] = (2.0, 12.0)
 DEFAULT_EPSILON = 1e-6
@@ -723,6 +723,7 @@ def render_prediction_comparison_sequences(
     gif_duration_ms: int = 180,
     canvas_size: Tuple[int, int] = DEFAULT_CANVAS_SIZE,
     epsilon: float = DEFAULT_EPSILON,
+    max_horizon_frames: int | None = None,
 ) -> Dict[str, Any]:
     if not torch_is_available() or torch is None:
         raise ImportError(
@@ -749,12 +750,15 @@ def render_prediction_comparison_sequences(
     )
 
     anchor_steps = _select_step_indices(episode, step_start=step_start, step_end=step_end)
+    effective_max_horizon = int(dataset_horizon)
+    if max_horizon_frames is not None:
+        effective_max_horizon = min(effective_max_horizon, max(int(max_horizon_frames), 1))
     selected_pairs = _collect_prediction_pairs(
         episode,
         dataset,
         model,
         anchor_steps=anchor_steps,
-        max_horizon=int(dataset_horizon),
+        max_horizon=effective_max_horizon,
         device=resolve_device(device),
         epsilon=float(epsilon),
     )
@@ -859,6 +863,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--history-len", type=int, default=None)
     parser.add_argument("--horizon", type=int, default=None)
+    parser.add_argument(
+        "--max-horizon-frames",
+        type=int,
+        default=None,
+        help="Cap rendered prediction frames per anchor to the first N future steps "
+             "(e.g. 1 = only h=1). Default: all horizon steps.",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--gif-duration-ms", type=int, default=180)
     parser.add_argument("--canvas-size", nargs=2, type=int, default=None)
@@ -948,6 +959,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 device=args.device,
                 gif_duration_ms=int(args.gif_duration_ms),
                 canvas_size=canvas_size,
+                max_horizon_frames=args.max_horizon_frames,
             )
             print(
                 "[emulation][viz] rendered prediction comparison sequences "
@@ -1466,14 +1478,14 @@ def _render_prediction_compare_frame(
     panel_w = int(panel_size[0])
     panel_h = int(panel_size[1])
     gap = 20
-    header_h = 44
+    header_h = 56
     image = Image.new("RGB", (panel_w * 2 + gap, panel_h + header_h), color=_BACKGROUND)
     draw = ImageDraw.Draw(image)
     title = (
         f"{metric} | {query_id} | anchor {anchor_step:03d} -> step {int(future_step.step):03d} "
         f"(h={horizon_offset})"
     )
-    draw.text((18, 12), title, fill=_TITLE, font=_load_font())
+    draw.text((18, 16), title, fill=_TITLE, font=_load_font(22))
 
     positions = _step_positions(future_step)
     gt_panel = _render_topology_panel(
@@ -1524,13 +1536,13 @@ def _render_topology_panel(
     del query_id
     panel = Image.new("RGB", (int(canvas_size[0]), int(canvas_size[1])), color=_PANEL_BACKGROUND)
     draw = ImageDraw.Draw(panel)
-    font = _load_font()
+    font = _load_font(18)
 
     header_h = int(position_layout["header_h"])
     draw.rectangle((0, 0, int(canvas_size[0]) - 1, int(canvas_size[1]) - 1), outline=_GRID, width=1)
     for index, line in enumerate(title_lines):
         fill = _TITLE if index == 0 else _SUBTITLE
-        draw.text((18, 12 + index * 18), str(line), fill=fill, font=font)
+        draw.text((18, 12 + index * 24), str(line), fill=fill, font=font)
 
     ego_center = (float(position_layout["center_x"]), float(position_layout["center_y"]))
     _draw_reference_axes(draw, ego_center, canvas_size, header_h)
@@ -2084,3 +2096,7 @@ __all__ = [
     "render_region_overview_sequences",
     "render_prediction_comparison_sequences",
 ]
+
+
+if __name__ == "__main__":
+    main()

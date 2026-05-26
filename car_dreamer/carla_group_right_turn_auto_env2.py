@@ -108,6 +108,7 @@ class CarlaGroupRightTurnAutoEnv(CarlaWptFixedEnv):
         self._vlm_sampling_strategy = str(getattr(vlm_cfg, "sampling_strategy", "latest"))  # uniform | latest
         self._vlm_max_total_shared_images = int(getattr(vlm_cfg, "max_total_shared_images", 12))
         self._vlm_age_decay_tau_s = float(getattr(vlm_cfg, "age_decay_tau_s", 0.5))
+        self._vlm_semantic_ema_alpha = float(getattr(vlm_cfg, "semantic_ema_alpha", 0.4))
 
         # sender-level confidence weights
         self._vlm_ego_conf_weight = float(getattr(vlm_cfg, "ego_conf_weight", 1.0))

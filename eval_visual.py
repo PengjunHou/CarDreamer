@@ -265,6 +265,30 @@ def build_sensor_table(records: List[Dict[str, Any]]) -> pd.DataFrame:
 # Plot 1: combined bar chart
 # --------------------------------------------------
 
+SMOOTHING_WINDOW = 10
+MAX_STEP = 80
+
+
+def _smooth(series: pd.Series, window: int = SMOOTHING_WINDOW) -> pd.Series:
+    return series.rolling(window=window, min_periods=1, center=True).mean()
+
+
+def _clip_steps(df: pd.DataFrame, max_step: Optional[int] = MAX_STEP) -> pd.DataFrame:
+    if max_step is None or "step" not in df.columns:
+        return df
+    return df[df["step"] <= max_step]
+
+
+def _pretty_legend(col: str, member_cols: List[str]) -> str:
+    if col == "confidence_ego_only":
+        return "Ego MA only"
+    if col == "confidence_ego_plus_shared":
+        return "Ego MA + All Collaborators"
+    if col in member_cols:
+        return f"Ego MA + Collaborator {member_cols.index(col) + 1}"
+    return col.replace("confidence_", "")
+
+
 def save_avg_confidence_bar(conf_df: pd.DataFrame, output_dir: Path) -> None:
     if conf_df.empty:
         return
@@ -279,7 +303,7 @@ def save_avg_confidence_bar(conf_df: pd.DataFrame, output_dir: Path) -> None:
         .sort_values("question_id")
     )
 
-    labels = grouped["question_id"].tolist()
+    labels = [f"Q{i + 1}" for i in range(len(grouped))]
     x = list(range(len(labels)))
     n = len(series_cols)
     width = 0.8 / max(n, 1)
@@ -287,13 +311,13 @@ def save_avg_confidence_bar(conf_df: pd.DataFrame, output_dir: Path) -> None:
     plt.figure(figsize=(max(12, len(labels) * (n * 0.35 + 0.5)), 5.5))
     for i, col in enumerate(series_cols):
         offset = (i - (n - 1) / 2.0) * width
-        legend_label = col.replace("confidence_", "")
+        legend_label = _pretty_legend(col, member_cols)
         plt.bar([xi + offset for xi in x], grouped[col], width=width, label=legend_label)
 
-    plt.xticks(x, labels, rotation=45, ha="right")
-    plt.ylabel("Average confidence")
-    plt.title("Average confidence by question")
-    plt.legend(fontsize=8)
+    plt.xticks(x, labels, rotation=0, ha="center", fontsize=14)
+    plt.ylabel("Sementic Confidence", fontsize=14, )
+    # plt.title("Average confidence by question")
+    plt.legend(fontsize=12, loc="upper left")
     plt.tight_layout()
     plt.savefig(output_dir / "avg_confidence_comparison_by_question.png", dpi=220)
     plt.close()
@@ -311,18 +335,23 @@ def save_confidence_timeseries(conf_df: pd.DataFrame, output_dir: Path) -> None:
     series_cols = ["confidence_ego_only", *member_cols, "confidence_ego_plus_shared"]
 
     for qid, sub in conf_df.groupby("question_id", dropna=False):
-        sub = sub.sort_values("step")
+        sub = sub.sort_values("step").copy()
         if sub["step"].isna().all():
+            continue
+        for col in series_cols:
+            sub[col] = _smooth(sub[col])
+        sub = _clip_steps(sub)
+        if sub.empty:
             continue
 
         plt.figure(figsize=(9, 5))
         for col in series_cols:
-            plt.plot(sub["step"], sub[col], label=col.replace("confidence_", ""))
+            plt.plot(sub["step"], sub[col], label=_pretty_legend(col, member_cols))
 
-        plt.xlabel("Step")
-        plt.ylabel("Confidence")
-        plt.title(f"Confidence over time: {qid}")
-        plt.legend(fontsize=8)
+        plt.xlabel("Time Step", fontsize=14)
+        plt.ylabel("Semantic Confidence", fontsize=14)
+        # plt.title(f"Confidence over time: {qid}", fontsize=14)
+        plt.legend(fontsize=12)
         plt.tight_layout()
 
         safe_name = str(qid).replace("/", "_")
@@ -339,16 +368,20 @@ def save_confidence_gain_timeseries(conf_df: pd.DataFrame, output_dir: Path) -> 
         return
 
     for qid, sub in conf_df.groupby("question_id", dropna=False):
-        sub = sub.sort_values("step")
+        sub = sub.sort_values("step").copy()
         if sub["step"].isna().all():
+            continue
+        sub["confidence_gain"] = _smooth(sub["confidence_gain"])
+        sub = _clip_steps(sub)
+        if sub.empty:
             continue
 
         plt.figure(figsize=(9, 5))
         plt.plot(sub["step"], sub["confidence_gain"], label="confidence_gain")
-        plt.xlabel("Step")
-        plt.ylabel("Confidence gain")
-        plt.title(f"Confidence gain over time: {qid}")
-        plt.legend()
+        plt.xlabel("Time Step", fontsize=14)
+        plt.ylabel("Semantic Confidence Gain", fontsize=14)
+        # plt.title(f"Confidence gain over time: {qid}", fontsize=14)
+        plt.legend(fontsize=12)
         plt.tight_layout()
 
         safe_name = str(qid).replace("/", "_")
@@ -378,13 +411,17 @@ def save_sensor_metric_timeseries(
         plt.figure(figsize=(9, 5))
 
         for sensor_key, sensor_sub in sub.groupby("sensor_key", dropna=False):
-            sensor_sub = sensor_sub.sort_values("step")
+            sensor_sub = sensor_sub.sort_values("step").copy()
+            sensor_sub[metric] = _smooth(sensor_sub[metric])
+            sensor_sub = _clip_steps(sensor_sub)
+            if sensor_sub.empty:
+                continue
             plt.plot(sensor_sub["step"], sensor_sub[metric], label=str(sensor_key))
 
-        plt.xlabel("Step")
-        plt.ylabel(metric)
-        plt.title(f"{title_prefix}: {qid}")
-        plt.legend()
+        plt.xlabel("Time Step", fontsize=14)
+        plt.ylabel(metric, fontsize=14)
+        # plt.title(f"{title_prefix}: {qid}", fontsize=14)
+        plt.legend(fontsize=12, loc="upper left")
         plt.tight_layout()
 
         safe_name = str(qid).replace("/", "_")

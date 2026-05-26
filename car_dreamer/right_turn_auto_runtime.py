@@ -158,6 +158,13 @@ class RightTurnAutoRuntimeMixin:
         self._comm_step_summary = {}
         self._comm_step_summary_step = -1
         self._reset_policy_runtime_state()
+        tracker = getattr(self, "_confidence_tracker", None)
+        if tracker is not None:
+            tracker.reset()
+        metrics = getattr(self, "_episode_metrics", None)
+        if metrics is not None:
+            metrics.reset()
+        self._episode_metrics_finalized = False
         RUNTIME_LOGGER.debug("Group runtime state reset.")
 
     def _get_active_policy_id(self) -> str:
@@ -355,6 +362,19 @@ class RightTurnAutoRuntimeMixin:
         self.agent = BasicAgent(self.ego)
         self.agent.set_destination(ego_transform.location)
         self._cache_actor(self.ego)
+        self._install_emergency_stop_hook()
+
+    def _install_emergency_stop_hook(self) -> None:
+        metrics = getattr(self, "_episode_metrics", None)
+        if metrics is None or self.agent is None:
+            return
+        original = self.agent.add_emergency_stop
+
+        def _patched(control, _orig=original, _m=metrics):
+            _m.on_emergency_stop()
+            return _orig(control)
+
+        self.agent.add_emergency_stop = _patched
 
     def _build_policy_vehicle_infos(self) -> List[VehicleInfo]:
         if getattr(self, "ego", None) is None:
@@ -851,6 +871,9 @@ class RightTurnAutoRuntimeMixin:
             "drop_ratio_prev_round": (dropped / attempted) if attempted > 0.0 else 0.0,
             "avg_link_latency_s": avg_latency_s,
         }
+        metrics = getattr(self, "_episode_metrics", None)
+        if metrics is not None:
+            metrics.add_bandwidth(float(total_payload_bytes))
 
     def _deliver_messages(self) -> None:
         if not self._in_flight:
