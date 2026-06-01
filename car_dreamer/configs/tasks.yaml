@@ -215,6 +215,16 @@ carla_group_right_turn_auto:
     - [7.4, -124.2, 0.1, 270.0]
     - [-38.8, -135.1, 0.1, 0.0]
     - [1.4, -151.2, 0.1, 90.0]
+  # Background traffic & pedestrians (scene enrichment; NOT part of the V2V group).
+  # Purpose: occlude the ego right-turn conflict region and add hazards so that the
+  # cooperative-perception (L3) signal has something to recover. Tune after viewing
+  # in sim; set explicit *_spawn_points to place targeted occluders/crossings.
+  env.num_background_vehs: 8
+  env.num_pedestrians: 6
+  env.scene_center: [-4.0, -135.0]      # [x, y] center for background placement
+  env.background_radius_m: 55.0         # keep background actors within this radius
+  env.background_veh_spawn_points: []   # optional explicit [x, y, z, yaw] occluders
+  env.pedestrian_spawn_points: []       # optional explicit [x, y, z] crossing points
   # Feature & graph construction (task-specific)
   env.feature_size: 3072
   env.graph.window_s: 2.0

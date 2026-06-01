@@ -141,6 +141,8 @@ class RightTurnAutoRuntimeMixin:
 
     def _reset_group_runtime_state(self) -> None:
         self.group_vehs = []
+        self.background_vehs = []
+        self.pedestrians = []
         self.groups = {}
         self._prev_action = None
         self._actor_cache = {}
@@ -344,6 +346,104 @@ class RightTurnAutoRuntimeMixin:
             [int(vehicle.id) for vehicle in self.group_vehs],
             sorted(self.groups.get(GROUP_ID, set())),
         )
+
+    def generate_background_actors(self) -> None:
+        """Spawn non-V2V background traffic and pedestrians to enrich the scene.
+
+        These actors are *not* part of the cooperative group (``group_vehs``) and
+        never participate in V2V messaging. Their purpose is to occlude the ego's
+        right-turn conflict region and add dynamic hazards, so the cooperative
+        perception signal has something to recover (this is what makes V2V matter
+        for the downstream L3 fusion). They are managed by the WorldManager and are
+        auto-destroyed on the next reset.
+        """
+        self.background_vehs = []
+        self.pedestrians = []
+
+        num_bg = int(getattr(self._config, "num_background_vehs", 0))
+        if num_bg > 0:
+            transforms = self._select_background_vehicle_transforms(num_bg)
+            try:
+                actors = self._world.spawn_auto_actors(num_bg, transforms=transforms)
+            except Exception:
+                RUNTIME_LOGGER.exception("Failed to spawn background vehicles.")
+                actors = []
+            self.background_vehs = list(actors)
+            for actor in self.background_vehs:
+                self._cache_actor(actor)
+
+        num_ped = int(getattr(self._config, "num_pedestrians", 0))
+        if num_ped > 0:
+            try:
+                walkers = self._world.spawn_walkers(
+                    num_ped,
+                    spawn_transforms=self._select_pedestrian_transforms(num_ped),
+                    center=self._scene_center_location(),
+                    radius=float(getattr(self._config, "background_radius_m", 60.0)),
+                )
+            except Exception:
+                RUNTIME_LOGGER.exception("Failed to spawn pedestrians.")
+                walkers = []
+            self.pedestrians = [walker for walker, _ in walkers]
+
+        RUNTIME_LOGGER.info(
+            "Generated background actors vehicles=%d pedestrians=%d",
+            len(self.background_vehs),
+            len(self.pedestrians),
+        )
+
+    def _scene_center_location(self) -> carla.Location:
+        center = getattr(self._config, "scene_center", None)
+        if center is not None and len(center) >= 2:
+            return carla.Location(x=float(center[0]), y=float(center[1]), z=0.1)
+        points = self._config.group_spawn_points or []
+        if points:
+            xs = [float(p[0]) for p in points]
+            ys = [float(p[1]) for p in points]
+            return carla.Location(x=sum(xs) / len(xs), y=sum(ys) / len(ys), z=0.1)
+        return carla.Location(0.0, 0.0, 0.1)
+
+    def _reserved_scene_locations(self) -> List[carla.Location]:
+        """Spawn points of ego and group vehicles, to keep background clear of them."""
+        locs: List[carla.Location] = []
+        for point in (self._config.group_spawn_points or []):
+            locs.append(carla.Location(x=float(point[0]), y=float(point[1]), z=0.1))
+        ego_end = getattr(self._config, "lane_end_point", None)
+        if ego_end is not None and len(ego_end) >= 2:
+            locs.append(carla.Location(x=float(ego_end[0]), y=float(ego_end[1]), z=0.1))
+        return locs
+
+    def _select_background_vehicle_transforms(self, n: int) -> List[carla.Transform]:
+        explicit = getattr(self._config, "background_veh_spawn_points", None) or []
+        transforms = [
+            carla.Transform(
+                carla.Location(*point[:3]),
+                carla.Rotation(yaw=float(point[3]) if len(point) > 3 else 0.0),
+            )
+            for point in explicit
+        ]
+        if len(transforms) >= n:
+            return transforms[:n]
+
+        center = self._scene_center_location()
+        radius = float(getattr(self._config, "background_radius_m", 60.0))
+        reserved = self._reserved_scene_locations()
+        min_clearance_m = 4.0
+        candidates = [
+            transform
+            for transform in self._world.get_spawn_points()
+            if transform.location.distance(center) <= radius
+            and all(transform.location.distance(loc) >= min_clearance_m for loc in reserved)
+        ]
+        np.random.shuffle(candidates)
+        transforms.extend(candidates)
+        return transforms[:n]
+
+    def _select_pedestrian_transforms(self, n: int) -> List[carla.Transform]:
+        explicit = getattr(self._config, "pedestrian_spawn_points", None) or []
+        transforms = [carla.Transform(carla.Location(*point[:3])) for point in explicit]
+        # Any shortfall is filled by navigation-mesh sampling inside spawn_walkers.
+        return transforms[:n]
 
     def _update_group_observations(self) -> None:
         for actor in self.group_vehs:

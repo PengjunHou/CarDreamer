@@ -1,6 +1,6 @@
 import time
 from functools import wraps
-from typing import Callable, Dict, List, Union
+from typing import Callable, Dict, List, Tuple, Union
 
 import carla
 import numpy as np
@@ -251,7 +251,78 @@ class WorldManager:
                     self._vehicle_manager.set_desired_speed(actor, self._config.background_speed)
         return actor_list
 
+    def spawn_walkers(
+        self,
+        n: int,
+        spawn_transforms: List[carla.Transform] = None,
+        center: carla.Location = None,
+        radius: float = None,
+        max_speed_range: Tuple[float, float] = (0.8, 1.6),
+    ) -> List[Tuple[carla.Actor, carla.Actor]]:
+        """
+        Spawn ``n`` pedestrians, each driven by an AI walker controller.
 
+        Walkers and their controllers are registered with this manager, so they
+        are automatically destroyed on the next :py:meth:`reset`.
+
+        :param n: number of pedestrians to spawn.
+        :param spawn_transforms: explicit spawn transforms; if fewer than ``n``
+            are provided, the rest are sampled from the navigation mesh.
+        :param center: if given, navigation-sampled points are kept only within
+            ``radius`` of this location.
+        :param radius: acceptance radius (meters) around ``center``.
+        :param max_speed_range: (min, max) walking speed in m/s, sampled per walker.
+
+        :return: list of (walker, controller) pairs successfully spawned. Note the
+            length may be less than ``n`` if spawning fails.
+        """
+        walker_bps = self._world.get_blueprint_library().filter("walker.pedestrian.*")
+        controller_bp = self._world.get_blueprint_library().find("controller.ai.walker")
+        if len(walker_bps) == 0:
+            WORLD_LOGGER.warning("No walker blueprints available; skipping pedestrian spawn.")
+            return []
+
+        transforms = list(spawn_transforms or [])
+
+        def _sample_navigation_transform() -> Union[carla.Transform, None]:
+            for _ in range(30):
+                loc = self._world.get_random_location_from_navigation()
+                if loc is None:
+                    continue
+                if center is not None and radius is not None and loc.distance(center) > float(radius):
+                    continue
+                return carla.Transform(loc)
+            return None
+
+        spawned: List[Tuple[carla.Actor, carla.Actor]] = []
+        for i in range(n):
+            transform = transforms[i] if i < len(transforms) else _sample_navigation_transform()
+            if transform is None:
+                continue
+            bp = np.random.choice(walker_bps)
+            if bp.has_attribute("is_invincible"):
+                bp.set_attribute("is_invincible", "false")
+            walker = self._world.try_spawn_actor(bp, transform)
+            if walker is None:
+                continue
+            self.actor_dict[walker.id] = walker
+            controller = self._world.try_spawn_actor(controller_bp, carla.Transform(), attach_to=walker)
+            if controller is None:
+                self.destroy_actor(walker.id)
+                continue
+            self.actor_dict[controller.id] = controller
+            try:
+                controller.start()
+                destination = self._world.get_random_location_from_navigation()
+                if destination is not None:
+                    controller.go_to_location(destination)
+                lo, hi = max_speed_range
+                controller.set_max_speed(float(np.random.uniform(lo, hi)))
+            except Exception as exc:  # pragma: no cover - depends on live CARLA
+                WORLD_LOGGER.warning("Failed to start walker controller: %s", exc)
+            spawned.append((walker, controller))
+        WORLD_LOGGER.info("Spawned %d/%d pedestrians.", len(spawned), n)
+        return spawned
 
     def try_spawn_aggresive_actor(
         self,

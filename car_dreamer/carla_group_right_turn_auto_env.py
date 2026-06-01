@@ -85,6 +85,8 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
     def _init_group_state(self) -> None:
         self.groups: Dict[int, set[int]] = {}
         self.group_vehs: List[carla.Actor] = []
+        self.background_vehs: List[carla.Actor] = []
+        self.pedestrians: List[carla.Actor] = []
         self.num_group_vehs = int(getattr(self._config, "num_group_vehs", 2))
         self._other_observers: Dict[int, Observer] = {}
         self.group_obs: Dict[int, Dict[str, Any]] = {}
@@ -322,6 +324,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         super().on_reset()
         self._setup_basic_agent()
         self.generate_group_vehicles()
+        self.generate_background_actors()
         self._refresh_actor_cache()
         AUTO_ENV_LOGGER.info(
             "Right-turn auto reset complete ego_id=%s group_vehicle_ids=%s",
