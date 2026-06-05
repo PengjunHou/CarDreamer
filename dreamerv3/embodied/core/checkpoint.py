@@ -2,6 +2,10 @@ import concurrent.futures
 import time
 
 from . import basics, path
+from runtime_logging import get_runtime_logger
+
+
+CHECKPOINT_LOGGER = get_runtime_logger("dreamerv3.train")
 
 
 class Checkpoint:
@@ -38,14 +42,18 @@ class Checkpoint:
         assert self._filename or filename
         filename = path.Path(filename or self._filename)
         exists = self._filename.exists()
-        self._log and exists and print("Found existing checkpoint.")
-        self._log and not exists and print("Did not find any checkpoint.")
+        if self._log:
+            if exists:
+                CHECKPOINT_LOGGER.info("Found existing checkpoint at %s", filename)
+            else:
+                CHECKPOINT_LOGGER.info("Did not find checkpoint at %s", filename)
         return exists
 
     def save(self, filename=None, keys=None):
         assert self._filename or filename
         filename = path.Path(filename or self._filename)
-        self._log and print(f"Writing checkpoint: {filename}")
+        if self._log:
+            CHECKPOINT_LOGGER.info("Writing checkpoint to %s", filename)
         if self._parallel:
             self._promise and self._promise.result()
             self._promise = self._worker.submit(self._save, filename, keys)
@@ -64,12 +72,14 @@ class Checkpoint:
             old.remove()
         else:
             filename.write(basics.pack(data), mode="wb")
-        self._log and print(f"Wrote checkpoint: {filename}")
+        if self._log:
+            CHECKPOINT_LOGGER.info("Wrote checkpoint to %s", filename)
 
     def load(self, filename=None, keys=None):
         assert self._filename or filename
         filename = path.Path(filename or self._filename)
-        self._log and print(f"Loading checkpoint: {filename}")
+        if self._log:
+            CHECKPOINT_LOGGER.info("Loading checkpoint from %s", filename)
         data = basics.unpack(filename.read("rb"))
         keys = tuple(data.keys() if keys is None else keys)
         for key in keys:
@@ -78,11 +88,11 @@ class Checkpoint:
             try:
                 self._values[key].load(data[key])
             except Exception:
-                print(f"Error loading {key} from checkpoint.")
+                CHECKPOINT_LOGGER.exception("Error loading '%s' from checkpoint %s", key, filename)
                 raise
         if self._log:
             age = time.time() - data["_timestamp"]
-            print(f"Loaded checkpoint from {age:.0f} seconds ago.")
+            CHECKPOINT_LOGGER.info("Loaded checkpoint from %.0f seconds ago", age)
 
     def load_or_save(self):
         if self.exists():

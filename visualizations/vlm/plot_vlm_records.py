@@ -1,3 +1,20 @@
+"""Visualize VLM records (vlm_records_*.json / .jsonl): per-sensor scores,
+sensor alignment metrics, ego-only vs ego+collaborator confidence breakdowns.
+
+Outputs (under ``--output_dir``):
+    confidence_table.csv, sensor_alignment_table.csv
+    avg_confidence_comparison_by_question.png   (bar chart per question)
+    timeseries_confidence_<qid>.png             (one PNG per question)
+    timeseries_confidence_gain_<qid>.png
+    timeseries_{facing,region,distance,fov}_alignment_<qid>.png
+    timeseries_confidence_contribution_<qid>.png
+
+Usage (from repo root):
+
+    python visualizations/vlm/plot_vlm_records.py \\
+        --input data/.../vlm_records_terminated_step_NNN.json \\
+        --output_dir logdir/vlm_viz
+"""
 import argparse
 import json
 from pathlib import Path
@@ -82,28 +99,44 @@ def _find_sensor_by_sender(per_sensor_scores: List[Dict[str, Any]], sender_id: O
 
 
 def compute_ego_plus_member_confidence(
-    ego_only: Dict[str, Any],
+    ego_only: Optional[Dict[str, Any]],
     member_sensor: Optional[Dict[str, Any]],
-    member_aggregated:Dict[str, Any],
+    member_aggregated: Optional[Dict[str, Any]],
 ) -> Optional[float]:
     """
-    New user-specified formula:
+    User-specified formula:
         | ego_only["weight"] * ego_only["belief"] + member["weight"] * member["belief"] |
 
-    For the member sensor, if "weight" is missing, fall back to "importance_weight"
-    because the new JSON stores the effective weight there.
+    Behaviour:
+      - Returns None when the member sensor itself is absent from per_sensor_scores
+        (i.e. there is genuinely no observation to score).
+      - When ego_only lacks "weight"/"belief" (e.g. ego forward camera was filtered
+        out for a rear-region question), ego's contribution is treated as 0 and the
+        formula degrades to |w_m * b_m| — i.e. that member's contribution alone.
+      - When member is absent from aggregated_details.per_sensor (filtered out at
+        aggregation time, e.g. answerability/visibility filter), member's effective
+        weight in this aggregation is 0 — the member contributed nothing — so the
+        result is just |w_e * b_e| (or 0 if ego is also absent).
+    The new JSON stores the effective weight under "weight" in aggregated_details
+    and under "importance_weight" in per_sensor_scores; we fall back to the latter
+    if the aggregated entry is unavailable.
     """
     if member_sensor is None:
         return None
 
-    ego_weight = _to_float(ego_only.get("weight"), 0.0)
-    ego_belief = _to_float(ego_only.get("belief"), 0.0)
+    ego_dict = ego_only if isinstance(ego_only, dict) else {}
+    ego_weight = _to_float(ego_dict.get("weight"), 0.0)
+    ego_belief = _to_float(ego_dict.get("belief"), 0.0)
 
-    member_weight = _to_float(member_aggregated.get("weight"), None)
+    if isinstance(member_aggregated, dict):
+        member_weight = _to_float(member_aggregated.get("weight"), None)
+        member_belief = _to_float(member_aggregated.get("belief"), 0.0)
+    else:
+        member_weight = None
+        member_belief = _to_float(member_sensor.get("belief"), 0.0)
+
     if member_weight is None:
-        print("member weight is None")
         member_weight = _to_float(member_sensor.get("importance_weight"), 0.0)
-    member_belief = _to_float(member_aggregated.get("belief"), 0.0)
 
     return abs(ego_weight * ego_belief + member_weight * member_belief)
 
@@ -112,11 +145,12 @@ def compute_ego_plus_member_confidence(
 # Flatten record-level confidence table
 # --------------------------------------------------
 
+def member_column_name(sender_id: int) -> str:
+    return f"confidence_ego_plus_{int(sender_id)}"
+
+
 def build_confidence_table(records: List[Dict[str, Any]]) -> pd.DataFrame:
     ego_sender_id, member_sender_ids = infer_sender_mapping(records)
-
-    member1_id = member_sender_ids[0] if len(member_sender_ids) >= 1 else None
-    member2_id = member_sender_ids[1] if len(member_sender_ids) >= 2 else None
 
     rows = []
 
@@ -129,51 +163,48 @@ def build_confidence_table(records: List[Dict[str, Any]]) -> pd.DataFrame:
         ego_only_conf = _to_float(ego_only.get("confidence"), 0.0)
         ego_plus_shared_conf = _to_float(ego_plus_shared.get("confidence"), 0.0)
         confidence_gain = _to_float(rec.get("confidence_gain"), 0.0)
+        agg_per_sensor = per_sensor_aggregated.get("per_sensor") or []
 
-        member1_sensor = _find_sensor_by_sender(per_sensor_scores, member1_id)
-        member2_sensor = _find_sensor_by_sender(per_sensor_scores, member2_id)
-        member1_aggregated = _find_sensor_by_sender(per_sensor_aggregated.get("per_sensor"), member1_id)
-        member2_aggregated = _find_sensor_by_sender(per_sensor_aggregated.get("per_sensor"), member2_id)
-
-        ego_plus_member1_conf = compute_ego_plus_member_confidence(ego_only, member1_sensor, member1_aggregated)
-        ego_plus_member2_conf = compute_ego_plus_member_confidence(ego_only, member2_sensor, member2_aggregated)
-
-        rows.append(
-            {
-                "step": rec.get("step"),
-                "question_id": rec.get("question_id"),
-                "question_type": rec.get("question_type"),
-                "ego_sender_id": ego_sender_id,
-                "member1_sender_id": member1_id,
-                "member2_sender_id": member2_id,
-                "confidence_ego_only": ego_only_conf,
-                "confidence_ego_plus_member1": ego_plus_member1_conf,
-                "confidence_ego_plus_member2": ego_plus_member2_conf,
-                "confidence_ego_plus_shared": ego_plus_shared_conf,
-                "confidence_gain": confidence_gain,
-            }
-        )
+        row: Dict[str, Any] = {
+            "step": rec.get("step"),
+            "question_id": rec.get("question_id"),
+            "question_type": rec.get("question_type"),
+            "ego_sender_id": ego_sender_id,
+            "confidence_ego_only": ego_only_conf,
+            "confidence_ego_plus_shared": ego_plus_shared_conf,
+            "confidence_gain": confidence_gain,
+        }
+        for mid in member_sender_ids:
+            ms = _find_sensor_by_sender(per_sensor_scores, mid)
+            ma = _find_sensor_by_sender(agg_per_sensor, mid)
+            row[member_column_name(mid)] = compute_ego_plus_member_confidence(ego_only, ms, ma)
+        rows.append(row)
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df
 
-    numeric_cols = [
-        "step",
-        "ego_sender_id",
-        "member1_sender_id",
-        "member2_sender_id",
-        "confidence_ego_only",
-        "confidence_ego_plus_member1",
-        "confidence_ego_plus_member2",
-        "confidence_ego_plus_shared",
-        "confidence_gain",
-    ]
+    numeric_cols = ["step", "ego_sender_id", "confidence_ego_only",
+                    "confidence_ego_plus_shared", "confidence_gain"]
+    numeric_cols += [member_column_name(mid) for mid in member_sender_ids]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     return df
+
+
+def list_member_confidence_columns(conf_df: pd.DataFrame) -> List[str]:
+    """Member columns are 'confidence_ego_plus_<sender_id>' (numeric suffix),
+    excluding the special 'confidence_ego_plus_shared'."""
+    cols = []
+    for c in conf_df.columns:
+        if not c.startswith("confidence_ego_plus_"):
+            continue
+        suffix = c[len("confidence_ego_plus_"):]
+        if suffix.isdigit():
+            cols.append(c)
+    return sorted(cols, key=lambda c: int(c[len("confidence_ego_plus_"):]))
 
 
 # --------------------------------------------------
@@ -184,13 +215,24 @@ def build_sensor_table(records: List[Dict[str, Any]]) -> pd.DataFrame:
     rows = []
 
     for rec in records:
+        agg_list = (rec.get("aggregated_details") or {}).get("per_sensor") or []
+        agg_by_key = {a.get("sensor_key"): a for a in agg_list if a.get("sensor_key") is not None}
+
         for s in rec.get("per_sensor_scores", []) or []:
             region_alignment = _to_float(s.get("region_alignment"), 0.0)
             facing_alignment = _to_float(s.get("facing_alignment"), 0.0)
             distance_alignment = _to_float(s.get("distance_alignment"), 0.0)
             fov_alignment = _to_float(s.get("fov_alignment"), 0.0)
-            
-            contribution = _to_float(s.get("weight"), 0.0)
+
+            # Effective weight & confidence contribution live in aggregated_details.per_sensor,
+            # not per_sensor_scores. Sensors filtered out of aggregation get 0.
+            agg = agg_by_key.get(s.get("sensor_key")) or {}
+            weight = _to_float(agg.get("weight"), 0.0)
+            belief = _to_float(agg.get("belief", s.get("belief")), 0.0)
+            contribution = _to_float(agg.get("confidence"), 0.0)
+            importance_weight = _to_float(
+                agg.get("importance_weight", s.get("importance_weight")), 0.0
+            )
 
             rows.append(
                 {
@@ -201,10 +243,14 @@ def build_sensor_table(records: List[Dict[str, Any]]) -> pd.DataFrame:
                     "sender_id": s.get("sender_id"),
                     "sensor_name": s.get("sensor_name"),
                     "is_ego": s.get("is_ego"),
+                    "used_for_aggregation": s.get("used_for_aggregation"),
                     "facing_alignment": facing_alignment,
                     "region_alignment": region_alignment,
                     "distance_alignment": distance_alignment,
                     "fov_alignment": fov_alignment,
+                    "importance_weight": importance_weight,
+                    "weight": weight,
+                    "belief": belief,
                     "confidence_contribution": contribution,
                 }
             )
@@ -219,6 +265,10 @@ def build_sensor_table(records: List[Dict[str, Any]]) -> pd.DataFrame:
         "facing_alignment",
         "region_alignment",
         "distance_alignment",
+        "fov_alignment",
+        "importance_weight",
+        "weight",
+        "belief",
         "confidence_contribution",
     ]
     for col in numeric_cols:
@@ -232,36 +282,59 @@ def build_sensor_table(records: List[Dict[str, Any]]) -> pd.DataFrame:
 # Plot 1: combined bar chart
 # --------------------------------------------------
 
+SMOOTHING_WINDOW = 10
+MAX_STEP = 80
+
+
+def _smooth(series: pd.Series, window: int = SMOOTHING_WINDOW) -> pd.Series:
+    return series.rolling(window=window, min_periods=1, center=True).mean()
+
+
+def _clip_steps(df: pd.DataFrame, max_step: Optional[int] = MAX_STEP) -> pd.DataFrame:
+    if max_step is None or "step" not in df.columns:
+        return df
+    return df[df["step"] <= max_step]
+
+
+def _pretty_legend(col: str, member_cols: List[str]) -> str:
+    if col == "confidence_ego_only":
+        return "Ego MA only"
+    if col == "confidence_ego_plus_shared":
+        return "Ego MA + All Collaborators"
+    if col in member_cols:
+        return f"Ego MA + Collaborator {member_cols.index(col) + 1}"
+    return col.replace("confidence_", "")
+
+
 def save_avg_confidence_bar(conf_df: pd.DataFrame, output_dir: Path) -> None:
     if conf_df.empty:
         return
 
+    member_cols = list_member_confidence_columns(conf_df)
+    series_cols = ["confidence_ego_only", *member_cols, "confidence_ego_plus_shared"]
+
     grouped = (
-        conf_df.groupby("question_id", dropna=False)
-        .agg(
-            ego_only=("confidence_ego_only", "mean"),
-            ego_plus_member1=("confidence_ego_plus_member1", "mean"),
-            ego_plus_member2=("confidence_ego_plus_member2", "mean"),
-            ego_plus_shared=("confidence_ego_plus_shared", "mean"),
-        )
+        conf_df.groupby("question_id", dropna=False)[series_cols]
+        .mean()
         .reset_index()
         .sort_values("question_id")
     )
 
-    labels = grouped["question_id"].tolist()
+    labels = [f"Q{i + 1}" for i in range(len(grouped))]
     x = list(range(len(labels)))
-    width = 0.2
+    n = len(series_cols)
+    width = 0.8 / max(n, 1)
 
-    plt.figure(figsize=(max(10, len(labels) * 1.0), 5.5))
-    plt.bar([i - 1.5 * width for i in x], grouped["ego_only"], width=width, label="ego_only")
-    plt.bar([i - 0.5 * width for i in x], grouped["ego_plus_member1"], width=width, label="ego_plus_member1")
-    plt.bar([i + 0.5 * width for i in x], grouped["ego_plus_member2"], width=width, label="ego_plus_member2")
-    plt.bar([i + 1.5 * width for i in x], grouped["ego_plus_shared"], width=width, label="ego_plus_shared")
+    plt.figure(figsize=(max(12, len(labels) * (n * 0.35 + 0.5)), 5.5))
+    for i, col in enumerate(series_cols):
+        offset = (i - (n - 1) / 2.0) * width
+        legend_label = _pretty_legend(col, member_cols)
+        plt.bar([xi + offset for xi in x], grouped[col], width=width, label=legend_label)
 
-    plt.xticks(x, labels, rotation=45, ha="right")
-    plt.ylabel("Average confidence")
-    plt.title("Average confidence by question")
-    plt.legend()
+    plt.xticks(x, labels, rotation=0, ha="center", fontsize=14)
+    plt.ylabel("Sementic Confidence", fontsize=14, )
+    # plt.title("Average confidence by question")
+    plt.legend(fontsize=12, loc="upper left")
     plt.tight_layout()
     plt.savefig(output_dir / "avg_confidence_comparison_by_question.png", dpi=220)
     plt.close()
@@ -275,21 +348,27 @@ def save_confidence_timeseries(conf_df: pd.DataFrame, output_dir: Path) -> None:
     if conf_df.empty:
         return
 
+    member_cols = list_member_confidence_columns(conf_df)
+    series_cols = ["confidence_ego_only", *member_cols, "confidence_ego_plus_shared"]
+
     for qid, sub in conf_df.groupby("question_id", dropna=False):
-        sub = sub.sort_values("step")
+        sub = sub.sort_values("step").copy()
         if sub["step"].isna().all():
+            continue
+        for col in series_cols:
+            sub[col] = _smooth(sub[col])
+        sub = _clip_steps(sub)
+        if sub.empty:
             continue
 
         plt.figure(figsize=(9, 5))
-        plt.plot(sub["step"], sub["confidence_ego_only"], label="ego_only")
-        plt.plot(sub["step"], sub["confidence_ego_plus_member1"], label="ego_plus_member1")
-        plt.plot(sub["step"], sub["confidence_ego_plus_member2"], label="ego_plus_member2")
-        plt.plot(sub["step"], sub["confidence_ego_plus_shared"], label="ego_plus_shared")
+        for col in series_cols:
+            plt.plot(sub["step"], sub[col], label=_pretty_legend(col, member_cols))
 
-        plt.xlabel("Step")
-        plt.ylabel("Confidence")
-        plt.title(f"Confidence over time: {qid}")
-        plt.legend()
+        plt.xlabel("Time Step", fontsize=14)
+        plt.ylabel("Semantic Confidence", fontsize=14)
+        # plt.title(f"Confidence over time: {qid}", fontsize=14)
+        plt.legend(fontsize=12)
         plt.tight_layout()
 
         safe_name = str(qid).replace("/", "_")
@@ -306,16 +385,20 @@ def save_confidence_gain_timeseries(conf_df: pd.DataFrame, output_dir: Path) -> 
         return
 
     for qid, sub in conf_df.groupby("question_id", dropna=False):
-        sub = sub.sort_values("step")
+        sub = sub.sort_values("step").copy()
         if sub["step"].isna().all():
+            continue
+        sub["confidence_gain"] = _smooth(sub["confidence_gain"])
+        sub = _clip_steps(sub)
+        if sub.empty:
             continue
 
         plt.figure(figsize=(9, 5))
         plt.plot(sub["step"], sub["confidence_gain"], label="confidence_gain")
-        plt.xlabel("Step")
-        plt.ylabel("Confidence gain")
-        plt.title(f"Confidence gain over time: {qid}")
-        plt.legend()
+        plt.xlabel("Time Step", fontsize=14)
+        plt.ylabel("Semantic Confidence Gain", fontsize=14)
+        # plt.title(f"Confidence gain over time: {qid}", fontsize=14)
+        plt.legend(fontsize=12)
         plt.tight_layout()
 
         safe_name = str(qid).replace("/", "_")
@@ -345,13 +428,17 @@ def save_sensor_metric_timeseries(
         plt.figure(figsize=(9, 5))
 
         for sensor_key, sensor_sub in sub.groupby("sensor_key", dropna=False):
-            sensor_sub = sensor_sub.sort_values("step")
+            sensor_sub = sensor_sub.sort_values("step").copy()
+            sensor_sub[metric] = _smooth(sensor_sub[metric])
+            sensor_sub = _clip_steps(sensor_sub)
+            if sensor_sub.empty:
+                continue
             plt.plot(sensor_sub["step"], sensor_sub[metric], label=str(sensor_key))
 
-        plt.xlabel("Step")
-        plt.ylabel(metric)
-        plt.title(f"{title_prefix}: {qid}")
-        plt.legend()
+        plt.xlabel("Time Step", fontsize=14)
+        plt.ylabel(metric, fontsize=14)
+        # plt.title(f"{title_prefix}: {qid}", fontsize=14)
+        plt.legend(fontsize=12, loc="upper left")
         plt.tight_layout()
 
         safe_name = str(qid).replace("/", "_")
@@ -416,7 +503,7 @@ def main() -> None:
         output_dir,
         metric="fov_alignment",
         title_prefix="FOV alignment over time",
-        filename_prefix="timeseries_distance_alignment",
+        filename_prefix="timeseries_fov_alignment",
     )
 
     save_sensor_metric_timeseries(

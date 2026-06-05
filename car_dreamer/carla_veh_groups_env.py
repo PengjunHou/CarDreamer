@@ -90,25 +90,28 @@ class CarlaVehGroupsEnv(CarlaWptFixedEnv):
             self.grouping_strategy = AllInOneGroup()
 
         # Network resources (global default per-vehicle caps; you can override per-vehicle later)
-        uplink_bps = float(getattr(self._config, "uplink_bps", 6e6))
-        downlink_bps = float(getattr(self._config, "downlink_bps", 12e6))
-        self._default_net_res = NetResource(uplink_bps=uplink_bps, downlink_bps=downlink_bps)
+        comm_cfg = getattr(self._config, "communication", None)
+        bandwidth_hz = float(getattr(comm_cfg, "bandwidth_hz", 10e6))
+        self._default_net_res = NetResource(bandwidth_hz=bandwidth_hz)
 
         # Latency model
-        base_rtt_s = float(getattr(self._config, "base_rtt_s", 0.02))
-        proc_delay_s = float(getattr(self._config, "proc_delay_s", 0.005))
-        distance_decay_m = float(getattr(self._config, "distance_decay_m", 60.0))
-        min_rate_factor = float(getattr(self._config, "min_rate_factor", 0.2))
-        jitter_s = float(getattr(self._config, "jitter_s", 0.0))
+        overhead_base_s = float(getattr(comm_cfg, "overhead_base_s", 0.030))
+        overhead_per_kb_s = float(getattr(comm_cfg, "overhead_per_kb_s", 0.0015))
+        pathloss_model = str(getattr(comm_cfg, "pathloss_model", "urban_los"))
+        margin_db = float(getattr(comm_cfg, "margin_db", 10.0))
+        margin_sigma_db = float(getattr(comm_cfg, "margin_sigma_db", 0.0))
+        jitter_s = float(getattr(comm_cfg, "jitter_s", 0.0))
+        overhead_bytes = int(getattr(comm_cfg, "overhead_bytes", 64))
 
         self.latency_model: LatencyModel = SimpleWirelessLatency(
-            base_rtt_s=base_rtt_s,
-            proc_delay_s=proc_delay_s,
-            distance_decay_m=distance_decay_m,
-            min_rate_factor=min_rate_factor,
+            overhead_base_s=overhead_base_s,
+            overhead_per_kb_s=overhead_per_kb_s,
+            pathloss_model=pathloss_model,
+            margin_db=margin_db,
+            margin_sigma_db=margin_sigma_db,
             jitter_s=jitter_s,
             rng=self._rng,
-            overhead_bytes=64,  # You can adjust overhead_bytes as needed
+            overhead_bytes=overhead_bytes,
         )
 
         # Optional hook to build your cooperative perception payload

@@ -172,14 +172,54 @@ env:
     continuous_steer: [-1.0, 1.0] # continuous value of steering angles
     n_commands: 3 # number of text commands for message handler
 
+  speed_preset: ""
+
+  dump_vlm_records_each_step: True
+  vlm_dump_dir: "data"
+  policy_mode: "fixed"
+  policy_id: "P3"
+  policy_selector_id: "default"
+  policy_override: ""
+  policy_seed: 0
+  policy_bandwidth_floor: 0.1
+  payload:
+    selector_id: "default"
+    override_type: ""
+    enabled_types: ["images", "tokens"]
+    image_jpeg_quality: 80
+
+  vlm:
+    scene_description_max_new_tokens: 96
+    score_max_new_tokens: 512
+    enable_step_cache: True
+    enable_multi_query_scoring: True
+
   communication: # V2V communication global default settings
-    group_update_period: 20   # how often to recompute groups (steps)
-    comm_period: 1            # how often to trigger intra-group communication (steps)
-    uplink_bps: 6000000.0     # per-vehicle uplink bandwidth (bps)
-    downlink_bps: 12000000.0  # per-vehicle downlink bandwidth (bps)
-    base_rtt_s: 0.02          # base round-trip time (seconds)
-    proc_delay_s: 0.005       # processing delay (seconds)
-    distance_decay_m: 60.0    # distance decay constant for latency model (meters)
-    min_rate_factor: 0.2      # minimum rate factor (prevents rate from dropping to zero)
-    jitter_s: 0.0             # random jitter added to latency (seconds, 0 = disabled)
-    overhead_bytes: 64        # fixed protocol overhead per message (bytes)
+    group_update_period: 20         # how often to recompute groups (steps)
+    comm_period: 1                  # how often to trigger intra-group communication (steps)
+    bandwidth_hz: 20000000.0        # total shared wireless bandwidth (Hz), e.g. 20 MHz; policy splits this across selected members
+    # --- two-segment latency model ---
+    # latency = overhead_base_s + overhead_per_kb_s * payload_KB
+    #         + 8 * payload_bytes / shannon_bps
+    #         + jitter
+    # shannon_bps = B_alloc * log2(1 + SNR);  SNR_dB = Pt - PL(d, fc) - N0(B) - margin
+    overhead_base_s: 0.030          # fixed app/MAC overhead per link (s); ~30ms encode+decode+resource select
+    overhead_per_kb_s: 0.0015       # size-linear overhead (s/KB); covers payload-dependent encode/decode cost
+    pathloss_model: urban_los       # 3GPP TR 37.885 V2V: urban_los | urban_nlos | highway_los
+    margin_db: 10.0                 # lumped fading + blockage + implementation margin (dB), subtracted from SNR
+    margin_sigma_db: 0.0            # if > 0, sample margin per call as N(margin_db, sigma^2) for shadow fading
+    jitter_s: 0.0                   # uniform jitter ±jitter_s added to latency (s, 0 = disabled)
+    overhead_bytes: 64              # fixed protocol overhead added to payload bytes for tx-time accounting
+    drop_on_capacity_exceeded: false
+    log_dropped_messages: true
+
+runtime_logging:
+  enabled: True
+  level: DEBUG
+  console_level: INFO
+  file_level: DEBUG
+  console: True
+  file: True
+  console_key_only: True
+  step_debug_interval: 1
+  driver_debug_shapes: False

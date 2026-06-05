@@ -184,7 +184,7 @@ carla_group_right_turn:
   env.min_flow_dist: 6
   env.max_flow_dist: 8
   # Group vehicles
-  env.num_group_vehs: 2
+  env.num_group_vehs: 4
   env.group_observation.enabled: [camera, collision]
   env.group_observation.camera.fov: 180
   env.grouping_strategy: "fixed"
@@ -195,7 +195,7 @@ carla_group_right_turn:
   env.feature_size: 307200
   env.graph.window_s: 2.0
   env.graph.tmax: 20
-  env.graph.max_nodes: 3
+  env.graph.max_nodes: 5
   env.graph.feat_dim_max: 307200
   env.graph.star_graph: true
 
@@ -206,18 +206,30 @@ carla_group_right_turn_auto:
   env.max_flow_dist: 8
   env.lane_end_point: [-5.0, -110.3, 0.1, 90.0]
   # Group vehicles
-  env.num_group_vehs: 2
+  env.num_group_vehs: 4
   env.group_observation.enabled: [camera, collision]
   env.group_observation.camera.fov: 180
   env.grouping_strategy: "fixed"
   env.group_spawn_points:
     - [15.4, -140.2, 0.1, 180.0]
     - [7.4, -124.2, 0.1, 270.0]
+    - [-38.8, -135.1, 0.1, 0.0]
+    - [1.4, -151.2, 0.1, 90.0]
+  # Background traffic & pedestrians (scene enrichment; NOT part of the V2V group).
+  # Purpose: occlude the ego right-turn conflict region and add hazards so that the
+  # cooperative-perception (L3) signal has something to recover. Tune after viewing
+  # in sim; set explicit *_spawn_points to place targeted occluders/crossings.
+  env.num_background_vehs: 8
+  env.num_pedestrians: 6
+  env.scene_center: [-4.0, -135.0]      # [x, y] center for background placement
+  env.background_radius_m: 55.0         # keep background actors within this radius
+  env.background_veh_spawn_points: []   # optional explicit [x, y, z, yaw] occluders
+  env.pedestrian_spawn_points: []       # optional explicit [x, y, z] crossing points
   # Feature & graph construction (task-specific)
   env.feature_size: 3072
   env.graph.window_s: 2.0
   env.graph.tmax: 20
-  env.graph.max_nodes: 3
+  env.graph.max_nodes: 5
   env.graph.feat_dim_max: 3072
   env.graph.star_graph: true
 
