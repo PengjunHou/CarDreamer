@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import math
-import os
 import random
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -21,17 +19,9 @@ from .toolkit import (
     _dist_m,
     _tx_bytes_for_latency,
     canonicalize_payload_type,
-    decode_payload_dict,
     get_vehicle_pos,
-    payload_fn_llm,
 )
-from .toolkit.emulation.features import (
-    build_observable_region,
-    compute_accessibility,
-    compute_complementarity,
-    compute_task_relevance,
-)
-from .toolkit.emulation.policy import (
+from .toolkit.policy import (
     BANDWIDTH_BUDGET,
     CollaborationAction,
     PolicySelectorDecision,
@@ -39,7 +29,6 @@ from .toolkit.emulation.policy import (
     VehicleInfo,
     get_policy,
 )
-from .toolkit.emulation.queries import make_query_records
 
 
 GROUP_ID = 0
@@ -149,24 +138,10 @@ class RightTurnAutoRuntimeMixin:
         self._in_flight = []
         self._received = defaultdict(lambda: deque(maxlen=RECEIVED_BUFFER_SIZE))
         self._veh_net_res = {}
-        self._vlm_records = []
-        self._vlm_last_eval = {}
-        self._vlm_step_cache = {}
-        self._vlm_episode_dumped = False
-        self._emulation_episode_dumped = False
-        self._emulation_episode_steps = []
-        self._emulation_step_counter = 0
         self._comm_link_analysis_by_sender = {}
         self._comm_step_summary = {}
         self._comm_step_summary_step = -1
         self._reset_policy_runtime_state()
-        tracker = getattr(self, "_confidence_tracker", None)
-        if tracker is not None:
-            tracker.reset()
-        metrics = getattr(self, "_episode_metrics", None)
-        if metrics is not None:
-            metrics.reset()
-        self._episode_metrics_finalized = False
         RUNTIME_LOGGER.debug("Group runtime state reset.")
 
     def _get_active_policy_id(self) -> str:
@@ -246,7 +221,7 @@ class RightTurnAutoRuntimeMixin:
                 avg_link_latency_s=float(getattr(self, "_policy_prev_comm_summary", {}).get("avg_link_latency_s", 0.0)),
                 drop_ratio_prev_round=float(getattr(self, "_policy_prev_comm_summary", {}).get("drop_ratio_prev_round", 0.0)),
             )
-        collabs = [float(info.sender_collab) for info in infos]
+        collabs = [float(info.collaboration_score) for info in infos]
         dists = [float(info.distance_m) for info in infos]
         comm_stats = self._comm_link_analysis_by_sender or {}
         latencies = [
@@ -257,8 +232,8 @@ class RightTurnAutoRuntimeMixin:
         prev_summary = getattr(self, "_policy_prev_comm_summary", {})
         return SceneSummary(
             num_candidates=len(infos),
-            max_sender_collab=max(collabs) if collabs else 0.0,
-            mean_sender_collab=sum(collabs) / len(collabs) if collabs else 0.0,
+            max_collaboration_score=max(collabs) if collabs else 0.0,
+            mean_collaboration_score=sum(collabs) / len(collabs) if collabs else 0.0,
             min_distance_m=min(dists) if dists else 0.0,
             mean_distance_m=sum(dists) / len(dists) if dists else 0.0,
             avg_link_latency_s=(sum(latencies) / len(latencies)) if latencies else float(prev_summary.get("avg_link_latency_s", 0.0)),
@@ -462,63 +437,27 @@ class RightTurnAutoRuntimeMixin:
         self.agent = BasicAgent(self.ego)
         self.agent.set_destination(ego_transform.location)
         self._cache_actor(self.ego)
-        self._install_emergency_stop_hook()
-
-    def _install_emergency_stop_hook(self) -> None:
-        metrics = getattr(self, "_episode_metrics", None)
-        if metrics is None or self.agent is None:
-            return
-        original = self.agent.add_emergency_stop
-
-        def _patched(control, _orig=original, _m=metrics):
-            _m.on_emergency_stop()
-            return _orig(control)
-
-        self.agent.add_emergency_stop = _patched
 
     def _build_policy_vehicle_infos(self) -> List[VehicleInfo]:
         if getattr(self, "ego", None) is None:
             return []
         ego_tf = self.ego.get_transform()
-        ego_vel = self.ego.get_velocity()
-        ego_pose = {
-            "x": float(ego_tf.location.x),
-            "y": float(ego_tf.location.y),
-            "yaw_rad": math.radians(float(ego_tf.rotation.yaw)),
-        }
-        ego_velocity = {
-            "vx": float(ego_vel.x),
-            "vy": float(ego_vel.y),
-        }
-        scene_type = str(getattr(self, "_emulation_scene_type", "right_turn"))
-        queries = make_query_records(scene_type)
-        ego_region = build_observable_region((0.0, 0.0), 0.0, range_m=16.0, width_m=9.0, lookahead_m=8.0)
         infos: List[VehicleInfo] = []
         for actor in self.group_vehs:
             tf = actor.get_transform()
-            vel = actor.get_velocity()
-            delta_pos = (
-                float(tf.location.x) - ego_pose["x"],
-                float(tf.location.y) - ego_pose["y"],
-            )
-            delta_vel = (
-                float(vel.x) - ego_velocity["vx"],
-                float(vel.y) - ego_velocity["vy"],
-            )
-            delta_yaw = math.radians(float(tf.rotation.yaw)) - ego_pose["yaw_rad"]
-            sender_region = build_observable_region(delta_pos, delta_yaw)
-            distance_m = math.sqrt(delta_pos[0] * delta_pos[0] + delta_pos[1] * delta_pos[1])
-            complementarity = compute_complementarity(sender_region, ego_region)
-            accessibility = compute_accessibility(distance_m, 0.0)
-            collab_values = []
-            for query in queries:
-                relevance = compute_task_relevance(sender_region, ego_region, query.required_region)
-                collab_values.append(float(complementarity * relevance * accessibility))
-            sender_collab = float(sum(collab_values) / len(collab_values)) if collab_values else 0.0
+            dx = float(tf.location.x) - float(ego_tf.location.x)
+            dy = float(tf.location.y) - float(ego_tf.location.y)
+            distance_m = math.sqrt(dx * dx + dy * dy)
+            latest_stats = self._get_latest_comm_link_analysis(int(actor.id))
+            feasible = float(latest_stats.get("comm_feasible", 1.0))
+            latency_s = max(float(latest_stats.get("analysis_latency_s", 0.0)), 0.0)
+            distance_score = math.exp(-0.03 * max(distance_m, 0.0))
+            latency_score = math.exp(-2.0 * latency_s)
+            collaboration_score = float(distance_score * latency_score * max(feasible, 0.0))
             infos.append(
                 VehicleInfo(
                     vehicle_id=int(actor.id),
-                    sender_collab=sender_collab,
+                    collaboration_score=collaboration_score,
                     distance_m=float(distance_m),
                 )
             )
@@ -611,7 +550,11 @@ class RightTurnAutoRuntimeMixin:
     ) -> PayloadSelectorDecision:
         registry = getattr(self, "_payload_registry", None)
         if registry is None:
-            return PayloadSelectorDecision(payload_type="tokens", payload_encoder_id="tokens_v1", reason="missing_registry")
+            return PayloadSelectorDecision(
+                payload_type="object_list",
+                payload_encoder_id="object_list_v1",
+                reason="missing_registry",
+            )
         override = str(getattr(self, "_payload_override", "")).strip()
         if override:
             encoder_id = registry.default_encoder_id(override)
@@ -624,8 +567,8 @@ class RightTurnAutoRuntimeMixin:
         selector = getattr(self, "_payload_selector", None)
         if selector is None:
             return PayloadSelectorDecision(
-                payload_type="tokens",
-                payload_encoder_id=registry.default_encoder_id("tokens"),
+                payload_type="object_list",
+                payload_encoder_id=registry.default_encoder_id("object_list"),
                 reason="missing_payload_selector",
                 overridden=False,
             )
@@ -636,7 +579,7 @@ class RightTurnAutoRuntimeMixin:
             distance_m=float(distance_m),
             latest_comm_stats=latest_comm_stats,
             registry=registry,
-            enabled_types=list(getattr(self, "_payload_enabled_types", ["tokens", "images"])),
+            enabled_types=list(getattr(self, "_payload_enabled_types", ["object_list"])),
         )
 
     def _compute_current_payload_decisions(self) -> Dict[int, PayloadSelectorDecision]:
@@ -667,13 +610,13 @@ class RightTurnAutoRuntimeMixin:
         decision = decisions.get(int(vehicle_id))
         if decision is None:
             registry = getattr(self, "_payload_registry", None)
-            encoder_id = "tokens_v1"
+            encoder_id = "object_list_v1"
             if registry is not None:
-                encoder_id = registry.default_encoder_id("tokens")
+                encoder_id = registry.default_encoder_id("object_list")
             decision = PayloadSelectorDecision(
-                payload_type="tokens",
+                payload_type="object_list",
                 payload_encoder_id=encoder_id,
-                reason="default_tokens",
+                reason="default_object_list",
                 overridden=False,
             )
         return {
@@ -707,15 +650,10 @@ class RightTurnAutoRuntimeMixin:
         if registry is None:
             raise RuntimeError("Payload registry is not initialized.")
         encoder = registry.get(payload_decision.payload_type, payload_decision.payload_encoder_id)
-        sender_id = int(sender.id)
         encoding = encoder.encode(
             sender,
             obs,
             self.feature_size,
-            image_proc_fn=lambda img, _unused, sid=sender_id: self._compute_single_image_description_from_array(
-                img,
-                cache_key=("scene_description", sid),
-            ),
             jpeg_quality=int(getattr(self, "_payload_image_jpeg_quality", 80)),
         )
         payload = encoding.to_payload_dict()
@@ -971,10 +909,6 @@ class RightTurnAutoRuntimeMixin:
             "drop_ratio_prev_round": (dropped / attempted) if attempted > 0.0 else 0.0,
             "avg_link_latency_s": avg_latency_s,
         }
-        metrics = getattr(self, "_episode_metrics", None)
-        if metrics is not None:
-            metrics.add_bandwidth(float(total_payload_bytes))
-
     def _deliver_messages(self) -> None:
         if not self._in_flight:
             return
@@ -1001,24 +935,19 @@ class RightTurnAutoRuntimeMixin:
                 len(self._received.get(int(self.ego.id), deque())),
             )
 
-    # =========================================================
-    # VLM evaluation
-    # =========================================================
-
     def _build_graph_info(self) -> Dict[str, Any]:
-        ego_feature = self.payload_fn(
+        ego_encoding = self._payload_registry.get("object_list").encode(
             self.ego,
             self.obs,
             self.feature_size,
-            image_proc_fn=None,
         )
         msgs = self._received.get(int(self.ego.id), deque())
         device = "cuda" if torch.cuda.is_available() else "cpu"
         return self._graph_builder.build(
             ego_actor=self.ego,
             carla_world=self._world._world,
-            ego_feat=ego_feature.get("feat"),
-            ego_feat_dim=ego_feature.get("feat_dim"),
+            ego_feat=ego_encoding.feat,
+            ego_feat_dim=ego_encoding.feat_dim,
             msgs=msgs,
             t_step=self._time_step,
             dt=float(self._config.world.fixed_delta_seconds),
@@ -1090,58 +1019,8 @@ class RightTurnAutoRuntimeMixin:
         )
         return shared_data
 
-    def _maybe_dump_vlm_records_step(self) -> None:
-        if not getattr(self, "_dump_vlm_records_each_step", False):
-            return
-        os.makedirs(self._vlm_dump_dir, exist_ok=True)
-        path = os.path.join(self._vlm_dump_dir, "vlm_records_live.json")
-        self.dump_vlm_records(path)
-
-    def _maybe_dump_vlm_records(self, suffix: str) -> Optional[str]:
-        if not self._dump_vlm_records_on_episode_end or self._vlm_episode_dumped:
-            return None
-        os.makedirs(self._vlm_dump_dir, exist_ok=True)
-        filename = f"vlm_records_{suffix}_step_{int(self._time_step)}.json"
-        path = os.path.join(self._vlm_dump_dir, filename)
-        self.dump_vlm_records(path)
-        self._vlm_episode_dumped = True
-        return path
-
-    def _maybe_dump_emulation_episode(self, suffix: str) -> Optional[str]:
-        if (
-            not getattr(self, "_dump_emulation_records_on_episode_end", False)
-            or getattr(self, "_emulation_episode_dumped", False)
-            or not getattr(self, "_emulation_episode_steps", [])
-        ):
-            return None
-        os.makedirs(self._emulation_dump_dir, exist_ok=True)
-        filename = f"emulation_episode_{suffix}_step_{int(self._time_step)}.json"
-        path = os.path.join(self._emulation_dump_dir, filename)
-        self.dump_emulation_episode(path)
-        self._emulation_episode_dumped = True
-        return path
-
     def _handle_episode_end(self, terminated: bool, truncated: bool, info: Dict[str, Any]) -> Dict[str, Any]:
-        if terminated or truncated:
-            suffix = "terminated" if terminated else "truncated"
-            vlm_dump_path = self._maybe_dump_vlm_records(suffix)
-            if vlm_dump_path is not None:
-                info["vlm_dump_path"] = vlm_dump_path
-                RUNTIME_LOGGER.info(
-                    "Episode end dump created step=%d path=%s records=%d",
-                    self._time_step,
-                    vlm_dump_path,
-                    len(getattr(self, "_vlm_records", [])),
-                )
-            emulation_dump_path = self._maybe_dump_emulation_episode(suffix)
-            if emulation_dump_path is not None:
-                info["emulation_dump_path"] = emulation_dump_path
-                RUNTIME_LOGGER.info(
-                    "Predictor-ready episode dump created step=%d path=%s canonical_steps=%d",
-                    self._time_step,
-                    emulation_dump_path,
-                    len(getattr(self, "_emulation_episode_steps", [])),
-                )
+        del terminated, truncated
         return info
 
     # =========================================================

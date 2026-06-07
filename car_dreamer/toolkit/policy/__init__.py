@@ -4,8 +4,8 @@ Implements the 8 fixed policies defined in Section IV.B-C of the paper:
   P1  Ego-Only            — no collaboration
   P2  Full-Low-Equal      — all vehicles, low freq, equal bandwidth
   P3  Full-High-Equal     — all vehicles, high freq, equal bandwidth
-  P4  Top2-Mid-Equal      — top-2 by s_collab, mid freq, equal bandwidth
-  P5  Top2-Adaptive-Value — top-2 by s_collab, adaptive freq, value-weighted BW
+  P4  Top2-Mid-Equal      — top-2 by collaboration score, mid freq, equal bandwidth
+  P5  Top2-Adaptive-Value — top-2 by collaboration score, adaptive freq, value-weighted BW
   P6  Nearest2-Mid-Dist   — 2 closest vehicles, mid freq, distance-weighted BW
   P7  Random2-Mid-Equal   — random 2 vehicles, mid freq, equal bandwidth
   P8  Random3-Adaptive    — random 3 vehicles, adaptive freq, value-weighted BW
@@ -19,7 +19,7 @@ from __future__ import annotations
 import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import Dict, Iterable, List, Sequence
 
 # Sharing frequency levels (Section IV.B)
 NU_LOW: float = 0.2
@@ -34,7 +34,7 @@ BANDWIDTH_BUDGET: float = 1.0
 class VehicleInfo:
     """Minimal per-vehicle info needed by policies to make decisions."""
     vehicle_id: int
-    sender_collab: float   # aggregate collaboration value s_collab (scalar summary)
+    collaboration_score: float   # aggregate collaboration value used by policy selection
     distance_m: float      # spatial distance to ego
 
 
@@ -104,8 +104,8 @@ class CollaborationAction:
 @dataclass(frozen=True)
 class SceneSummary:
     num_candidates: int = 0
-    max_sender_collab: float = 0.0
-    mean_sender_collab: float = 0.0
+    max_collaboration_score: float = 0.0
+    mean_collaboration_score: float = 0.0
     min_distance_m: float = 0.0
     mean_distance_m: float = 0.0
     avg_link_latency_s: float = 0.0
@@ -153,7 +153,7 @@ class FixedCollaborationPolicy(ABC):
         collab_map: Dict[int, float],
         all_ids: List[int],
     ) -> Dict[int, float]:
-        """Bandwidth proportional to s_collab; 0 for unselected."""
+        """Bandwidth proportional to collaboration score; 0 for unselected."""
         total = sum(max(collab_map.get(vid, 0.0), 0.0) for vid in selected_ids)
         bw: Dict[int, float] = {}
         for vid in all_ids:
@@ -244,16 +244,16 @@ class FullHighEqualPolicy(FixedCollaborationPolicy):
 
 
 # ---------------------------------------------------------------------------
-# P4 — Top2-Mid-Equal: top-2 by s_collab, mid freq, equal bandwidth
+# P4 - Top2-Mid-Equal: top-2 by collaboration score, mid freq, equal bandwidth
 # ---------------------------------------------------------------------------
 class Top2MidEqualPolicy(FixedCollaborationPolicy):
-    """P4: Select 2 vehicles with highest s_collab, mid frequency, equal bandwidth."""
+    """P4: Select 2 vehicles with highest collaboration score, mid frequency, equal bandwidth."""
 
     policy_id = "P4"
 
     def __call__(self, vehicles: Sequence[VehicleInfo], rng=None) -> CollaborationAction:
         all_ids = [v.vehicle_id for v in vehicles]
-        sorted_veh = sorted(vehicles, key=lambda v: v.sender_collab, reverse=True)
+        sorted_veh = sorted(vehicles, key=lambda v: v.collaboration_score, reverse=True)
         selected = [v.vehicle_id for v in sorted_veh[:2]]
         nu_map = {vid: NU_MID for vid in selected}
         bw_map = self._equal_bandwidth(selected, all_ids)
@@ -261,23 +261,23 @@ class Top2MidEqualPolicy(FixedCollaborationPolicy):
 
 
 # ---------------------------------------------------------------------------
-# P5 — Top2-Adaptive-Value: top-2 by s_collab, adaptive freq, value-weighted BW
+# P5 - Top2-Adaptive-Value: top-2 by collaboration score, adaptive freq, value-weighted BW
 # ---------------------------------------------------------------------------
 class Top2AdaptiveValuePolicy(FixedCollaborationPolicy):
-    """P5: Top-2 by s_collab; rank-1 gets high freq, rank-2 gets mid freq;
-    bandwidth allocated proportional to s_collab."""
+    """P5: Top-2 by collaboration score; rank-1 gets high freq, rank-2 gets mid freq;
+    bandwidth allocated proportional to collaboration score."""
 
     policy_id = "P5"
 
     def __call__(self, vehicles: Sequence[VehicleInfo], rng=None) -> CollaborationAction:
         all_ids = [v.vehicle_id for v in vehicles]
-        sorted_veh = sorted(vehicles, key=lambda v: v.sender_collab, reverse=True)
+        sorted_veh = sorted(vehicles, key=lambda v: v.collaboration_score, reverse=True)
         top2 = sorted_veh[:2]
         selected = [v.vehicle_id for v in top2]
         nu_map: Dict[int, float] = {}
         for rank, v in enumerate(top2):
             nu_map[v.vehicle_id] = NU_HIGH if rank == 0 else NU_MID
-        collab_map = {v.vehicle_id: v.sender_collab for v in vehicles}
+        collab_map = {v.vehicle_id: v.collaboration_score for v in vehicles}
         bw_map = self._value_weighted_bandwidth(selected, collab_map, all_ids)
         return self._make_action(selected, nu_map, bw_map, all_ids)
 
@@ -323,7 +323,7 @@ class Random2MidEqualPolicy(FixedCollaborationPolicy):
 # ---------------------------------------------------------------------------
 class Random3AdaptiveValuePolicy(FixedCollaborationPolicy):
     """P8: Randomly select 3 vehicles; rank-1 gets high freq, others mid freq;
-    bandwidth proportional to s_collab."""
+    bandwidth proportional to collaboration score."""
 
     policy_id = "P8"
 
@@ -332,8 +332,8 @@ class Random3AdaptiveValuePolicy(FixedCollaborationPolicy):
         all_ids = [v.vehicle_id for v in vehicles]
         k = min(3, len(all_ids))
         selected_ids = _rng.sample(all_ids, k)
-        # sort selected by s_collab descending to assign adaptive frequencies
-        collab_map = {v.vehicle_id: v.sender_collab for v in vehicles}
+        # Sort selected members by collaboration score to assign adaptive frequencies.
+        collab_map = {v.vehicle_id: v.collaboration_score for v in vehicles}
         selected_sorted = sorted(selected_ids, key=lambda vid: collab_map.get(vid, 0.0), reverse=True)
         nu_map: Dict[int, float] = {}
         for rank, vid in enumerate(selected_sorted):
@@ -388,9 +388,9 @@ class RuleBasedPolicySelector:
             return PolicySelectorDecision("P2", reason="poor_link_quality", scene_summary=scene_summary)
         if float(scene_summary.min_distance_m) <= 8.0 and num_candidates >= 2:
             return PolicySelectorDecision("P6", reason="nearby_senders", scene_summary=scene_summary)
-        if float(scene_summary.max_sender_collab) >= 0.55 and num_candidates >= 2:
+        if float(scene_summary.max_collaboration_score) >= 0.55 and num_candidates >= 2:
             return PolicySelectorDecision("P5", reason="high_collaboration_value", scene_summary=scene_summary)
-        if num_candidates >= 3 and float(scene_summary.mean_sender_collab) < 0.25:
+        if num_candidates >= 3 and float(scene_summary.mean_collaboration_score) < 0.25:
             return PolicySelectorDecision("P7", reason="many_low_value_candidates", scene_summary=scene_summary)
         return PolicySelectorDecision("P3", reason="default_full_high", scene_summary=scene_summary)
 
@@ -426,74 +426,3 @@ def get_policy(policy_id: str) -> FixedCollaborationPolicy:
 
 def list_policy_ids() -> List[str]:
     return POLICY_REGISTRY.list_policy_ids()
-
-
-# ---------------------------------------------------------------------------
-# Helpers to bridge CandidateVehicleState → VehicleInfo
-# ---------------------------------------------------------------------------
-
-def vehicle_info_from_state(vehicle) -> VehicleInfo:
-    """Convert a CandidateVehicleState to the VehicleInfo needed by policies."""
-    import math
-    collab = vehicle.sender_collab
-    scalar_collab = float(sum(collab.values()) / len(collab)) if collab else float(vehicle.complementarity * vehicle.accessibility)
-    dist = vehicle.communication_stats.get("distance_m")
-    if dist is None:
-        dist = math.sqrt(float(vehicle.delta_pos[0]) ** 2 + float(vehicle.delta_pos[1]) ** 2)
-    return VehicleInfo(vehicle_id=int(vehicle.vehicle_id), sender_collab=scalar_collab, distance_m=float(dist))
-
-
-# ---------------------------------------------------------------------------
-# Episode-level helpers (Section IV.E: trajectory generation)
-# ---------------------------------------------------------------------------
-
-def apply_action_to_episode(episode, policy: FixedCollaborationPolicy, *, seed_base: int = 0):
-    """Return a new episode with policy actions written into each step's vehicle fields.
-
-    For each step, the policy is called with a per-step seed to produce
-    (alpha_i, nu_i, bandwidth_i) for every candidate vehicle. These values are
-    stored back into CandidateVehicleState so the dataset can include them in
-    the node feature vector for policy-conditioned learning.
-    """
-    import dataclasses as _dc
-    new_steps = []
-    for step_idx, step in enumerate(episode.steps):
-        infos = [vehicle_info_from_state(v) for v in step.candidate_vehicles]
-        rng = random.Random(seed_base + step_idx)
-        action = policy(infos, rng=rng)
-        new_vehicles = []
-        for v in step.candidate_vehicles:
-            vid = v.vehicle_id
-            new_v = _dc.replace(
-                v,
-                alpha=float(action.alpha.get(vid, 0.0)),
-                nu=float(action.nu.get(vid, 0.0)),
-                bandwidth=float(action.bandwidth.get(vid, 0.0)),
-            )
-            new_vehicles.append(new_v)
-        new_step = _dc.replace(step, candidate_vehicles=new_vehicles, policy_id=policy.policy_id)
-        new_steps.append(new_step)
-    return _dc.replace(
-        episode,
-        steps=new_steps,
-        policy_id=policy.policy_id,
-        metadata={**episode.metadata, "policy_id": policy.policy_id},
-    )
-
-
-def generate_policy_conditioned_episodes(base_episode, policies=None, *, seed_base: int = 0):
-    """Generate one episode variant per policy from a single base episode.
-
-    Implements Section IV.E trajectory generation: the same underlying scene
-    is replayed under each of the 8 fixed policies to produce the diverse
-    training dataset for policy-conditioned dynamics learning.
-    """
-    import dataclasses as _dc
-    if policies is None:
-        policies = DEFAULT_POLICIES
-    result = []
-    for pol in policies:
-        new_ep = apply_action_to_episode(base_episode, pol, seed_base=seed_base)
-        new_ep = _dc.replace(new_ep, episode_id=f"{base_episode.episode_id}__{pol.policy_id}")
-        result.append(new_ep)
-    return result

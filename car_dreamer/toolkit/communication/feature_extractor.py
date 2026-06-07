@@ -171,7 +171,7 @@ def get_extractor(cfg: Optional[FeatureExtractorConfig] = None) -> FeatureExtrac
 
 #     return {"feat": feat, "feat_dim": feature_size, "has_image": True, "text": text}
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 import numpy as np
 
 
@@ -191,73 +191,6 @@ def _empty_feature(feature_size: int) -> np.ndarray:
     return np.zeros((max(int(feature_size), 0),), dtype=np.float32)
 
 
-def _coerce_feature_output(
-    proc_out: Any,
-    feature_size: int,
-) -> Dict[str, Any]:
-    feature = _empty_feature(feature_size)
-    scene_description = ""
-
-    if isinstance(proc_out, str):
-        scene_description = proc_out.strip()
-    elif isinstance(proc_out, dict):
-        if proc_out.get("scene_description") is not None:
-            scene_description = str(proc_out["scene_description"]).strip()
-        if proc_out.get("feat") is not None:
-            feature = np.asarray(proc_out["feat"], dtype=np.float32).reshape(-1)
-    elif proc_out is not None:
-        feature = np.asarray(proc_out, dtype=np.float32).reshape(-1)
-
-    return {
-        "feat": feature,
-        "feat_dim": int(feature.shape[0]),
-        "scene_description": scene_description,
-    }
-
-
-def payload_fn_llm(
-    sender,
-    obs,
-    feature_size,
-    *args,
-    image_proc_fn: Optional[Callable[..., Any]] = None,
-    **kwargs,
-):
-    img = obs.get("camera", None)
-    raw_message = obs.get("message", "")
-    raw_message_text = _safe_to_text(raw_message)
-
-    has_image = bool(img is not None)
-    scene_description = ""
-    feat = _empty_feature(feature_size)
-    feat_dim = int(feat.shape[0])
-
-    if has_image and image_proc_fn is not None:
-        try:
-            proc_out = image_proc_fn(img, feature_size)
-            payload_bits = _coerce_feature_output(proc_out, feature_size)
-            feat = payload_bits["feat"]
-            feat_dim = int(payload_bits["feat_dim"])
-            scene_description = payload_bits["scene_description"]
-        except Exception as exc:
-            scene_description = f"image_proc_fn failed: {type(exc).__name__}: {exc}"
-
-    parts = []
-    if raw_message_text:
-        parts.append(f"observer_message: {raw_message_text}")
-    if scene_description:
-        parts.append(f"scene_description: {scene_description}")
-    merged_text = "\n".join(parts)
-
-    return {
-        "feat": feat,
-        "feat_dim": feat_dim,
-        "has_image": has_image,
-        "img_emb": None,
-        "text": merged_text,
-        "scene_description": scene_description,
-    }
-    
 def payload_fn_cnn(sender, obs, feature_size, image_embed_fn):
     img = obs.get("camera", None)
     raw_message = obs.get("message", "")

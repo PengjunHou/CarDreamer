@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
@@ -10,13 +11,13 @@ from PIL import Image
 
 PAYLOAD_TYPE_ORDER: tuple[str, ...] = (
     "object_list",
+    "bev",
     "occupancy",
     "images",
     "latent",
-    "tokens",
 )
-DEFAULT_PAYLOAD_TYPE = "tokens"
-DEFAULT_PAYLOAD_ENCODER_ID = "tokens_v1"
+DEFAULT_PAYLOAD_TYPE = "object_list"
+DEFAULT_PAYLOAD_ENCODER_ID = "object_list_v1"
 
 
 def canonicalize_payload_type(payload_type: str | None) -> str:
@@ -143,8 +144,8 @@ class UnsupportedPayloadEncoder(PayloadEncoder):
         )
 
 
-class TokensPayloadEncoder(PayloadEncoder):
-    payload_type = "tokens"
+class ObjectListPayloadEncoder(PayloadEncoder):
+    payload_type = "object_list"
     payload_encoder_id = DEFAULT_PAYLOAD_ENCODER_ID
 
     def encode(
@@ -157,26 +158,32 @@ class TokensPayloadEncoder(PayloadEncoder):
         jpeg_quality: int = 80,
         **kwargs,
     ) -> PayloadEncoding:
-        del sender, jpeg_quality, kwargs
-        img = obs.get("camera", None)
-        raw_message_text = _safe_to_text(obs.get("message", ""))
-        scene_description = ""
-        if img is not None and image_proc_fn is not None:
+        del image_proc_fn, jpeg_quality, kwargs
+        pose: Dict[str, float] = {}
+        velocity: Dict[str, float] = {}
+        if sender is not None:
             try:
-                proc_out = image_proc_fn(img, feature_size)
-                if isinstance(proc_out, str):
-                    scene_description = proc_out.strip()
-                elif isinstance(proc_out, Mapping):
-                    scene_description = str(proc_out.get("scene_description", "")).strip()
-            except Exception as exc:  # pragma: no cover - exercised in runtime fallback
-                scene_description = f"image_proc_fn failed: {type(exc).__name__}: {exc}"
-        parts = []
-        if raw_message_text:
-            parts.append(f"observer_message: {raw_message_text}")
-        if scene_description:
-            parts.append(f"scene_description: {scene_description}")
-        merged_text = "\n".join(parts)
-        data = merged_text.encode("utf-8")
+                tf = sender.get_transform()
+                pose = {
+                    "x": float(tf.location.x),
+                    "y": float(tf.location.y),
+                    "yaw": float(tf.rotation.yaw),
+                }
+            except Exception:
+                pose = {}
+            try:
+                vel = sender.get_velocity()
+                velocity = {"vx": float(vel.x), "vy": float(vel.y)}
+            except Exception:
+                velocity = {}
+        objects = obs.get("objects", obs.get("object_list", []))
+        payload = {
+            "sender_pose": pose,
+            "sender_velocity": velocity,
+            "objects": objects if isinstance(objects, list) else [],
+            "message": _safe_to_text(obs.get("message", "")),
+        }
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
         return PayloadEncoding(
             payload_type=self.payload_type,
             payload_encoder_id=self.payload_encoder_id,
@@ -184,9 +191,9 @@ class TokensPayloadEncoder(PayloadEncoder):
             data_nbytes=len(data),
             feat=_empty_feature(feature_size),
             feat_dim=0,
-            scene_description=scene_description,
-            text=merged_text,
-            has_image=bool(img is not None),
+            scene_description="",
+            text="",
+            has_image=False,
             img_emb=None,
         )
 
@@ -289,16 +296,16 @@ class RuleBasedPayloadSelector:
         feasible = float(latest_comm_stats.get("comm_feasible", 1.0))
         link_rate_bps = float(latest_comm_stats.get("link_rate_bps", 0.0))
         preferred = DEFAULT_PAYLOAD_TYPE
-        reason = "default_tokens"
+        reason = "default_object_list"
         if feasible <= 0.5 or link_rate_bps < 2.0e6:
-            preferred = "tokens"
+            preferred = "object_list"
             reason = "low_link_capacity"
         elif float(bandwidth) >= 0.45 and float(distance_m) <= 12.0:
-            preferred = "images"
+            preferred = "bev" if registry.has_type("bev") else "object_list"
             reason = "high_bandwidth_near_sender"
         else:
-            preferred = "tokens"
-            reason = "default_tokens"
+            preferred = "object_list"
+            reason = "default_object_list"
         if preferred not in enabled:
             preferred = enabled[0]
             reason = f"{reason}_fallback_enabled"
@@ -312,11 +319,10 @@ class RuleBasedPayloadSelector:
 
 def build_default_payload_registry() -> PayloadEncoderRegistry:
     registry = PayloadEncoderRegistry()
-    registry.register("object_list", UnsupportedPayloadEncoder("object_list", "object_list_v1"))
+    registry.register("object_list", ObjectListPayloadEncoder())
     registry.register("occupancy", UnsupportedPayloadEncoder("occupancy", "occupancy_v1"))
     registry.register("images", ImagesPayloadEncoder())
     registry.register("latent", UnsupportedPayloadEncoder("latent", "latent_v1"))
-    registry.register("tokens", TokensPayloadEncoder())
     return registry
 
 
@@ -332,11 +338,6 @@ def decode_payload_dict(payload: Mapping[str, Any]) -> Dict[str, Any]:
             image = Image.open(BytesIO(bytes(data))).convert("RGB")
         except Exception:
             image = None
-    elif payload_type == "tokens" and data and not text:
-        try:
-            text = bytes(data).decode("utf-8")
-        except Exception:
-            text = ""
     return {
         "payload_type": payload_type,
         "payload_encoder_id": payload_encoder_id or (

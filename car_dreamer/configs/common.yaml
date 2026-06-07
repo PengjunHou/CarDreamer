@@ -174,8 +174,6 @@ env:
 
   speed_preset: ""
 
-  dump_vlm_records_each_step: True
-  vlm_dump_dir: "data"
   policy_mode: "fixed"
   policy_id: "P3"
   policy_selector_id: "default"
@@ -185,14 +183,8 @@ env:
   payload:
     selector_id: "default"
     override_type: ""
-    enabled_types: ["images", "tokens"]
+    enabled_types: ["object_list"]
     image_jpeg_quality: 80
-
-  vlm:
-    scene_description_max_new_tokens: 96
-    score_max_new_tokens: 512
-    enable_step_cache: True
-    enable_multi_query_scoring: True
 
   communication: # V2V communication global default settings
     group_update_period: 20         # how often to recompute groups (steps)

@@ -7,11 +7,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.nn.utils.rnn import pack_padded_sequence
-
-# torch-geometric (PyG)
-from torch_geometric.data import Data
 
 
 # =========================
@@ -96,7 +91,7 @@ class VehicleNodeGraphBuilder:
         t_step: int,
         dt: float,
         device: torch.device,
-    ) -> Data:
+    ) -> Dict[str, Any]:
         cfg = self.cfg
         t_now = float(t_step) * float(dt)
 

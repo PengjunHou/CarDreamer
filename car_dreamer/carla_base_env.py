@@ -230,12 +230,6 @@ class CarlaBaseEnv(gym.Env):
                 extra_destroy()
             except Exception:
                 pass
-        release_vlm = getattr(self, "_release_vlm_models", None)
-        if callable(release_vlm):
-            try:
-                release_vlm()
-            except Exception:
-                pass
         if self._monitor is not None:
             try:
                 self._monitor.stop()

@@ -9,11 +9,9 @@ Two pieces of language live here:
    high for matching cases.
 
 2. ``ActionFactor`` -- the *schema* for a scene-grounded accelerate / decelerate /
-   maintain "safety factor". Factors are NOT hardcoded here: they are generated per
-   scene by a VLM/LLM (built in the downstream inference / semantic-confidence
-   stage), because scene content varies (some scenes have no intersection or traffic
-   light). At inference, each factor's positive/negative is embedded and scored
-   against ``z_fused``.
+   maintain "safety factor". Factors are NOT hardcoded here because scene content
+   varies (some scenes have no intersection or traffic light). At inference, each
+   factor's positive/negative is embedded and scored against ``z_fused``.
 
 The scene description (piece 1) is template-from-ground-truth on purpose -- the
 reconstruction target must be deterministic. Its expressiveness is the ceiling of
@@ -94,16 +92,14 @@ def build_scene_description(
 # --------------------------------------------------------------------------- #
 # Action factors are NOT hardcoded here: scene content varies (some scenes have no
 # intersection or traffic light), so the factor set must be *generated from the
-# current scene* by a VLM/LLM. This is only the structural schema. The actual
-# generator is built in the inference / semantic-confidence stage and emits a list
-# of ``ActionFactor`` per scene.
+# current scene* by an external factor generator. This is only the structural
+# schema. The actual generator emits a list of ``ActionFactor`` per scene.
 #
 # Why dynamic generation is safe in L3: ``z_fused`` is trained toward the templated
 # GT description, so it *grounds* the factors -- an irrelevant / over-proposed
-# factor simply gets low cosine and washes out (VLM proposes = recall; z_fused
-# arbitrates = precision). The one real constraint is that generated factor language
-# should share vocabulary with ``build_scene_description`` above, so the cosine
-# against ``z_fused`` stays calibrated.
+# factor simply gets low cosine and washes out. The one real constraint is that
+# generated factor language should share vocabulary with ``build_scene_description``
+# above, so the cosine against ``z_fused`` stays calibrated.
 # --------------------------------------------------------------------------- #
 
 ACTIONS: Sequence[str] = ("accelerate", "decelerate", "maintain")
@@ -113,16 +109,15 @@ ACTIONS: Sequence[str] = ("accelerate", "decelerate", "maintain")
 class ActionFactor:
     """One scene-grounded driving factor, matching the PDF §7 structured-JSON format.
 
-    Produced per scene by the (downstream) VLM/LLM factor generator, never hardcoded.
+    Produced per scene by the downstream factor generator, never hardcoded.
     Field names mirror the PDF: ``evidence_language`` (l_pos), ``contrast_language``
     (l_neg), and ``expected_sensor_check`` -- the optional physical / CARLA-state
     grounding channel from PDF §6 (e.g. ``"front_vehicle_distance < 12m"``).
     ``sign`` / ``weight`` come from the PDF §11 aggregation pseudocode.
 
     At inference, ``evidence_language`` / ``contrast_language`` are embedded and
-    scored against ``z_fused``; the per-factor confidence (optionally combined with
-    the ``expected_sensor_check`` channel) is aggregated per action -- this is where
-    the deferred semantic-confidence belief/ambiguity formula plugs in.
+    scored against ``z_fused``; the per-factor score can optionally be combined with
+    the ``expected_sensor_check`` channel and aggregated per action.
     """
 
     factor: str                      # short name, e.g. "vehicle close ahead"
@@ -138,7 +133,7 @@ def factors_from_support_json(payload: Dict[str, Any]) -> List["ActionFactor"]:
     """Parse the PDF §7 grouped JSON into a flat list of ``ActionFactor``.
 
     Expects ``{"decelerate_support": [ {...}, ... ], "accelerate_support": [...], ...}``
-    -- exactly what the VLM/LLM factor generator is prompted to emit. Missing/unknown
+    -- exactly what the factor generator emits. Missing/unknown
     fields are tolerated so a partial generation still yields usable factors.
     """
     factors: List[ActionFactor] = []

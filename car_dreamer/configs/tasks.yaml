@@ -223,8 +223,8 @@ carla_group_right_turn_auto:
   env.num_pedestrians: 6
   env.scene_center: [-4.0, -135.0]      # [x, y] center for background placement
   env.background_radius_m: 55.0         # keep background actors within this radius
-  env.background_veh_spawn_points: []   # optional explicit [x, y, z, yaw] occluders
-  env.pedestrian_spawn_points: []       # optional explicit [x, y, z] crossing points
+  env.background_veh_spawn_points: null # optional explicit [x, y, z, yaw] occluders
+  env.pedestrian_spawn_points: null     # optional explicit [x, y, z] crossing points
   # Feature & graph construction (task-specific)
   env.feature_size: 3072
   env.graph.window_s: 2.0

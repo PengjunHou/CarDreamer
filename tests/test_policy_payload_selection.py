@@ -10,7 +10,7 @@ from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLKIT_ROOT = REPO_ROOT / "car_dreamer" / "toolkit"
-EMULATION_ROOT = TOOLKIT_ROOT / "emulation"
+POLICY_ROOT = TOOLKIT_ROOT / "policy"
 COMM_ROOT = TOOLKIT_ROOT / "communication"
 
 
@@ -35,13 +35,12 @@ def _load_module(full_name: str, path: Path):
     return module
 
 
-def _load_emulation_module(module_name: str):
+def _load_policy_module():
     _ensure_pkg("car_dreamer", REPO_ROOT / "car_dreamer")
     _ensure_pkg("car_dreamer.toolkit", TOOLKIT_ROOT)
-    _ensure_pkg("car_dreamer.toolkit.emulation", EMULATION_ROOT)
     return _load_module(
-        f"car_dreamer.toolkit.emulation.{module_name}",
-        EMULATION_ROOT / f"{module_name}.py",
+        "car_dreamer.toolkit.policy",
+        POLICY_ROOT / "__init__.py",
     )
 
 
@@ -55,7 +54,7 @@ def _load_comm_module(module_name: str):
     )
 
 
-POLICY = _load_emulation_module("policy")
+POLICY = _load_policy_module()
 PAYLOADS = _load_comm_module("payloads")
 
 
@@ -78,21 +77,21 @@ class PolicyPayloadSelectionTest(unittest.TestCase):
         )
         self.assertEqual(
             selector(
-                POLICY.SceneSummary(num_candidates=2, max_sender_collab=0.7, min_distance_m=15.0),
+                POLICY.SceneSummary(num_candidates=2, max_collaboration_score=0.7, min_distance_m=15.0),
                 registry=registry,
             ).policy_id,
             "P5",
         )
         self.assertEqual(
             selector(
-                POLICY.SceneSummary(num_candidates=4, mean_sender_collab=0.1, min_distance_m=20.0),
+                POLICY.SceneSummary(num_candidates=4, mean_collaboration_score=0.1, min_distance_m=20.0),
                 registry=registry,
             ).policy_id,
             "P7",
         )
         self.assertEqual(
             selector(
-                POLICY.SceneSummary(num_candidates=2, max_sender_collab=0.2, mean_sender_collab=0.3, min_distance_m=20.0),
+                POLICY.SceneSummary(num_candidates=2, max_collaboration_score=0.2, mean_collaboration_score=0.3, min_distance_m=20.0),
                 registry=registry,
             ).policy_id,
             "P3",
@@ -114,7 +113,7 @@ class PolicyPayloadSelectionTest(unittest.TestCase):
         registry = POLICY.build_default_policy_registry()
         registry.register(CustomPolicy())
         self.assertIn("PX", registry.list_policy_ids())
-        action = registry.get("PX")([POLICY.VehicleInfo(vehicle_id=5, sender_collab=0.2, distance_m=8.0)])
+        action = registry.get("PX")([POLICY.VehicleInfo(vehicle_id=5, collaboration_score=0.2, distance_m=8.0)])
         self.assertEqual(action.alpha[5], 1.0)
 
     def test_collaboration_action_normalizes_only_active_bandwidth(self):
@@ -145,15 +144,14 @@ class PolicyPayloadSelectionTest(unittest.TestCase):
         image = np.full((8, 8, 3), fill_value=120, dtype=np.uint8)
         obs = {"camera": image, "message": "car on right"}
 
-        tokens_encoding = registry.get("tokens").encode(
+        object_list_encoding = registry.get("object_list").encode(
             sender=None,
             obs=obs,
             feature_size=16,
-            image_proc_fn=lambda img, feature_size: "scene ahead clear",
         )
-        self.assertEqual(tokens_encoding.payload_type, "tokens")
-        self.assertGreater(tokens_encoding.data_nbytes, 0)
-        self.assertIn("scene ahead clear", tokens_encoding.text)
+        self.assertEqual(object_list_encoding.payload_type, "object_list")
+        self.assertGreater(object_list_encoding.data_nbytes, 0)
+        self.assertEqual(object_list_encoding.feat_dim, 0)
 
         images_encoding = registry.get("images").encode(
             sender=None,
@@ -175,19 +173,19 @@ class PolicyPayloadSelectionTest(unittest.TestCase):
             distance_m=5.0,
             latest_comm_stats={"comm_feasible": 0.0, "link_rate_bps": 1.0e6},
             registry=registry,
-            enabled_types=["images", "tokens"],
+            enabled_types=["object_list", "images"],
         )
-        self.assertEqual(low_link.payload_type, "tokens")
+        self.assertEqual(low_link.payload_type, "object_list")
         high_link = selector(
             sender_id=1,
             bandwidth=0.6,
             distance_m=6.0,
             latest_comm_stats={"comm_feasible": 1.0, "link_rate_bps": 8.0e6},
             registry=registry,
-            enabled_types=["images", "tokens"],
+            enabled_types=["object_list", "images"],
         )
-        self.assertEqual(high_link.payload_type, "images")
-        self.assertEqual(PAYLOADS.payload_type_to_one_hot("images").tolist(), [0.0, 0.0, 1.0, 0.0, 0.0])
+        self.assertEqual(high_link.payload_type, "object_list")
+        self.assertEqual(PAYLOADS.payload_type_to_one_hot("images").tolist(), [0.0, 0.0, 0.0, 1.0, 0.0])
 
 
 if __name__ == "__main__":

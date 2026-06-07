@@ -24,7 +24,5 @@ from .communication import (
     canonicalize_payload_type,
     decode_payload_dict,
     payload_fn_cnn,
-    payload_fn_llm,
     payload_type_to_one_hot,
 )
-from .vlm import compute_query_direction_from_observer
