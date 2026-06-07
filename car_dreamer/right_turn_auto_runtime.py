@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import math
-import os
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -55,8 +53,6 @@ class RightTurnAutoRuntimeMixin:
         self._in_flight = []
         self._received = defaultdict(lambda: deque(maxlen=RECEIVED_BUFFER_SIZE))
         self._veh_net_res = {}
-        self._vlm_last_eval = {}
-        self._episode_dumped = False
         RUNTIME_LOGGER.debug("Group runtime state reset.")
 
     def _destroy_group_observers(self) -> None:
@@ -131,7 +127,6 @@ class RightTurnAutoRuntimeMixin:
                 sender,
                 obs,
                 self.feature_size,
-                image_proc_fn=self._compute_single_image_description_from_array,
             )
 
         tf = sender.get_transform()
@@ -284,7 +279,7 @@ class RightTurnAutoRuntimeMixin:
             )
 
     # =========================================================
-    # VLM evaluation
+    # Graph info construction
     # =========================================================
 
     def _build_graph_info(self) -> Dict[str, Any]:
@@ -292,7 +287,6 @@ class RightTurnAutoRuntimeMixin:
             self.ego,
             self.obs,
             self.feature_size,
-            image_proc_fn=self._compute_single_image_description_from_array,
         )
         msgs = self._received.get(int(self.ego.id), deque())
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -368,31 +362,6 @@ class RightTurnAutoRuntimeMixin:
             edge_index.shape[1] if edge_index.ndim == 2 else 0,
         )
         return shared_data
-
-    def _maybe_dump_vlm_records(self, suffix: str) -> Optional[str]:
-        if not self._dump_vlm_records_on_episode_end or self._episode_dumped:
-            return None
-        os.makedirs(self._vlm_dump_dir, exist_ok=True)
-        filename = f"vlm_records_{suffix}_step_{int(self._time_step)}.json"
-        path = os.path.join(self._vlm_dump_dir, filename)
-        self.dump_vlm_records(path)
-        self._episode_dumped = True
-        return path
-
-    def _handle_episode_end(self, terminated: bool, truncated: bool, info: Dict[str, Any]) -> Dict[str, Any]:
-        if terminated or truncated:
-            dump_path = self._maybe_dump_vlm_records(
-                "terminated" if terminated else "truncated"
-            )
-            if dump_path is not None:
-                info["vlm_dump_path"] = dump_path
-                RUNTIME_LOGGER.info(
-                    "Episode end dump created step=%d path=%s records=%d",
-                    self._time_step,
-                    dump_path,
-                    len(getattr(self, "_vlm_records", [])),
-                )
-        return info
 
     # =========================================================
     # Environment overrides

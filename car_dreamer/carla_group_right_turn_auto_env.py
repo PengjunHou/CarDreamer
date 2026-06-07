@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, List, Optional
 
 import carla
-from transformers import AutoProcessor
 from runtime_logging import get_runtime_logger, get_runtime_logging_config, should_log_periodic
 
 from .carla_wpt_fixed_env import CarlaWptFixedEnv
@@ -20,13 +18,12 @@ from .toolkit import (
     VehicleNodeGraphBuilder,
     payload_fn_llm,
 )
-from .toolkit.vlm import RightTurnAutoVLMMixin
 
 
 AUTO_ENV_LOGGER = get_runtime_logger("car_dreamer.env.right_turn_auto")
 
 
-class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixin, CarlaWptFixedEnv):
+class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, CarlaWptFixedEnv):
     """
     Vehicle passes the crossing (turn right) and avoid collision.
 
@@ -40,10 +37,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self._init_group_state()
         self._init_communication_config()
         self._init_graph_builder()
-        self._init_vlm_config()
         self._init_runtime_flags()
-        if self._vlm_enabled:
-            self._init_vlm()
 
     # =========================================================
     # Initialization helpers
@@ -101,60 +95,7 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         )
         self._graph_builder = VehicleNodeGraphBuilder(cfg)
 
-    def _init_vlm_config(self) -> None:
-        vlm_cfg = getattr(self._config, "vlm", None)
-        self._vlm_enabled = bool(getattr(vlm_cfg, "enabled", True))
-        self._vlm_model_name = str(getattr(vlm_cfg, "model_name", "Qwen/Qwen2.5-VL-3B-Instruct"))
-        self._vlm_image_template = str(getattr(vlm_cfg, "image_template", "Analyze the driving scene."))
-        self._vlm_eval_period = int(getattr(vlm_cfg, "eval_period", 1))
-        self._vlm_image_obs_key = str(getattr(vlm_cfg, "image_obs_key", "camera"))
-        self._vlm_local_files_only = bool(getattr(vlm_cfg, "local_files_only", False))
-        self._vlm_shared_source = str(getattr(vlm_cfg, "shared_source", "received_feat"))
-        self._vlm_received_window_s = float(getattr(vlm_cfg, "received_window_s", 2.0))
-        self._vlm_max_msgs_per_sender = int(getattr(vlm_cfg, "max_msgs_per_sender", 20))
-        self._vlm_max_images_per_sender_for_inference = int(
-            getattr(vlm_cfg, "max_images_per_sender_for_inference", 4)
-        )
-        self._vlm_sampling_strategy = str(getattr(vlm_cfg, "sampling_strategy", "uniform"))
-        self._vlm_max_total_shared_images = int(getattr(vlm_cfg, "max_total_shared_images", 12))
-
-        self._vlm_ego_conf_weight = float(getattr(vlm_cfg, "ego_conf_weight", 1.0))
-        self._vlm_default_shared_conf_weight = float(getattr(vlm_cfg, "shared_conf_weight", 1.0))
-        self._vlm_shared_conf_weights: Dict[int, float] = {}
-        shared_weights_cfg = getattr(vlm_cfg, "shared_weights", None)
-        if shared_weights_cfg is not None:
-            try:
-                self._vlm_shared_conf_weights = {
-                    int(k): float(v) for k, v in dict(shared_weights_cfg).items()
-                }
-            except Exception:
-                self._vlm_shared_conf_weights = {}
-
-        self._vlm_importance_distance_tau = float(getattr(vlm_cfg, "importance_distance_tau", 20.0))
-        self._vlm_importance_region_weight = float(getattr(vlm_cfg, "importance_region_weight", 1.0))
-        self._vlm_importance_facing_weight = float(getattr(vlm_cfg, "importance_facing_weight", 1.0))
-        self._vlm_importance_distance_weight = float(getattr(vlm_cfg, "importance_distance_weight", 1.0))
-        self._vlm_importance_ego_bias = float(getattr(vlm_cfg, "importance_ego_bias", 0.0))
-        self._vlm_sc_beta = float(getattr(vlm_cfg, "sc_beta", 1.0))
-        self._vlm_sensor_fov_deg = float(getattr(vlm_cfg, "sensor_fov_deg", 120.0))
-
-        self._vlm_do_sample = bool(getattr(vlm_cfg, "do_sample", False))
-        self._vlm_score_max_new_tokens = int(getattr(vlm_cfg, "score_max_new_tokens", 128))
-        self._vlm_temperature = float(getattr(vlm_cfg, "temperature", 0.0))
-        self._vlm_top_p = float(getattr(vlm_cfg, "top_p", 0.9))
-
-        self._vlm_model = None
-        self._vlm_processor: Optional[AutoProcessor] = None
-        self._vlm_records: List[Dict[str, Any]] = []
-        self._vlm_last_eval: Dict[str, Any] = {}
-        self._vlm_questions = self._build_vlm_questions()
-
     def _init_runtime_flags(self) -> None:
-        self._dump_vlm_records_on_episode_end = bool(
-            getattr(self._config, "dump_vlm_records_on_episode_end", True)
-        )
-        self._vlm_dump_dir = str(getattr(self._config, "vlm_dump_dir", "data"))
-        self._episode_dumped = False
         self.agent = None
 
     # =========================================================
@@ -180,18 +121,6 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self._update_group_observations()
         if self._time_step % max(self.comm_period, 1) == 0:
             self._run_group_communication()
-        if self._vlm_enabled and self._time_step % max(self._vlm_eval_period, 1) == 0:
-            try:
-                AUTO_ENV_LOGGER.debug("Starting VLM evaluation at step=%d", self._time_step)
-                self._evaluate_vlm_questions()
-                AUTO_ENV_LOGGER.debug("Completed VLM evaluation at step=%d", self._time_step)
-            except Exception as exc:
-                AUTO_ENV_LOGGER.exception("VLM evaluation failed at step=%d", self._time_step)
-                self._vlm_last_eval = {
-                    "step": int(self._time_step),
-                    "status": "error",
-                    "error": str(exc),
-                }
         self._cleanup_actor_flow()
         runtime_cfg = get_runtime_logging_config()
         print(f"Step {self._time_step}: in_flight={len(self._in_flight)} received_for_ego={len(self._received.get(int(self.ego.id), []))}")
@@ -219,7 +148,6 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         self.get_state()
         _, reward, terminated, truncated, info = super().step(action)
         info = self._merge_step_info(info, requested_action=action)
-        info = self._handle_episode_end(terminated, truncated, info)
         if terminated or truncated:
             AUTO_ENV_LOGGER.info(
                 "Episode ended step=%d reward=%.4f terminated=%s truncated=%s info_keys=%s",
@@ -237,7 +165,3 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, RightTurnAutoVLMMixi
         info = self._build_reset_info()
         AUTO_ENV_LOGGER.debug("Right-turn auto reset info keys=%s", sorted(info.keys()))
         return self.obs, info
-
-    def dump_vlm_records(self, path: str) -> None:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(self._vlm_records, handle, ensure_ascii=False, indent=2)
