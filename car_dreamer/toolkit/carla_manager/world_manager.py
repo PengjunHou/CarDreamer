@@ -59,6 +59,10 @@ class WorldManager:
         self._apply_control = None
         self._on_step = None
         self.actor_dict = {}
+        # Pedestrians (walker bodies + their AI controllers) are tracked separately
+        # from actor_dict so they never enter the vehicle-oriented BEV / visibility
+        # pipeline (which assumes vehicle bounding boxes), but are still destroyed on reset.
+        self._walker_actors = {}
         self._time_step = 0
 
         self._ego_planner = None
@@ -80,6 +84,7 @@ class WorldManager:
     def reset(self) -> None:
         # destroy all actors
         self._time_step = 0
+        self._destroy_walkers()
         self._client.apply_batch_sync([carla.command.DestroyActor(id) for id in self.actor_dict])
         self.actor_dict = {}
 
@@ -240,7 +245,114 @@ class WorldManager:
                     self._vehicle_manager.set_desired_speed(actor, self._config.background_speed)
         return actor_list
 
+    def _destroy_walkers(self) -> None:
+        """Stop walker AI controllers and destroy all tracked pedestrians."""
+        if not self._walker_actors:
+            return
+        for actor in self._walker_actors.values():
+            if "controller.ai.walker" in actor.type_id:
+                try:
+                    actor.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._client.apply_batch_sync([carla.command.DestroyActor(id) for id in self._walker_actors])
+        self._walker_actors = {}
 
+    def spawn_walkers(
+        self,
+        n: int,
+        run_speed: float = 1.4,
+        cross_factor: float = 0.1,
+    ) -> List[carla.Actor]:
+        """
+        Spawn ``n`` pedestrians that wander the navigation mesh via AI controllers.
+
+        Walker bodies and their ``controller.ai.walker`` actors are tracked in a
+        dedicated registry (not ``actor_dict``), so they stay out of the vehicle-only
+        BEV/visibility pipeline but are still stopped and destroyed on the next reset.
+        Intended to be called from ``on_reset`` (the world is asynchronous there).
+
+        :param n: number of pedestrians to spawn.
+        :param run_speed: maximum walking speed in m/s.
+        :param cross_factor: probability that pedestrians cross roads (0..1).
+
+        :return: a list of spawned walker actors (length may be less than ``n``).
+        """
+        if n <= 0:
+            return []
+
+        walker_bps = self.get_blueprint_library("walker.pedestrian.*")
+        if len(walker_bps) == 0:
+            WORLD_LOGGER.warning("No walker blueprints found; skipping pedestrian spawn.")
+            return []
+        controller_bp = self._world.get_blueprint_library().find("controller.ai.walker")
+        self._world.set_pedestrians_cross_factor(float(cross_factor))
+
+        # 1) spawn walker bodies at random navigation-mesh points, retrying the
+        #    shortfall since random points often collide (occupied / too close).
+        walker_ids = []
+        attempts = 0
+        max_attempts = n * 5
+        while len(walker_ids) < n and attempts < max_attempts:
+            batch = []
+            for _ in range(n - len(walker_ids)):
+                location = self._world.get_random_location_from_navigation()
+                if location is None:
+                    continue
+                bp = np.random.choice(walker_bps)
+                if bp.has_attribute("is_invincible"):
+                    bp.set_attribute("is_invincible", "false")
+                batch.append(carla.command.SpawnActor(bp, carla.Transform(location)))
+            attempts += len(batch)
+            if not batch:
+                break
+            for response in self._client.apply_batch_sync(batch, True):
+                if response.error:
+                    WORLD_LOGGER.debug("Walker spawn skipped: %s", response.error)
+                else:
+                    walker_ids.append(response.actor_id)
+
+        # 2) batch-spawn an AI controller attached to each walker body
+        controller_batch = [
+            carla.command.SpawnActor(controller_bp, carla.Transform(), walker_id)
+            for walker_id in walker_ids
+        ]
+        controller_ids = []
+        for response in self._client.apply_batch_sync(controller_batch, True):
+            if response.error:
+                WORLD_LOGGER.debug("Walker controller spawn skipped: %s", response.error)
+            else:
+                controller_ids.append(response.actor_id)
+
+        # 3) let the server register the new actors before starting the controllers
+        self._world.wait_for_tick()
+
+        # 4) track pedestrians (separately from vehicles), send each to a random target
+        walkers = []
+        for walker_id in walker_ids:
+            actor = self._world.get_actor(walker_id)
+            if actor is not None:
+                self._walker_actors[actor.id] = actor
+                walkers.append(actor)
+        for controller_id in controller_ids:
+            controller = self._world.get_actor(controller_id)
+            if controller is None:
+                continue
+            self._walker_actors[controller.id] = controller
+            try:
+                controller.start()
+                controller.go_to_location(self._world.get_random_location_from_navigation())
+                controller.set_max_speed(float(run_speed))
+            except Exception as exc:  # noqa: BLE001
+                WORLD_LOGGER.debug("Failed to start walker controller %s: %s", controller_id, exc)
+
+        WORLD_LOGGER.info(
+            "Spawned pedestrians requested=%d walkers=%d controllers=%d",
+            n,
+            len(walkers),
+            len(controller_ids),
+        )
+        return walkers
 
     def try_spawn_aggresive_actor(
         self,

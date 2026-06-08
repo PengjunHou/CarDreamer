@@ -7,7 +7,20 @@ class CarlaRoundaboutEnv(CarlaWptFixedEnv):
     Vehicle passes the roundabout and avoid collision.
 
     **Provided Tasks**: ``carla_roundabout``
+
+    In addition to the single car flow from :class:`CarlaWptFixedEnv`, this env can
+    populate the scene with scattered background traffic and pedestrians, controlled
+    by ``num_vehicles`` and ``num_pedestrians`` in the task config (0 disables each).
     """
+
+    def on_reset(self) -> None:
+        super().on_reset()
+        num_vehicles = int(getattr(self._config, "num_vehicles", 0))
+        if num_vehicles > 0:
+            self._world.spawn_auto_actors(num_vehicles)
+        num_pedestrians = int(getattr(self._config, "num_pedestrians", 0))
+        if num_pedestrians > 0:
+            self._world.spawn_walkers(num_pedestrians)
 
     def on_step(self) -> None:
         if len(self.actor_flow) > 0:

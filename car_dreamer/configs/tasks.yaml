@@ -33,35 +33,6 @@ carla_navigation:
     decoder.cnn_kernels: [5, 5, 5, 6, 6]
     train.log_keys_video: [camera, birdeye_wpt]
 
-carla_veh_groups:
-  env:
-    name: CarlaVehGroupsEnv-v0
-    observation.enabled: [camera, collision,birdeye_wpt]
-    num_vehicles: 50
-    <<: *carla_wpt
-    lane_start_points:
-      - [5.8, 100, 0.1]
-      - [9.0, 100, 0.1]
-      - [12.2, 100, 0.1]
-      - [15.6, 100, 0.1]
-    lane_end_points:
-      - [5.8, -58, 0.1]
-      - [9.0, -58, 0.1]
-      - [12.2, -58, 0.1]
-      - [15.6, -58, 0.1]
-
-  dreamerv3:
-    encoder.cnn_keys: "birdeye_wpt"
-    decoder.cnn_keys: "birdeye_wpt"
-    run.log_keys_video: [camera, birdeye_wpt]
-    run.log_keys_max: "collision"
-
-  dreamerv2:
-    encoder.cnn_keys: "birdeye_wpt"
-    decoder.cnn_keys: "birdeye_wpt"
-    decoder.cnn_kernels: [5, 5, 5, 6, 6]
-    train.log_keys_video: [camera, birdeye_wpt]
-
 carla_four_lane:
   env:
     name: CarlaFourLaneEnv-v0
@@ -178,27 +149,6 @@ carla_right_turn_hard:
   env.min_flow_dist: 6
   env.max_flow_dist: 8
 
-carla_group_right_turn:
-  <<: *carla_right_turn_simple
-  env.name: CarlaGroupRightTurnEnv-v0
-  env.min_flow_dist: 6
-  env.max_flow_dist: 8
-  # Group vehicles
-  env.num_group_vehs: 2
-  env.group_observation.enabled: [camera, collision]
-  env.group_observation.camera.fov: 180
-  env.grouping_strategy: "fixed"
-  env.group_spawn_points:
-    - [15.4, -140.2, 0.1, 180.0]
-    - [7.4, -124.2, 0.1, 270.0]
-  # Feature & graph construction (task-specific)
-  env.feature_size: 307200
-  env.graph.window_s: 2.0
-  env.graph.tmax: 20
-  env.graph.max_nodes: 3
-  env.graph.feat_dim_max: 307200
-  env.graph.star_graph: true
-
 carla_group_right_turn_auto:
   <<: *carla_right_turn_simple
   env.name: CarlaGroupRightTurnAutoEnv-v0
@@ -209,6 +159,9 @@ carla_group_right_turn_auto:
   env.num_group_vehs: 2
   env.group_observation.enabled: [camera, collision]
   env.group_observation.camera.fov: 180
+  # Per-episode probability that each camera vehicle joins cooperative perception
+  # (randomized candidate pool so the model learns dynamics, not a fixed set).
+  env.coop_participation_prob: 0.5
   env.grouping_strategy: "fixed"
   env.group_spawn_points:
     - [15.4, -140.2, 0.1, 180.0]
@@ -310,6 +263,8 @@ carla_roundabout:
     flow_spawn_point: [-14.1, -13.5, 0.1, 125.0]
     min_flow_dist: 10
     max_flow_dist: 16
+    num_vehicles: 40       # scattered background autopilot traffic across Town03 (0 disables)
+    num_pedestrians: 20    # pedestrians wandering the navigation mesh (0 disables)
     terminal.out_lane_thres: 6
 
   dreamerv3:

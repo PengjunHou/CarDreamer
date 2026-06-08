@@ -1,0 +1,509 @@
+"""Reusable V2V cooperative-perception communication mixin.
+
+``V2VCommMixin`` factors out the cooperative-perception machinery that used to live
+inside ``carla_group_right_turn_auto`` so that any task env can opt into it:
+
+* a per-vehicle camera/observer pool of cooperative vehicles,
+* per-episode random participation (candidate pool) for generalization,
+* a per-step collaboration-policy hook (``_select_collaborators``),
+* V2V message passing with a wireless latency model and a delivery queue, and
+* an ego-centric GNN graph built from the ego's received messages.
+
+The mixin is vehicle-source-agnostic. The default cooperative-vehicle source spawns
+``num_coop_vehs`` camera-equipped autopilot vehicles near the ego each episode; a host
+task may override :py:meth:`_spawn_cooperative_vehicles` for a task-specific source
+(e.g. fixed spawn points).
+
+A host task opts in by:
+  1. ``class CarlaXEnv(V2VCommMixin, CarlaWptEnv): ...``
+  2. ``__init__``: call ``self._init_v2v()`` after ``super().__init__()``.
+  3. ``on_reset``: ``self._reset_group_runtime_state(); self._destroy_group_observers();
+     super().on_reset(); self._spawn_cooperative_vehicles(); self._refresh_actor_cache()``.
+  4. ``on_step``: ``self._deliver_messages(); self._update_group_observations()`` and
+     ``self._run_group_communication()`` every ``comm_period`` steps.
+  5. ``step`` / ``reset``: merge ``self._merge_step_info(info, action)`` /
+     ``self._build_reset_info()`` into the returned info dict.
+
+The host env must provide (all already present on every ``CarlaBaseEnv``/``CarlaWptEnv``):
+``self.ego``, ``self.obs``, ``self._world``, ``self._time_step``, ``self.get_state()``,
+and (for graph reset info) ``self.get_wpt_dist``. The task config must provide a
+``group_observation`` block (camera+collision) and may provide ``communication`` /
+``graph`` / ``feature_size`` / ``num_coop_vehs`` / ``coop_spawn_radius_m`` /
+``coop_participation_prob`` keys (all default-tolerant).
+"""
+
+from __future__ import annotations
+
+import math
+from collections import defaultdict, deque
+from typing import Any, Deque, Dict, List, Optional
+
+import carla
+import numpy as np
+import torch
+from runtime_logging import get_runtime_logger, get_runtime_logging_config, should_log_periodic
+
+from .toolkit import (
+    GraphBuildConfig,
+    NetResource,
+    Observer,
+    SimpleWirelessLatency,
+    V2VMessage,
+    VehicleNodeGraphBuilder,
+    _dist_m,
+    _tx_bytes_for_latency,
+    get_vehicle_pos,
+    payload_fn_llm,
+)
+
+
+GROUP_ID = 0
+RECEIVED_BUFFER_SIZE = 256
+V2V_LOGGER = get_runtime_logger("car_dreamer.v2v")
+
+
+class V2VCommMixin:
+    # =========================================================
+    # Initialization
+    # =========================================================
+
+    def _init_v2v(self) -> None:
+        """Initialize cooperative-group state, latency model, and graph builder.
+
+        Call once from the host env ``__init__`` after ``super().__init__()``.
+        """
+        # --- cooperative group / candidate state ---
+        self.groups: Dict[int, set] = {}
+        self.group_vehs: List[carla.Actor] = []
+        self.coop_participant_ids: set = set()
+        self.selected_collaborators: set = set()
+        self._other_observers: Dict[int, Observer] = {}
+        self.group_obs: Dict[int, Dict[str, Any]] = {}
+        self._prev_action = None
+        self._actor_cache: Dict[int, carla.Actor] = {}
+        # Per-episode probability that each camera vehicle joins cooperative perception.
+        self.coop_participation_prob = float(getattr(self._config, "coop_participation_prob", 0.5))
+        # Default near-ego spawner uses num_coop_vehs; fixed-point hosts use num_group_vehs.
+        self.num_coop_vehs = int(getattr(self._config, "num_coop_vehs", 3))
+        self.num_group_vehs = int(getattr(self._config, "num_group_vehs", self.num_coop_vehs))
+        self.coop_spawn_radius_m = float(getattr(self._config, "coop_spawn_radius_m", 50.0))
+
+        # --- communication config / latency model ---
+        comm_cfg = getattr(self._config, "communication", None)
+        self.group_update_period = int(getattr(comm_cfg, "group_update_period", 20))
+        self.comm_period = int(getattr(comm_cfg, "comm_period", 5))
+        uplink_bps = float(getattr(comm_cfg, "uplink_bps", 6e6))
+        downlink_bps = float(getattr(comm_cfg, "downlink_bps", 12e6))
+        base_rtt_s = float(getattr(comm_cfg, "base_rtt_s", 0.02))
+        proc_delay_s = float(getattr(comm_cfg, "proc_delay_s", 0.005))
+        distance_decay_m = float(getattr(comm_cfg, "distance_decay_m", 60.0))
+        min_rate_factor = float(getattr(comm_cfg, "min_rate_factor", 0.2))
+        jitter_s = float(getattr(comm_cfg, "jitter_s", 0.0))
+        overhead_bytes = int(getattr(comm_cfg, "overhead_bytes", 64))
+        self._default_net_res = NetResource(uplink_bps=uplink_bps, downlink_bps=downlink_bps)
+        self.latency_model = SimpleWirelessLatency(
+            base_rtt_s=base_rtt_s,
+            proc_delay_s=proc_delay_s,
+            distance_decay_m=distance_decay_m,
+            min_rate_factor=min_rate_factor,
+            jitter_s=jitter_s,
+            overhead_bytes=overhead_bytes,
+        )
+        self.payload_fn = payload_fn_llm
+        self.trans_msg_type = str(getattr(self._config, "trans_msg_type", "image"))
+        self._in_flight: List[V2VMessage] = []
+        self._received: Dict[int, Deque[V2VMessage]] = defaultdict(
+            lambda: deque(maxlen=RECEIVED_BUFFER_SIZE)
+        )
+        self._veh_net_res: Dict[int, NetResource] = {}
+
+        # --- graph builder ---
+        self.feature_size = int(getattr(self._config, "feature_size", 64))
+        graph_cfg = getattr(self._config, "graph", None)
+        self._graph_builder = VehicleNodeGraphBuilder(
+            GraphBuildConfig(
+                window_s=float(getattr(graph_cfg, "window_s", 2.0)),
+                Tmax=int(getattr(graph_cfg, "tmax", 15)),
+                max_nodes=int(getattr(graph_cfg, "max_nodes", 3)),
+                feat_dim_max=int(getattr(graph_cfg, "feat_dim_max", 128)),
+                star_graph=bool(getattr(graph_cfg, "star_graph", True)),
+            )
+        )
+
+    # =========================================================
+    # Actor cache helpers
+    # =========================================================
+
+    def _cache_actor(self, actor: Optional[carla.Actor]) -> None:
+        if actor is not None:
+            self._actor_cache[int(actor.id)] = actor
+
+    def _refresh_actor_cache(self) -> None:
+        self._actor_cache = {}
+        self._cache_actor(getattr(self, "ego", None))
+        for actor in self.group_vehs:
+            self._cache_actor(actor)
+
+    def _get_group_member_actor(self, actor_id: int) -> Optional[carla.Actor]:
+        actor = self._actor_cache.get(int(actor_id))
+        if actor is not None:
+            return actor
+        if getattr(self, "ego", None) is not None and int(self.ego.id) == int(actor_id):
+            self._cache_actor(self.ego)
+            return self.ego
+        for actor in self.group_vehs:
+            if int(actor.id) == int(actor_id):
+                self._cache_actor(actor)
+                return actor
+        actor = self._world._world.get_actor(int(actor_id))
+        if actor is not None:
+            self._cache_actor(actor)
+        return actor
+
+    # =========================================================
+    # Reset / observers
+    # =========================================================
+
+    def _reset_group_runtime_state(self) -> None:
+        self.group_vehs = []
+        self.groups = {}
+        self.coop_participant_ids = set()
+        self.selected_collaborators = set()
+        self._prev_action = None
+        self._actor_cache = {}
+        self._in_flight = []
+        self._received = defaultdict(lambda: deque(maxlen=RECEIVED_BUFFER_SIZE))
+        self._veh_net_res = {}
+        V2V_LOGGER.debug("V2V runtime state reset.")
+
+    def _destroy_group_observers(self) -> None:
+        for observer in self._other_observers.values():
+            observer.destroy()
+        self._other_observers = {}
+        self.group_obs = {}
+
+    def _create_group_observer(self, vehicle: carla.Actor) -> None:
+        group_observation = self._config.group_observation
+        observer = Observer(self._world, group_observation)
+        self._other_observers[int(vehicle.id)] = observer
+        observer.reset(vehicle)
+        self.group_obs[int(vehicle.id)], _ = observer.get_observation(self.get_state())
+
+    def _update_group_observations(self) -> None:
+        # Only participating (collaborating) vehicles' observations are consumed by
+        # V2V communication and the policy graph, so only refresh those.
+        for actor in self.group_vehs:
+            if int(actor.id) not in self.coop_participant_ids:
+                continue
+            observer = self._other_observers.get(int(actor.id))
+            if observer is not None:
+                self.group_obs[int(actor.id)], _ = observer.get_observation(self.get_state())
+
+    # =========================================================
+    # Cooperative-vehicle source (override for a task-specific source)
+    # =========================================================
+
+    def _spawn_points_near_ego(self, radius_m: float, n: int) -> List[carla.Transform]:
+        """Map spawn points within ``radius_m`` of the ego (fallback: nearest ``n``)."""
+        ego_loc = self.ego.get_transform().location
+        scored = []
+        for point in self._world.get_spawn_points():
+            d = math.hypot(point.location.x - ego_loc.x, point.location.y - ego_loc.y)
+            scored.append((d, point))
+        scored.sort(key=lambda item: item[0])
+        within = [point for d, point in scored if d <= radius_m]
+        if len(within) >= n:
+            return within
+        return [point for _, point in scored[: max(n, len(within))]]
+
+    def _spawn_cooperative_vehicles(self) -> None:
+        """Default cooperative-vehicle source: spawn N camera-equipped autopilot
+        vehicles near the ego (they move). Override for a task-specific source.
+
+        Every spawned vehicle is camera-equipped; each independently joins the
+        cooperative candidate pool with probability ``coop_participation_prob``.
+        """
+        self.groups.setdefault(GROUP_ID, set())
+        self.groups[GROUP_ID].add(int(self.ego.id))
+        n = int(getattr(self, "num_coop_vehs", 3))
+        if n <= 0:
+            return
+        near_points = self._spawn_points_near_ego(self.coop_spawn_radius_m, n)
+        vehicles = self._world.spawn_auto_actors(n, transforms=near_points)
+        participation_prob = float(getattr(self, "coop_participation_prob", 0.5))
+        for vehicle in vehicles:
+            if vehicle is None:
+                continue
+            self._create_group_observer(vehicle)  # camera+collision sensor
+            self.group_vehs.append(vehicle)
+            self._cache_actor(vehicle)
+            if np.random.random() < participation_prob:
+                self.coop_participant_ids.add(int(vehicle.id))
+                self.groups[GROUP_ID].add(int(vehicle.id))
+        V2V_LOGGER.info(
+            "Spawned cooperative vehicles requested=%d spawned=%d participants=%s group_members=%s",
+            n,
+            len(self.group_vehs),
+            sorted(self.coop_participant_ids),
+            sorted(self.groups.get(GROUP_ID, set())),
+        )
+
+    # =========================================================
+    # Communication
+    # =========================================================
+
+    def _make_payload(self, sender: carla.Actor) -> Dict[str, Any]:
+        obs = self.obs if int(sender.id) == int(self.ego.id) else self.group_obs.get(int(sender.id), {})
+        payload: Dict[str, Any] = {}
+        if self.payload_fn is not None:
+            payload = self.payload_fn(
+                sender,
+                obs,
+                self.feature_size,
+            )
+
+        tf = sender.get_transform()
+        vel = sender.get_velocity()
+        payload.update(
+            {
+                "pose": {
+                    "x": float(tf.location.x),
+                    "y": float(tf.location.y),
+                    "yaw": float(tf.rotation.yaw),
+                },
+                "vel": {"vx": float(vel.x), "vy": float(vel.y)},
+                "sender_id": int(sender.id),
+            }
+        )
+        return payload
+
+    def _build_group_actor_map(self) -> Dict[int, carla.Actor]:
+        actor_map: Dict[int, carla.Actor] = {}
+        if getattr(self, "ego", None) is not None:
+            actor_map[int(self.ego.id)] = self.ego
+        for actor in self.group_vehs:
+            actor_map[int(actor.id)] = actor
+        self._actor_cache.update(actor_map)
+        return actor_map
+
+    def _select_collaborators(self, candidate_ids: set) -> set:
+        """Pick which candidate vehicles share with the ego this communication step.
+
+        This is the collaboration-policy hook (WAM's ``S_t``). The candidate pool
+        (``coop_participant_ids``) is fixed for the episode; the policy chooses a subset
+        of it to actually collaborate with at each communication step.
+
+        The default returns the full candidate set, preserving the prior
+        "every participant shares" behaviour. Override / replace this method with the
+        collaboration policy; it may read any runtime state via ``self`` (ego, graph,
+        ``group_obs``, distances, bandwidth budget, ...).
+
+        :param candidate_ids: candidate vehicle ids (this episode's participants).
+        :return: the subset of ``candidate_ids`` that shares with the ego this step.
+        """
+        return set(candidate_ids)
+
+    def _enqueue_message(
+        self,
+        group_id: int,
+        sender_id: int,
+        receiver_id: int,
+        payload: Dict[str, Any],
+        payload_bytes: int,
+        latency_s: float,
+        distance_m: float,
+        fixed_dt: float,
+    ) -> None:
+        delay_steps = max(int(math.ceil(latency_s / max(fixed_dt, 1e-6))), 0)
+        deliver_step = int(self._time_step + delay_steps)
+        self._in_flight.append(
+            V2VMessage(
+                sender_id=int(sender_id),
+                receiver_id=int(receiver_id),
+                group_id=int(group_id),
+                payload=payload,
+                payload_bytes=int(payload_bytes),
+                created_step=int(self._time_step),
+                deliver_step=deliver_step,
+                latency_s=float(latency_s),
+                distance_m=float(distance_m),
+            )
+        )
+
+    def _run_group_communication(self) -> None:
+        candidate_ids = set(self.coop_participant_ids)
+        # Collaboration policy selects the subset that shares with the ego this step.
+        selected = set(self._select_collaborators(candidate_ids)) & candidate_ids
+        self.selected_collaborators = selected
+        if not selected:
+            return
+
+        # Communicating members = ego + the policy-selected collaborators (full-mesh).
+        member_ids = [int(self.ego.id)] + sorted(selected)
+        actor_map = self._build_group_actor_map()
+        fixed_dt = float(self._world._settings.fixed_delta_seconds)
+        degree = max(len(member_ids) - 1, 0)  # contention degree for this round
+        enqueued_count = 0
+        sender_ids = set()
+        total_payload_bytes = 0
+
+        for sender_id in member_ids:
+            sender = actor_map.get(int(sender_id))
+            if sender is None:
+                continue
+            sender_ids.add(int(sender_id))
+            payload = self._make_payload(sender)
+            payload_bytes = _tx_bytes_for_latency(
+                payload,
+                overhead_bytes=getattr(self.latency_model, "overhead_bytes", 64),
+            )
+            for receiver_id in member_ids:
+                if int(receiver_id) == int(sender_id):
+                    continue
+                receiver = actor_map.get(int(receiver_id))
+                if receiver is None:
+                    continue
+                sender_res = self._veh_net_res.get(int(sender_id), self._default_net_res)
+                receiver_res = self._veh_net_res.get(int(receiver_id), self._default_net_res)
+                latency_s = self.latency_model.compute_latency_s(
+                    sender=sender,
+                    receiver=receiver,
+                    payload_size_bytes=payload_bytes,
+                    sender_res=sender_res,
+                    receiver_res=receiver_res,
+                    out_degree=max(degree, 1),
+                    in_degree=max(degree, 1),
+                )
+                self._enqueue_message(
+                    group_id=GROUP_ID,
+                    sender_id=int(sender_id),
+                    receiver_id=int(receiver_id),
+                    payload=payload,
+                    payload_bytes=payload_bytes,
+                    latency_s=latency_s,
+                    distance_m=_dist_m(sender, receiver),
+                    fixed_dt=fixed_dt,
+                )
+                enqueued_count += 1
+                total_payload_bytes += int(payload_bytes)
+        print(f"Group communication run step={self._time_step} candidates={sorted(candidate_ids)} selected={sorted(selected)} sender_ids={sorted(sender_ids)} enqueued_count={enqueued_count} total_payload_bytes={total_payload_bytes}")
+        runtime_cfg = get_runtime_logging_config()
+        if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=V2V_LOGGER):
+            V2V_LOGGER.debug(
+                "Communication round step=%d candidates=%s selected=%s senders=%s enqueued=%d in_flight=%d payload_bytes=%d",
+                self._time_step,
+                sorted(candidate_ids),
+                sorted(selected),
+                sorted(sender_ids),
+                enqueued_count,
+                len(self._in_flight),
+                total_payload_bytes,
+            )
+
+    def _deliver_messages(self) -> None:
+        if not self._in_flight:
+            return
+        current_step = int(self._time_step)
+        remaining: List[V2VMessage] = []
+        delivered_count = 0
+        for msg in self._in_flight:
+            if int(msg.deliver_step) <= current_step:
+                self._received[int(msg.receiver_id)].append(msg)
+                delivered_count += 1
+            else:
+                remaining.append(msg)
+        self._in_flight = remaining
+        runtime_cfg = get_runtime_logging_config()
+        if should_log_periodic(current_step, int(runtime_cfg["step_debug_interval"]), logger=V2V_LOGGER):
+            V2V_LOGGER.debug(
+                "Delivered messages step=%d delivered=%d remaining_in_flight=%d ego_received=%d",
+                current_step,
+                delivered_count,
+                len(self._in_flight),
+                len(self._received.get(int(self.ego.id), deque())),
+            )
+
+    # =========================================================
+    # Graph info construction
+    # =========================================================
+
+    def _build_graph_info(self) -> Dict[str, Any]:
+        ego_feature = self.payload_fn(
+            self.ego,
+            self.obs,
+            self.feature_size,
+        )
+        msgs = self._received.get(int(self.ego.id), deque())
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        return self._graph_builder.build(
+            ego_actor=self.ego,
+            carla_world=self._world._world,
+            ego_feat=ego_feature.get("feat"),
+            ego_feat_dim=ego_feature.get("feat_dim"),
+            msgs=msgs,
+            t_step=self._time_step,
+            dt=float(self._config.world.fixed_delta_seconds),
+            device=device,
+        )
+
+    def _merge_step_info(self, info: Dict[str, Any], requested_action: Any) -> Dict[str, Any]:
+        del requested_action
+        shared_data = self._build_graph_info()
+        reward_info = {
+            k: v
+            for k, v in info.items()
+            if k.startswith("r_")
+            or k in [
+                "wpt_dis",
+                "speed_parallel",
+                "speed_perpendicular",
+                "speed_norm",
+                "ttc",
+                "time_penalty",
+            ]
+        }
+        reward_info["ego_x"] = self.ego.get_transform().location.x
+        reward_info["ego_y"] = self.ego.get_transform().location.y
+        shared_data.update(reward_info)
+        runtime_cfg = get_runtime_logging_config()
+        if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=V2V_LOGGER):
+            valid_nodes = int(np.asarray(shared_data.get("node_mask", np.zeros(0))).sum())
+            edge_index = np.asarray(shared_data.get("edge_index", np.zeros((2, 0))))
+            msg_count = len(self._received.get(int(self.ego.id), deque()))
+            V2V_LOGGER.debug(
+                "Step info merged step=%d valid_nodes=%d num_edges=%d ego_received_msgs=%d reward_keys=%s",
+                self._time_step,
+                valid_nodes,
+                edge_index.shape[1] if edge_index.ndim == 2 else 0,
+                msg_count,
+                sorted(reward_info.keys()),
+            )
+        return shared_data
+
+    def _build_reset_info(self) -> Dict[str, Any]:
+        shared_data = self._build_graph_info()
+        ego_location = np.array([*get_vehicle_pos(self.ego)])
+        reward_info = {
+            "ego_x": ego_location[0],
+            "ego_y": ego_location[1],
+            "speed_parallel": 0,
+            "speed_perpendicular": 0,
+            "speed_norm": 0,
+            "wpt_dis": self.get_wpt_dist(ego_location),
+            "r_waypoints": 0,
+            "r_speed": 0,
+            "r_collision": 0,
+            "r_out_of_lane": 0,
+            "r_destination": 0,
+            "time_penalty": 0,
+            "ttc": 0,
+        }
+        shared_data.update(reward_info)
+        valid_nodes = int(np.asarray(shared_data.get("node_mask", np.zeros(0))).sum())
+        edge_index = np.asarray(shared_data.get("edge_index", np.zeros((2, 0))))
+        V2V_LOGGER.info(
+            "Built reset graph info valid_nodes=%d num_edges=%d",
+            valid_nodes,
+            edge_index.shape[1] if edge_index.ndim == 2 else 0,
+        )
+        return shared_data
