@@ -12,7 +12,7 @@ carla_wpt:
         destination_reached: 20.0,
       }
   terminal:
-    time_limit: 100 # maximum timesteps per episode
+    time_limit: 500 # maximum timesteps per episode
     out_lane_thres: 3 # threshold for out of lane
 
 carla_navigation:
