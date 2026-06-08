@@ -184,6 +184,18 @@ env:
     jitter_s: 0.0             # random jitter added to latency (seconds, 0 = disabled)
     overhead_bytes: 64        # fixed protocol overhead per message (bytes)
 
+  wam:
+    enabled: True
+    notable_distance_m: 10.0
+    max_notable_objects: 3
+    reference_waypoint_count: 6
+    prediction_horizon_steps: 6
+    uncertainty_threshold: 1.0
+    visible_uncertainty: 0.2
+    invisible_uncertainty: 2.0
+    default_modality: objlist
+    base_station_policy: placeholder_all
+
 runtime_logging:
   enabled: True
   level: DEBUG

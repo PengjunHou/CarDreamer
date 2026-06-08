@@ -55,6 +55,15 @@ from .toolkit import (
     get_vehicle_pos,
     payload_fn_llm,
 )
+from .toolkit.observer.handlers.utils import is_fov_visible
+from .toolkit.wam import (
+    WAMPolicy,
+    ObjectState,
+    build_coop_request,
+    build_placeholder_policy,
+    predict_notable_motion,
+    select_notable_objects,
+)
 
 
 GROUP_ID = 0
@@ -129,6 +138,45 @@ class V2VCommMixin:
                 star_graph=bool(getattr(graph_cfg, "star_graph", True)),
             )
         )
+        self._init_wam_config()
+
+    def _init_wam_config(self) -> None:
+        wam_cfg = getattr(self._config, "wam", None)
+        self._wam_enabled = bool(getattr(wam_cfg, "enabled", True))
+        self._wam_notable_distance_m = float(getattr(wam_cfg, "notable_distance_m", 10.0))
+        self._wam_max_notable_objects = int(getattr(wam_cfg, "max_notable_objects", 3))
+        self._wam_reference_waypoint_count = int(getattr(wam_cfg, "reference_waypoint_count", 6))
+        self._wam_prediction_horizon_steps = int(getattr(wam_cfg, "prediction_horizon_steps", 6))
+        self._wam_uncertainty_threshold = float(getattr(wam_cfg, "uncertainty_threshold", 1.0))
+        self._wam_visible_uncertainty = float(getattr(wam_cfg, "visible_uncertainty", 0.2))
+        self._wam_invisible_uncertainty = float(getattr(wam_cfg, "invisible_uncertainty", 2.0))
+        self._wam_default_modality = str(getattr(wam_cfg, "default_modality", "objlist"))
+        self._wam_base_station_policy = str(getattr(wam_cfg, "base_station_policy", "placeholder_all"))
+        self._wam_local_sight_fov = getattr(
+            wam_cfg,
+            "local_sight_fov",
+            self._get_config_value(("observation", "camera", "attributes", "fov"), 120.0),
+        )
+        self._wam_local_sight_range = getattr(wam_cfg, "local_sight_range_m", 64.0)
+        self._wam_collaborator_sight_fov = getattr(
+            wam_cfg,
+            "collaborator_sight_fov",
+            getattr(
+                getattr(getattr(self._config, "group_observation", None), "camera", None),
+                "fov",
+                self._get_config_value(("group_observation", "camera", "attributes", "fov"), 120.0),
+            ),
+        )
+        self._wam_collaborator_sight_range = getattr(wam_cfg, "collaborator_sight_range_m", 64.0)
+        self._reset_wam_runtime_state()
+
+    def _get_config_value(self, path, default):
+        value = self._config
+        for key in path:
+            value = getattr(value, key, None)
+            if value is None:
+                return default
+        return value
 
     # =========================================================
     # Actor cache helpers
@@ -174,7 +222,21 @@ class V2VCommMixin:
         self._in_flight = []
         self._received = defaultdict(lambda: deque(maxlen=RECEIVED_BUFFER_SIZE))
         self._veh_net_res = {}
+        self._reset_wam_runtime_state()
         V2V_LOGGER.debug("V2V runtime state reset.")
+
+    def _reset_wam_runtime_state(self) -> None:
+        self._wam_notable_records = []
+        self._wam_motion_predictions = {}
+        self._wam_coop_request = None
+        self._wam_policy = WAMPolicy(
+            selected_vehicle_ids=(),
+            modality_by_vehicle={},
+            bandwidth_by_vehicle={},
+            frequency_steps=int(getattr(self, "comm_period", 1)),
+            reason="not_initialized",
+        )
+        self._wam_last_update_step = -1
 
     def _destroy_group_observers(self) -> None:
         for observer in self._other_observers.values():
@@ -301,7 +363,220 @@ class V2VCommMixin:
         :param candidate_ids: candidate vehicle ids (this episode's participants).
         :return: the subset of ``candidate_ids`` that shares with the ego this step.
         """
-        return set(candidate_ids)
+        if not bool(getattr(self, "_wam_enabled", True)):
+            return set(candidate_ids)
+        policy = getattr(self, "_wam_policy", None)
+        if policy is None:
+            return set()
+        return set(int(vehicle_id) for vehicle_id in policy.selected_vehicle_ids) & set(candidate_ids)
+
+    # =========================================================
+    # WAM runtime: notable objects -> request -> placeholder policy
+    # =========================================================
+
+    def _actor_polygon_xy(self, actor: carla.Actor):
+        tf = actor.get_transform()
+        bb = actor.bounding_box
+        length = max(float(bb.extent.x), 0.1)
+        width = max(float(bb.extent.y), 0.1)
+        yaw = math.radians(float(tf.rotation.yaw))
+        local = np.array(
+            [
+                [length, width],
+                [length, -width],
+                [-length, -width],
+                [-length, width],
+            ],
+            dtype=np.float32,
+        )
+        rot = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
+        poly = local @ rot.T
+        poly[:, 0] += float(tf.location.x)
+        poly[:, 1] += float(tf.location.y)
+        return [(float(x), float(y)) for x, y in poly]
+
+    def _wam_reference_route_points(self):
+        count = max(int(getattr(self, "_wam_reference_waypoint_count", 6)), 1)
+        route = []
+        for waypoint in list(getattr(self, "waypoints", []))[:count]:
+            route.append((float(waypoint[0]), float(waypoint[1])))
+        if route:
+            return route
+        ego = getattr(self, "ego", None)
+        if ego is None:
+            return []
+        loc = ego.get_transform().location
+        return [(float(loc.x), float(loc.y))]
+
+    def _wam_object_actors(self) -> List[carla.Actor]:
+        ego_id = int(self.ego.id)
+        actors = self._world._world.get_actors()
+        objects = []
+        for actor in list(actors.filter("vehicle.*")) + list(actors.filter("walker.pedestrian.*")):
+            if int(actor.id) == ego_id:
+                continue
+            objects.append(actor)
+        return objects
+
+    def _wam_actor_visible_from(
+        self,
+        observer: carla.Actor,
+        target: carla.Actor,
+        polygons: Dict[int, Any],
+        *,
+        fov,
+        sight_range,
+    ) -> bool:
+        target_poly = polygons.get(int(target.id))
+        if target_poly is None:
+            return False
+        tf = observer.get_transform()
+        return bool(
+            is_fov_visible(
+                (float(tf.location.x), float(tf.location.y)),
+                float(tf.rotation.yaw),
+                int(observer.id),
+                int(target.id),
+                target_poly,
+                polygons,
+                fov,
+                sight_range,
+            )
+        )
+
+    def _wam_build_object_states(self) -> List[ObjectState]:
+        object_actors = self._wam_object_actors()
+        observer_actors = [self.ego] + [actor for actor in self.group_vehs if actor is not None]
+        polygons = {}
+        for actor in object_actors + observer_actors:
+            try:
+                polygons[int(actor.id)] = self._actor_polygon_xy(actor)
+            except Exception:
+                V2V_LOGGER.debug("Failed to build actor polygon actor_id=%s", getattr(actor, "id", None))
+
+        object_states: List[ObjectState] = []
+        participant_ids = set(int(actor_id) for actor_id in getattr(self, "coop_participant_ids", set()))
+        participant_actors = [
+            actor for actor in self.group_vehs if actor is not None and int(actor.id) in participant_ids
+        ]
+        for actor in object_actors:
+            try:
+                tf = actor.get_transform()
+                vel = actor.get_velocity()
+                bb = actor.bounding_box
+                visible_to_ego = self._wam_actor_visible_from(
+                    self.ego,
+                    actor,
+                    polygons,
+                    fov=self._wam_local_sight_fov,
+                    sight_range=self._wam_local_sight_range,
+                )
+                visible_to_collaborators = []
+                for observer in participant_actors:
+                    if int(observer.id) == int(actor.id):
+                        continue
+                    if self._wam_actor_visible_from(
+                        observer,
+                        actor,
+                        polygons,
+                        fov=self._wam_collaborator_sight_fov,
+                        sight_range=self._wam_collaborator_sight_range,
+                    ):
+                        visible_to_collaborators.append(int(observer.id))
+                actor_type = str(getattr(actor, "type_id", ""))
+                object_class = "pedestrian" if "walker.pedestrian" in actor_type else "vehicle"
+                object_states.append(
+                    ObjectState(
+                        actor_id=int(actor.id),
+                        actor_type=actor_type,
+                        object_class=object_class,
+                        x=float(tf.location.x),
+                        y=float(tf.location.y),
+                        z=float(tf.location.z),
+                        vx=float(vel.x),
+                        vy=float(vel.y),
+                        yaw=float(tf.rotation.yaw),
+                        length=float(2.0 * bb.extent.x),
+                        width=float(2.0 * bb.extent.y),
+                        height=float(2.0 * bb.extent.z),
+                        bbox=tuple(polygons.get(int(actor.id), ())),
+                        visible_to_ego=visible_to_ego,
+                        visible_to_collaborators=tuple(sorted(visible_to_collaborators)),
+                    )
+                )
+            except Exception:
+                V2V_LOGGER.debug("Failed to build WAM object state actor_id=%s", getattr(actor, "id", None))
+        return object_states
+
+    def _update_wam_runtime_state(self, *, force: bool = False) -> None:
+        if not bool(getattr(self, "_wam_enabled", True)):
+            return
+        step = int(getattr(self, "_time_step", 0))
+        if not force and int(getattr(self, "_wam_last_update_step", -1)) == step:
+            return
+
+        route_points = self._wam_reference_route_points()
+        object_states = self._wam_build_object_states()
+        self._wam_notable_records = select_notable_objects(
+            object_states,
+            route_points,
+            notable_distance_m=float(self._wam_notable_distance_m),
+            max_notable_objects=int(self._wam_max_notable_objects),
+        )
+        dt = float(getattr(getattr(self._config, "world", None), "fixed_delta_seconds", 0.1))
+        self._wam_motion_predictions = predict_notable_motion(
+            self._wam_notable_records,
+            dt=dt,
+            horizon_steps=int(self._wam_prediction_horizon_steps),
+            visible_uncertainty=float(self._wam_visible_uncertainty),
+            invisible_uncertainty=float(self._wam_invisible_uncertainty),
+        )
+        self._wam_coop_request = build_coop_request(
+            ego_id=int(self.ego.id),
+            step=step,
+            predictions=self._wam_motion_predictions,
+            uncertainty_threshold=float(self._wam_uncertainty_threshold),
+        )
+        self._wam_policy = build_placeholder_policy(
+            request=self._wam_coop_request,
+            candidate_vehicle_ids=self.coop_participant_ids,
+            uplink_bps=float(getattr(self._default_net_res, "uplink_bps", 0.0)),
+            frequency_steps=int(self.comm_period),
+            default_modality=str(self._wam_default_modality),
+        )
+        self._wam_last_update_step = step
+        if should_log_periodic(step, int(get_runtime_logging_config()["step_debug_interval"]), logger=V2V_LOGGER):
+            V2V_LOGGER.debug(
+                "WAM step=%d notable=%s max_uncertainty=%.3f triggered=%s selected=%s",
+                step,
+                [record.object_state.actor_id for record in self._wam_notable_records],
+                self._wam_max_uncertainty(),
+                self._wam_coop_request is not None,
+                list(self._wam_policy.selected_vehicle_ids),
+            )
+
+    def _wam_max_uncertainty(self) -> float:
+        if not getattr(self, "_wam_motion_predictions", None):
+            return 0.0
+        return float(max(pred.uncertainty_score for pred in self._wam_motion_predictions.values()))
+
+    def _wam_info(self) -> Dict[str, Any]:
+        self._update_wam_runtime_state()
+        notable = list(getattr(self, "_wam_notable_records", []))
+        policy = getattr(self, "_wam_policy", None)
+        return {
+            "wam_notable_object_ids": [int(record.object_state.actor_id) for record in notable],
+            "wam_visible_notable_object_ids": [
+                int(record.object_state.actor_id) for record in notable if bool(record.visible)
+            ],
+            "wam_invisible_notable_object_ids": [
+                int(record.object_state.actor_id) for record in notable if bool(record.invisible)
+            ],
+            "wam_uncertainty_max": float(self._wam_max_uncertainty()),
+            "wam_coop_triggered": bool(getattr(self, "_wam_coop_request", None) is not None),
+            "wam_policy_selected_vehicle_ids": list(policy.selected_vehicle_ids) if policy is not None else [],
+            "wam_policy_modality_by_vehicle": dict(policy.modality_by_vehicle) if policy is not None else {},
+        }
 
     def _enqueue_message(
         self,
@@ -331,6 +606,7 @@ class V2VCommMixin:
         )
 
     def _run_group_communication(self) -> None:
+        self._update_wam_runtime_state()
         candidate_ids = set(self.coop_participant_ids)
         # Collaboration policy selects the subset that shares with the ego this step.
         selected = set(self._select_collaborators(candidate_ids)) & candidate_ids
@@ -386,7 +662,6 @@ class V2VCommMixin:
                 )
                 enqueued_count += 1
                 total_payload_bytes += int(payload_bytes)
-        print(f"Group communication run step={self._time_step} candidates={sorted(candidate_ids)} selected={sorted(selected)} sender_ids={sorted(sender_ids)} enqueued_count={enqueued_count} total_payload_bytes={total_payload_bytes}")
         runtime_cfg = get_runtime_logging_config()
         if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=V2V_LOGGER):
             V2V_LOGGER.debug(
@@ -465,6 +740,7 @@ class V2VCommMixin:
         reward_info["ego_x"] = self.ego.get_transform().location.x
         reward_info["ego_y"] = self.ego.get_transform().location.y
         shared_data.update(reward_info)
+        shared_data.update(self._wam_info())
         runtime_cfg = get_runtime_logging_config()
         if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=V2V_LOGGER):
             valid_nodes = int(np.asarray(shared_data.get("node_mask", np.zeros(0))).sum())
@@ -499,6 +775,7 @@ class V2VCommMixin:
             "ttc": 0,
         }
         shared_data.update(reward_info)
+        shared_data.update(self._wam_info())
         valid_nodes = int(np.asarray(shared_data.get("node_mask", np.zeros(0))).sum())
         edge_index = np.asarray(shared_data.get("edge_index", np.zeros((2, 0))))
         V2V_LOGGER.info(
