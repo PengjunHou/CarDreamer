@@ -57,10 +57,16 @@ from .toolkit import (
 )
 from .toolkit.observer.handlers.utils import is_fov_visible
 from .toolkit.wam import (
-    WAMPolicy,
+    OBJECT_STATE_DIM,
+    GraphBuildSpec,
     ObjectState,
+    ObservationNodeInput,
+    VehicleNodeInput,
+    WAMPolicy,
     build_coop_request,
     build_placeholder_policy,
+    build_wam_hetero_graph,
+    hetero_graph_stats,
     predict_notable_motion,
     select_notable_objects,
 )
@@ -168,6 +174,24 @@ class V2VCommMixin:
             ),
         )
         self._wam_collaborator_sight_range = getattr(wam_cfg, "collaborator_sight_range_m", 64.0)
+
+        # --- policy-conditioned hetero graph (§4-§7, §9) ---
+        self._wam_build_graph = bool(getattr(wam_cfg, "build_graph", True))
+        graph_wam_cfg = getattr(wam_cfg, "graph", None)
+        self._wam_graph_embed = bool(getattr(graph_wam_cfg, "embed", False))
+        self._wam_graph_route_waypoints = int(
+            getattr(graph_wam_cfg, "route_waypoints", self._wam_reference_waypoint_count)
+        )
+        self._wam_graph_max_object_nodes = int(getattr(graph_wam_cfg, "max_object_nodes", 32))
+        self._wam_graph_hidden_dim = int(getattr(graph_wam_cfg, "hidden_dim", 256))
+        self._wam_graph_num_layers = int(getattr(graph_wam_cfg, "num_layers", 3))
+        self._wam_graph_num_heads = int(getattr(graph_wam_cfg, "num_heads", 8))
+        self._wam_graph_gamma_freshness = float(getattr(graph_wam_cfg, "gamma_freshness", 5.0))
+        self._wam_graph_bev_channels = int(getattr(graph_wam_cfg, "bev_channels", 8))
+        self._wam_graph_bev_size = int(getattr(graph_wam_cfg, "bev_size", 128))
+        self._wam_graph_net = None
+        self._wam_graph_embeddings = None
+
         self._reset_wam_runtime_state()
 
     def _get_config_value(self, path, default):
@@ -227,8 +251,11 @@ class V2VCommMixin:
 
     def _reset_wam_runtime_state(self) -> None:
         self._wam_notable_records = []
+        self._wam_object_states = []
         self._wam_motion_predictions = {}
         self._wam_coop_request = None
+        self._wam_graph = None
+        self._wam_graph_embeddings = None
         self._wam_policy = WAMPolicy(
             selected_vehicle_ids=(),
             modality_by_vehicle={},
@@ -517,6 +544,7 @@ class V2VCommMixin:
 
         route_points = self._wam_reference_route_points()
         object_states = self._wam_build_object_states()
+        self._wam_object_states = object_states
         self._wam_notable_records = select_notable_objects(
             object_states,
             route_points,
@@ -544,6 +572,8 @@ class V2VCommMixin:
             frequency_steps=int(self.comm_period),
             default_modality=str(self._wam_default_modality),
         )
+        if self._wam_build_graph:
+            self._build_wam_graph()
         self._wam_last_update_step = step
         if should_log_periodic(step, int(get_runtime_logging_config()["step_debug_interval"]), logger=V2V_LOGGER):
             V2V_LOGGER.debug(
@@ -560,11 +590,150 @@ class V2VCommMixin:
             return 0.0
         return float(max(pred.uncertainty_score for pred in self._wam_motion_predictions.values()))
 
+    # =========================================================
+    # WAM policy-conditioned hetero graph (§4-§7, §9)
+    # =========================================================
+
+    def _wam_route_xy(self):
+        route = []
+        for waypoint in list(getattr(self, "waypoints", []))[: int(self._wam_graph_route_waypoints)]:
+            route.append((float(waypoint[0]), float(waypoint[1])))
+        return tuple(route)
+
+    def _wam_vehicle_node_input(self, actor: carla.Actor, *, is_ego: bool, agent_slot: int, route_xy=()):
+        tf = actor.get_transform()
+        vel = actor.get_velocity()
+        return VehicleNodeInput(
+            actor_id=int(actor.id),
+            is_ego=bool(is_ego),
+            agent_slot=int(agent_slot),
+            x=float(tf.location.x),
+            y=float(tf.location.y),
+            z=float(tf.location.z),
+            vx=float(vel.x),
+            vy=float(vel.y),
+            yaw=float(tf.rotation.yaw),
+            q_comm=1.0,
+            q_comp=1.0,
+            route_xy=tuple(route_xy),
+        )
+
+    def _wam_objlist_payload_bytes(self, n_objects: int) -> float:
+        overhead = int(getattr(self.latency_model, "overhead_bytes", 64))
+        return float(max(int(n_objects), 0) * OBJECT_STATE_DIM * 4 + overhead)
+
+    def _wam_bev_payload_bytes(self) -> float:
+        return float(int(self._wam_graph_bev_channels) * int(self._wam_graph_bev_size) ** 2)
+
+    def _build_wam_graph(self) -> None:
+        """Assemble the policy-conditioned hetero graph for the current ``π_t`` (§7)."""
+        policy = self._wam_policy
+        objects = list(getattr(self, "_wam_object_states", []))
+        selected = [int(vid) for vid in policy.selected_vehicle_ids]
+
+        ego = self._wam_vehicle_node_input(
+            self.ego, is_ego=True, agent_slot=0, route_xy=self._wam_route_xy()
+        )
+        ego_visible = [s for s in objects if bool(s.visible_to_ego)]
+        observations = [
+            ObservationNodeInput(
+                vehicle_id=int(self.ego.id),
+                modality="objlist",
+                observed_object_ids=tuple(int(s.actor_id) for s in ego_visible),
+                payload_bytes=self._wam_objlist_payload_bytes(len(ego_visible)),
+                latency_s=0.0,
+                freshness=1.0,
+                quality=1.0,
+                sample_age_s=0.0,
+            )
+        ]
+
+        collaborators = []
+        slot = 1
+        out_degree = max(len(selected), 1)
+        for vid in selected:
+            actor = self._get_group_member_actor(vid)
+            if actor is None:
+                continue
+            collaborators.append(self._wam_vehicle_node_input(actor, is_ego=False, agent_slot=slot))
+            slot += 1
+            modality = str(policy.modality_by_vehicle.get(vid, self._wam_default_modality))
+            if modality == "bev":
+                observed_ids = ()
+                payload = self._wam_bev_payload_bytes()
+            else:
+                observed_ids = tuple(int(s.actor_id) for s in objects if int(vid) in s.visible_to_collaborators)
+                payload = self._wam_objlist_payload_bytes(len(observed_ids))
+            latency_s = float(
+                self.latency_model.compute_latency_s(
+                    sender=actor,
+                    receiver=self.ego,
+                    payload_size_bytes=int(payload),
+                    sender_res=self._veh_net_res.get(int(vid), self._default_net_res),
+                    receiver_res=self._default_net_res,
+                    out_degree=out_degree,
+                    in_degree=out_degree,
+                )
+            )
+            freshness = math.exp(-float(self._wam_graph_gamma_freshness) * latency_s)
+            observations.append(
+                ObservationNodeInput(
+                    vehicle_id=int(vid),
+                    modality=modality,
+                    observed_object_ids=observed_ids,
+                    payload_bytes=payload,
+                    latency_s=latency_s,
+                    freshness=freshness,
+                    quality=1.0,
+                    sample_age_s=0.0,
+                )
+            )
+
+        spec = GraphBuildSpec(
+            route_waypoints=int(self._wam_graph_route_waypoints),
+            max_object_nodes=int(self._wam_graph_max_object_nodes),
+        )
+        notable_ids = {int(record.object_state.actor_id) for record in self._wam_notable_records}
+        self._wam_graph = build_wam_hetero_graph(
+            ego=ego,
+            collaborators=collaborators,
+            objects=objects,
+            observations=observations,
+            policy=policy,
+            spec=spec,
+            notable_ids=notable_ids,
+        )
+        if self._wam_graph_embed:
+            self._run_wam_graph_embedding()
+
+    def _run_wam_graph_embedding(self) -> None:
+        """Optional: run the §5 embedding + §9 HGT encoder on the current graph.
+
+        Off by default (``env.wam.graph.embed``); the env builds the graph, while the GNN
+        forward is intended for the world-model / training side.
+        """
+        from .toolkit.wam import WAMGraphModelConfig, WAMHeteroGraphNet
+
+        if self._wam_graph is None:
+            return
+        if self._wam_graph_net is None:
+            cfg = WAMGraphModelConfig(
+                route_waypoints=int(self._wam_graph_route_waypoints),
+                hidden_dim=int(self._wam_graph_hidden_dim),
+                num_layers=int(self._wam_graph_num_layers),
+                num_heads=int(self._wam_graph_num_heads),
+                bev_channels=int(self._wam_graph_bev_channels),
+                bev_size=int(self._wam_graph_bev_size),
+            )
+            self._wam_graph_net = WAMHeteroGraphNet(cfg).eval()
+        with torch.no_grad():
+            self._wam_graph_embeddings = self._wam_graph_net(self._wam_graph)
+
     def _wam_info(self) -> Dict[str, Any]:
         self._update_wam_runtime_state()
         notable = list(getattr(self, "_wam_notable_records", []))
         policy = getattr(self, "_wam_policy", None)
-        return {
+        info = {
             "wam_notable_object_ids": [int(record.object_state.actor_id) for record in notable],
             "wam_visible_notable_object_ids": [
                 int(record.object_state.actor_id) for record in notable if bool(record.visible)
@@ -577,6 +746,10 @@ class V2VCommMixin:
             "wam_policy_selected_vehicle_ids": list(policy.selected_vehicle_ids) if policy is not None else [],
             "wam_policy_modality_by_vehicle": dict(policy.modality_by_vehicle) if policy is not None else {},
         }
+        graph = getattr(self, "_wam_graph", None)
+        if graph is not None:
+            info.update(hetero_graph_stats(graph))
+        return info
 
     def _enqueue_message(
         self,

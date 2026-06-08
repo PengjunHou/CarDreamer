@@ -20,6 +20,49 @@ from .debug_recording import (
     predicted_future_waypoints,
     snapshot_from_carla_actor,
 )
+from .graph import (
+    COOP,
+    EDGE_TYPES,
+    MODALITIES,
+    MODALITY_TO_ID,
+    NODE_TYPES,
+    OBJECT,
+    OBJECT_CLASSES,
+    OBJECT_STATE_DIM,
+    OBS_OBJ,
+    OBS_SCALAR_DIM,
+    OBSERVATION,
+    VEH_OBS,
+    VEHICLE,
+    WAM_METADATA,
+    GraphBuildSpec,
+    ObservationNodeInput,
+    VehicleNodeInput,
+    build_wam_hetero_graph,
+    hetero_graph_stats,
+    vehicle_state_dim,
+)
+from .graph_model import (
+    WAMGraphModelConfig,
+    WAMHeteroGraphEmbedding,
+    WAMHeteroGraphEncoder,
+    WAMHeteroGraphNet,
+)
+from .heads import (
+    GaussianTrajectoryHead,
+    NotableObjectHead,
+    WAMPerceptionConfig,
+    WAMPerceptionModel,
+    WAMTemporalEncoder,
+    align_object_history,
+    gaussian_trajectory_nll,
+    perception_loss,
+    policy_uncertainty,
+)
+from .targets import (
+    TrajectoryTargetBuffer,
+    build_trajectory_targets,
+)
 
 __all__ = [
     "ActorSnapshot",
@@ -38,4 +81,43 @@ __all__ = [
     "predicted_future_waypoints",
     "select_notable_objects",
     "snapshot_from_carla_actor",
+    # hetero graph construction (§4-§7)
+    "COOP",
+    "EDGE_TYPES",
+    "MODALITIES",
+    "MODALITY_TO_ID",
+    "NODE_TYPES",
+    "OBJECT",
+    "OBJECT_CLASSES",
+    "OBJECT_STATE_DIM",
+    "OBS_OBJ",
+    "OBS_SCALAR_DIM",
+    "OBSERVATION",
+    "VEH_OBS",
+    "VEHICLE",
+    "WAM_METADATA",
+    "GraphBuildSpec",
+    "ObservationNodeInput",
+    "VehicleNodeInput",
+    "build_wam_hetero_graph",
+    "hetero_graph_stats",
+    "vehicle_state_dim",
+    # graph embedding + HGT encoder (§5, §9)
+    "WAMGraphModelConfig",
+    "WAMHeteroGraphEmbedding",
+    "WAMHeteroGraphEncoder",
+    "WAMHeteroGraphNet",
+    # temporal encoder + task heads (§10, §11) + losses / reward (§15, §11.2)
+    "GaussianTrajectoryHead",
+    "NotableObjectHead",
+    "WAMPerceptionConfig",
+    "WAMPerceptionModel",
+    "WAMTemporalEncoder",
+    "align_object_history",
+    "gaussian_trajectory_nll",
+    "perception_loss",
+    "policy_uncertainty",
+    # ground-truth trajectory targets (§15.2)
+    "TrajectoryTargetBuffer",
+    "build_trajectory_targets",
 ]

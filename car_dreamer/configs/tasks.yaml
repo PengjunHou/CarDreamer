@@ -173,6 +173,18 @@ carla_group_right_turn_auto:
   env.graph.max_nodes: 3
   env.graph.feat_dim_max: 3072
   env.graph.star_graph: true
+  # WAM policy-conditioned hetero graph (Design §4-§7, §9). The env builds the graph each
+  # step; the §5 embedding + §9 HGT encoder (graph.embed) is for the world-model side.
+  env.wam.build_graph: true
+  env.wam.graph.embed: false
+  env.wam.graph.hidden_dim: 256
+  env.wam.graph.num_layers: 3
+  env.wam.graph.num_heads: 8
+  env.wam.graph.route_waypoints: 6
+  env.wam.graph.max_object_nodes: 32
+  env.wam.graph.gamma_freshness: 5.0
+  env.wam.graph.bev_channels: 8
+  env.wam.graph.bev_size: 128
 
 carla_right_turn_random:
   env:
