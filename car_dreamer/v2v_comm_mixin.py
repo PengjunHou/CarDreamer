@@ -9,16 +9,18 @@ inside ``carla_group_right_turn_auto`` so that any task env can opt into it:
 * V2V message passing with a wireless latency model and a delivery queue, and
 * an ego-centric GNN graph built from the ego's received messages.
 
-The mixin is vehicle-source-agnostic. The default cooperative-vehicle source spawns
-``num_coop_vehs`` camera-equipped autopilot vehicles near the ego each episode; a host
-task may override :py:meth:`_spawn_cooperative_vehicles` for a task-specific source
-(e.g. fixed spawn points).
+Cooperative vehicles are declared in the task's ``scenario_actors.vehicles`` config: any
+vehicle with a ``start`` point is spawned by the reusable ``ScenarioActorManager`` and then
+registered here via :py:meth:`_register_cooperative_candidate` (the manager's
+``cooperative_hook``), which attaches a camera+collision observer and adds it to this episode's
+candidate pool with probability ``coop_participation_prob``.
 
 A host task opts in by:
   1. ``class CarlaXEnv(V2VCommMixin, CarlaWptEnv): ...``
   2. ``__init__``: call ``self._init_v2v()`` after ``super().__init__()``.
   3. ``on_reset``: ``self._reset_group_runtime_state(); self._destroy_group_observers();
-     super().on_reset(); self._spawn_cooperative_vehicles(); self._refresh_actor_cache()``.
+     super().on_reset(); self.groups.setdefault(GROUP_ID, set()).add(int(self.ego.id))``.
+     (Candidate vehicles are registered automatically by the base-env scenario hook.)
   4. ``on_step``: ``self._deliver_messages(); self._update_group_observations()`` and
      ``self._run_group_communication()`` every ``comm_period`` steps.
   5. ``step`` / ``reset``: merge ``self._merge_step_info(info, action)`` /
@@ -28,8 +30,7 @@ The host env must provide (all already present on every ``CarlaBaseEnv``/``Carla
 ``self.ego``, ``self.obs``, ``self._world``, ``self._time_step``, ``self.get_state()``,
 and (for graph reset info) ``self.get_wpt_dist``. The task config must provide a
 ``group_observation`` block (camera+collision) and may provide ``communication`` /
-``graph`` / ``feature_size`` / ``num_coop_vehs`` / ``coop_spawn_radius_m`` /
-``coop_participation_prob`` keys (all default-tolerant).
+``graph`` / ``feature_size`` / ``coop_participation_prob`` keys (all default-tolerant).
 """
 
 from __future__ import annotations
@@ -98,10 +99,6 @@ class V2VCommMixin:
         self._actor_cache: Dict[int, carla.Actor] = {}
         # Per-episode probability that each camera vehicle joins cooperative perception.
         self.coop_participation_prob = float(getattr(self._config, "coop_participation_prob", 0.5))
-        # Default near-ego spawner uses num_coop_vehs; fixed-point hosts use num_group_vehs.
-        self.num_coop_vehs = int(getattr(self._config, "num_coop_vehs", 3))
-        self.num_group_vehs = int(getattr(self._config, "num_group_vehs", self.num_coop_vehs))
-        self.coop_spawn_radius_m = float(getattr(self._config, "coop_spawn_radius_m", 50.0))
 
         # --- communication config / latency model ---
         comm_cfg = getattr(self._config, "communication", None)
@@ -289,52 +286,33 @@ class V2VCommMixin:
                 self.group_obs[int(actor.id)], _ = observer.get_observation(self.get_state())
 
     # =========================================================
-    # Cooperative-vehicle source (override for a task-specific source)
+    # Cooperative-vehicle registration (driven by scenario_actors `start` vehicles)
     # =========================================================
 
-    def _spawn_points_near_ego(self, radius_m: float, n: int) -> List[carla.Transform]:
-        """Map spawn points within ``radius_m`` of the ego (fallback: nearest ``n``)."""
-        ego_loc = self.ego.get_transform().location
-        scored = []
-        for point in self._world.get_spawn_points():
-            d = math.hypot(point.location.x - ego_loc.x, point.location.y - ego_loc.y)
-            scored.append((d, point))
-        scored.sort(key=lambda item: item[0])
-        within = [point for d, point in scored if d <= radius_m]
-        if len(within) >= n:
-            return within
-        return [point for _, point in scored[: max(n, len(within))]]
+    def _register_cooperative_candidate(self, vehicle: carla.Actor) -> None:
+        """Turn an already-spawned scenario vehicle into a V2V cooperative candidate.
 
-    def _spawn_cooperative_vehicles(self) -> None:
-        """Default cooperative-vehicle source: spawn N camera-equipped autopilot
-        vehicles near the ego (they move). Override for a task-specific source.
-
-        Every spawned vehicle is camera-equipped; each independently joins the
-        cooperative candidate pool with probability ``coop_participation_prob``.
+        Invoked (as the ``ScenarioActorManager`` ``cooperative_hook``) for every
+        ``scenario_actors`` vehicle that has a ``start`` point. The vehicle gets a
+        camera+collision observer and joins this episode's candidate pool with probability
+        ``coop_participation_prob`` (only participants enter the group, share over V2V, and
+        appear in the policy graph). The vehicle itself is spawned (and destroyed on reset)
+        by the scenario manager via the world's ``actor_dict``.
         """
-        self.groups.setdefault(GROUP_ID, set())
-        self.groups[GROUP_ID].add(int(self.ego.id))
-        n = int(getattr(self, "num_coop_vehs", 3))
-        if n <= 0:
+        if vehicle is None:
             return
-        near_points = self._spawn_points_near_ego(self.coop_spawn_radius_m, n)
-        vehicles = self._world.spawn_auto_actors(n, transforms=near_points)
-        participation_prob = float(getattr(self, "coop_participation_prob", 0.5))
-        for vehicle in vehicles:
-            if vehicle is None:
-                continue
-            self._create_group_observer(vehicle)  # camera+collision sensor
-            self.group_vehs.append(vehicle)
-            self._cache_actor(vehicle)
-            if np.random.random() < participation_prob:
-                self.coop_participant_ids.add(int(vehicle.id))
-                self.groups[GROUP_ID].add(int(vehicle.id))
-        V2V_LOGGER.info(
-            "Spawned cooperative vehicles requested=%d spawned=%d participants=%s group_members=%s",
-            n,
+        self.groups.setdefault(GROUP_ID, set()).add(int(self.ego.id))
+        self._create_group_observer(vehicle)  # camera+collision sensor
+        self.group_vehs.append(vehicle)
+        self._cache_actor(vehicle)
+        if np.random.random() < float(getattr(self, "coop_participation_prob", 0.5)):
+            self.coop_participant_ids.add(int(vehicle.id))
+            self.groups[GROUP_ID].add(int(vehicle.id))
+        V2V_LOGGER.debug(
+            "Registered cooperative candidate id=%s participant=%s total_candidates=%d",
+            int(vehicle.id),
+            int(vehicle.id) in self.coop_participant_ids,
             len(self.group_vehs),
-            sorted(self.coop_participant_ids),
-            sorted(self.groups.get(GROUP_ID, set())),
         )
 
     # =========================================================

@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from runtime_logging import get_runtime_logger, get_runtime_logging_config, should_log_periodic
 
 from .carla_wpt_fixed_env import CarlaWptFixedEnv
-from .right_turn_auto_runtime import RightTurnAutoRuntimeMixin
+from .right_turn_auto_runtime import GROUP_ID, RightTurnAutoRuntimeMixin
 
 
 AUTO_ENV_LOGGER = get_runtime_logger("car_dreamer.env.right_turn_auto")
@@ -21,8 +21,9 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, CarlaWptFixedEnv):
     accepted to preserve the Gym interface expected by the training stack.
 
     Cooperative perception (V2V) is provided by :class:`V2VCommMixin` via
-    :class:`RightTurnAutoRuntimeMixin`, which overrides the cooperative-vehicle source
-    to use the fixed ``group_spawn_points`` for this task.
+    :class:`RightTurnAutoRuntimeMixin`. Cooperative vehicles are declared in the task's
+    ``scenario_actors`` config (any vehicle with a ``start`` point) and registered as
+    candidates by the base-env scenario hook.
     """
 
     def __init__(self, config):
@@ -47,12 +48,14 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, CarlaWptFixedEnv):
         self._configure_traffic_lights()
         super().on_reset()
         self._setup_basic_agent()
-        self._spawn_cooperative_vehicles()
+        # Cooperative vehicles are declared in scenario_actors (vehicles with a `start` point)
+        # and registered by the base-env scenario hook, which runs right after on_reset. Here we
+        # only seed the cooperative group with the ego.
+        self.groups.setdefault(GROUP_ID, set()).add(int(self.ego.id))
         self._refresh_actor_cache()
         AUTO_ENV_LOGGER.info(
-            "Right-turn auto reset complete ego_id=%s group_vehicle_ids=%s",
+            "Right-turn auto reset complete ego_id=%s",
             getattr(self.ego, "id", None),
-            [int(actor.id) for actor in self.group_vehs],
         )
 
     def on_step(self) -> None:

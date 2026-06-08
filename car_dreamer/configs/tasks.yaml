@@ -152,20 +152,9 @@ carla_right_turn_hard:
 carla_group_right_turn_auto:
   <<: *carla_right_turn_simple
   env.name: CarlaGroupRightTurnAutoEnv-v0
-  env.min_flow_dist: 6
-  env.max_flow_dist: 8
   env.lane_end_point: [-5.0, -110.3, 0.1, 90.0]
-  # Group vehicles
-  env.num_group_vehs: 2
-  env.group_observation.enabled: [camera, collision]
-  env.group_observation.camera.fov: 180
-  # Per-episode probability that each camera vehicle joins cooperative perception
-  # (randomized candidate pool so the model learns dynamics, not a fixed set).
-  env.coop_participation_prob: 0.5
-  env.grouping_strategy: "fixed"
-  env.group_spawn_points:
-    - [15.4, -140.2, 0.1, 180.0]
-    - [7.4, -124.2, 0.1, 270.0]
+  # Non-ego vehicle settings (car flow + V2V/cooperative vehicles) are configured in
+  # configs/tasks/carla_group_right_turn_auto.yaml, alongside the scenario_actors block.
   # Feature & graph construction (task-specific)
   env.feature_size: 3072
   env.graph.window_s: 2.0

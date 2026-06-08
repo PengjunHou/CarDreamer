@@ -1,5 +1,16 @@
 # 在一个 Task 中接入 V2V 协同感知通信模块
 
+> **⚠️ 更新（协同车来源已变更）**：协同车辆不再由 `_spawn_cooperative_vehicles` /
+> `num_coop_vehs` / `coop_spawn_radius_m` / `group_spawn_points` 生成。现在统一在任务的
+> **`scenario_actors.vehicles`** 配置里声明——**任何带 `start` 点的车辆即为 V2V 候选车**
+> （自动挂相机、可被 policy 选中）：无 `destination` → 静止;有 `destination` → TM 路由（`target_speed`
+> 默认 25）。`ScenarioActorManager` 负责生成，并通过 `cooperative_hook` 调用
+> `V2VCommMixin._register_cooperative_candidate` 完成注册;共享传感器配置仍是单个
+> `env.group_observation` 块，候选参与概率仍是 `env.coop_participation_prob`。
+> 详见 [`car_dreamer/toolkit/scenario_actors.py`](../car_dreamer/toolkit/scenario_actors.py) 与
+> [`docs/wam_implementation.md`](wam_implementation.md)。下文中凡涉及 `_spawn_cooperative_vehicles`/
+> near-ego 生成器/`group_spawn_points` 的段落均为**历史写法**，仅作背景参考。
+
 本文档说明如何把可复用的 **V2V 协同感知通信模块**（`V2VCommMixin`）接入到任意一个
 CarDreamer task 中，使其具备与 `carla_group_right_turn_auto` 一致的协同感知能力：
 带相机的协同车辆、按 episode 随机的候选集、逐步的 policy 选择、带时延的 V2V 消息收发，

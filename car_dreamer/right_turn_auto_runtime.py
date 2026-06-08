@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import carla
-import numpy as np
 from agents.navigation.basic_agent import BasicAgent
 from runtime_logging import get_runtime_logger
 
@@ -15,9 +14,10 @@ RUNTIME_LOGGER = get_runtime_logger("car_dreamer.runtime")
 class RightTurnAutoRuntimeMixin(V2VCommMixin):
     """Right-turn-auto specifics layered on the reusable V2V communication mixin.
 
-    Keeps only what is specific to this task: ``BasicAgent`` ego control, fixed
-    ``group_spawn_points`` cooperative vehicles (overriding the generic near-ego
-    spawner), all-green traffic lights, and right-turn actor-flow cleanup.
+    Keeps only what is specific to this task: ``BasicAgent`` ego control, all-green
+    traffic lights, and right-turn actor-flow cleanup. Cooperative vehicles are declared
+    in ``scenario_actors`` (any vehicle with a ``start`` point) and registered via
+    ``V2VCommMixin._register_cooperative_candidate``.
     """
 
     def _configure_traffic_lights(self) -> None:
@@ -26,43 +26,6 @@ class RightTurnAutoRuntimeMixin(V2VCommMixin):
             tl.set_green_time(9999)
             tl.set_red_time(0)
             tl.set_yellow_time(0)
-
-    def _spawn_cooperative_vehicles(self) -> None:
-        """Override the near-ego default: spawn cooperative vehicles at the fixed
-        ``group_spawn_points`` (stationary). Every vehicle is camera-equipped; each
-        independently joins the cooperative candidate pool with probability
-        ``coop_participation_prob``.
-        """
-        self.groups.setdefault(GROUP_ID, set())
-        self.groups[GROUP_ID].add(int(self.ego.id))
-        spawn_points = self._config.group_spawn_points
-        assert spawn_points is not None and len(spawn_points) >= self.num_group_vehs, (
-            "Not enough spawn points for the number of group vehicles"
-        )
-        participation_prob = float(getattr(self, "coop_participation_prob", 0.5))
-        for spawn_point in spawn_points[: self.num_group_vehs]:
-            transform = carla.Transform(
-                carla.Location(*spawn_point[:3]),
-                carla.Rotation(yaw=spawn_point[3]),
-            )
-            vehicle = self._world.spawn_actor(transform=transform)
-            # Every non-flow vehicle is camera-equipped (observer attached here).
-            self._create_group_observer(vehicle)
-            self.group_vehs.append(vehicle)
-            self._cache_actor(vehicle)
-            # Randomly decide if this camera vehicle participates in cooperative
-            # perception this episode. Only participants become candidate collaborators
-            # (i.e. enter the group, share over V2V, and appear in the policy graph).
-            if np.random.random() < participation_prob:
-                self.coop_participant_ids.add(int(vehicle.id))
-                self.groups[GROUP_ID].add(int(vehicle.id))
-        RUNTIME_LOGGER.info(
-            "Generated group vehicles count=%d ids=%s participants=%s group_members=%s",
-            len(self.group_vehs),
-            [int(vehicle.id) for vehicle in self.group_vehs],
-            sorted(self.coop_participant_ids),
-            sorted(self.groups.get(GROUP_ID, set())),
-        )
 
     def _setup_basic_agent(self) -> None:
         self.ego_end = self._config.lane_end_point

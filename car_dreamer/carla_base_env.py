@@ -7,7 +7,7 @@ import numpy as np
 from gymnasium import spaces
 from runtime_logging import get_runtime_logger, get_runtime_logging_config, should_log_periodic, summarize_keys
 
-from .toolkit import EnvMonitorOpenCV, Observer, WorldManager
+from .toolkit import EnvMonitorOpenCV, Observer, ScenarioActorManager, WorldManager
 
 
 ENV_LOGGER = get_runtime_logger("car_dreamer.env")
@@ -19,8 +19,16 @@ class CarlaBaseEnv(gym.Env):
 
         self._monitor = EnvMonitorOpenCV(self._config)
         self._world = WorldManager(self._config)
-        self._world.on_reset(self.on_reset)
-        self._world.on_step(self.on_step)
+        # Config-driven background actors (vehicles + pedestrians); no-op without config.
+        # V2V-enabled envs expose `_register_cooperative_candidate` so that scenario vehicles with a
+        # `start` point become cooperative candidates; other envs just place them (hook is None).
+        self._scenario_actors = ScenarioActorManager(
+            self._world,
+            getattr(self._config, "scenario_actors", None),
+            cooperative_hook=getattr(self, "_register_cooperative_candidate", None),
+        )
+        self._world.on_reset(self._on_reset_hook)
+        self._world.on_step(self._on_step_hook)
         self._ego_observer = Observer(self._world, self._config.observation)
 
         self.action_space = self._get_action_space()
@@ -51,6 +59,16 @@ class CarlaBaseEnv(gym.Env):
         This method will be called after the simulator ticks.
         """
         pass
+
+    def _on_reset_hook(self) -> None:
+        """Internal: run the task's ``on_reset`` then spawn config-driven scenario actors."""
+        self.on_reset()
+        self._scenario_actors.reset_spawn()
+
+    def _on_step_hook(self) -> None:
+        """Internal: run the task's ``on_step`` then maintain scenario actors."""
+        self.on_step()
+        self._scenario_actors.step_update()
 
     @abstractmethod
     def reward(self) -> Tuple[float, Dict]:

@@ -354,6 +354,157 @@ class WorldManager:
         )
         return walkers
 
+    def spawn_scenario_vehicle(
+        self,
+        start: carla.Transform = None,
+        destination: carla.Location = None,
+        target_speed: float = None,
+        ignore_lights: bool = False,
+        stationary: bool = False,
+        blueprint: carla.ActorBlueprint = None,
+    ) -> Union[carla.Actor, None]:
+        """
+        Spawn one vehicle for the config-driven scenario-actor module.
+
+        :param start: spawn transform; if None, a random map spawn point is used.
+        :param destination: if given, the Traffic Manager routes the vehicle toward it
+            (``tm.set_path``); the vehicle drives there legally (lanes, lights) and keeps
+            going afterwards. If None, the vehicle roams (TM default).
+        :param target_speed: desired speed (km/h); falls back to ``world.background_speed``.
+        :param ignore_lights: if True, the vehicle runs red lights (100%).
+        :param stationary: if True, the vehicle is parked (no autopilot / no routing) -- used
+            for cooperative observer vehicles that should stay put.
+        :param blueprint: if None, a random ``vehicle.*`` 4-wheel blueprint is used.
+
+        The vehicle is registered in ``actor_dict`` and destroyed on the next reset.
+        """
+        if blueprint is None:
+            blueprint = self.get_blueprint("vehicle.*", {"number_of_wheels": "4"})
+        transform = start if start is not None else self.get_random_spawn_point()
+        vehicle = self.try_spawn_actor(transform, blueprint)
+        if vehicle is None:
+            WORLD_LOGGER.debug("Scenario vehicle spawn failed (occupied?) at %s", transform.location)
+            return None
+        if stationary:
+            return vehicle  # parked observer: no autopilot, no route
+        vehicle.set_autopilot(True, self._tm_port)
+        tm = self._vehicle_manager._tm
+        self._vehicle_manager.set_auto_lane_change(vehicle, self._config.auto_lane_change)
+        if target_speed is not None:
+            self._vehicle_manager.set_desired_speed(vehicle, float(target_speed))
+        elif "background_speed" in self._config:
+            self._vehicle_manager.set_desired_speed(vehicle, self._config.background_speed)
+        if ignore_lights:
+            tm.ignore_lights_percentage(vehicle, 100.0)
+        if destination is not None:
+            try:
+                tm.set_path(vehicle, [destination])
+            except Exception as exc:  # noqa: BLE001
+                WORLD_LOGGER.warning("set_path failed for scenario vehicle %s: %s", vehicle.id, exc)
+        return vehicle
+
+    def spawn_scenario_walkers(
+        self,
+        specs: List[Dict],
+        cross_factor: float = 0.1,
+    ) -> List[Dict]:
+        """
+        Spawn one pedestrian per spec for the scenario-actor module (batched).
+
+        Each spec is a dict with optional ``start`` (``carla.Transform``/``carla.Location``;
+        random navigation point if absent), ``destination`` (``carla.Location``; random walk
+        if absent), ``max_speed`` (m/s) and ``on_arrival`` (passed through to the manager).
+        Reuses the proven body -> controller -> wait_for_tick -> start sequence; bodies and
+        controllers are tracked in ``_walker_actors`` (destroyed on reset).
+
+        :return: a list of manager records ``{walker, controller, destination, on_arrival,
+            max_speed}`` for per-step maintenance.
+        """
+        if not specs:
+            return []
+        walker_bps = self.get_blueprint_library("walker.pedestrian.*")
+        if len(walker_bps) == 0:
+            WORLD_LOGGER.warning("No walker blueprints found; skipping pedestrian spawn.")
+            return []
+        controller_bp = self._world.get_blueprint_library().find("controller.ai.walker")
+        self._world.set_pedestrians_cross_factor(float(cross_factor))
+
+        # 1) spawn walker bodies (explicit start transform or a random navigation point)
+        spawn_specs: List[Dict] = []
+        batch = []
+        for spec in specs:
+            start = spec.get("start")
+            if start is None:
+                location = self._world.get_random_location_from_navigation()
+                if location is None:
+                    continue
+                transform = carla.Transform(location)
+            elif isinstance(start, carla.Transform):
+                transform = start
+            else:
+                transform = carla.Transform(start)
+            bp = np.random.choice(walker_bps)
+            if bp.has_attribute("is_invincible"):
+                bp.set_attribute("is_invincible", "false")
+            batch.append(carla.command.SpawnActor(bp, transform))
+            spawn_specs.append(spec)
+
+        walker_ids = []
+        walker_spec_by_id: Dict[int, Dict] = {}
+        for spec, response in zip(spawn_specs, self._client.apply_batch_sync(batch, True)):
+            if response.error:
+                WORLD_LOGGER.debug("Walker spawn skipped: %s", response.error)
+            else:
+                walker_ids.append(response.actor_id)
+                walker_spec_by_id[response.actor_id] = spec
+
+        # 2) attach an AI controller to each surviving walker body
+        controller_batch = [carla.command.SpawnActor(controller_bp, carla.Transform(), wid) for wid in walker_ids]
+        controller_walker_pairs = []
+        for wid, response in zip(walker_ids, self._client.apply_batch_sync(controller_batch, True)):
+            if response.error:
+                WORLD_LOGGER.debug("Walker controller spawn skipped: %s", response.error)
+            else:
+                controller_walker_pairs.append((response.actor_id, wid))
+
+        # 3) let the server register the new actors before starting the controllers
+        self._world.wait_for_tick()
+
+        for wid in walker_ids:
+            actor = self._world.get_actor(wid)
+            if actor is not None:
+                self._walker_actors[actor.id] = actor
+
+        # 4) start each controller and send it to its destination (or a random point)
+        records: List[Dict] = []
+        for controller_id, walker_id in controller_walker_pairs:
+            controller = self._world.get_actor(controller_id)
+            if controller is None:
+                continue
+            self._walker_actors[controller.id] = controller
+            spec = walker_spec_by_id.get(walker_id, {})
+            destination = spec.get("destination")
+            target = destination if destination is not None else self._world.get_random_location_from_navigation()
+            max_speed = float(spec.get("max_speed", 1.4))
+            try:
+                controller.start()
+                controller.go_to_location(target)
+                controller.set_max_speed(max_speed)
+            except Exception as exc:  # noqa: BLE001
+                WORLD_LOGGER.debug("Failed to start walker controller %s: %s", controller_id, exc)
+                continue
+            records.append(
+                {
+                    "walker": self._world.get_actor(walker_id),
+                    "controller": controller,
+                    "destination": destination,
+                    "on_arrival": spec.get("on_arrival", "keep"),
+                    "max_speed": max_speed,
+                }
+            )
+        WORLD_LOGGER.info("Spawned scenario pedestrians requested=%d bodies=%d managed=%d", len(specs), len(walker_ids), len(records))
+        return records
+
     def try_spawn_aggresive_actor(
         self,
         transform: Union[carla.Transform, None] = None,
