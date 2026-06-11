@@ -39,6 +39,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
+from .bev import WAMBevDecoder
 from .graph import MODALITIES, OBJECT
 from .graph_model import WAMGraphModelConfig, WAMHeteroGraphNet
 from .runtime import WAMPolicy
@@ -680,10 +681,26 @@ class WAMUnifiedWorldModel(nn.Module):
         self.context_encoder = WAMBSContextEncoder(graph_config, flow_config.bev_latent_dim)
         self.flow = WAMFlowMatchingUWM(flow_config)
         self.flow_config = flow_config
+        # §14 BEV decoder (paired with the shared E_bev in the graph encoder) for §15.4 reconstruction.
+        self.bev_decoder = (
+            WAMBevDecoder(int(flow_config.bev_latent_dim), channels=graph_config.bev_channels, size=graph_config.bev_size)
+            if flow_config.enable_bev
+            else None
+        )
 
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
+
+    def encode_bev(self, rasters: torch.Tensor) -> torch.Tensor:
+        """``E_bev(B^sem) -> z^bev`` via the shared graph BEV encoder. ``rasters [N,C,H,W] -> [N,d]``."""
+        return self.context_encoder.graph_net.encode_bev(rasters)
+
+    def decode_bev(self, latents: torch.Tensor) -> torch.Tensor:
+        """``D_bev(z^bev) -> B̂^sem`` occupancy logits ``[N,C,H,W]`` (§14)."""
+        if self.bev_decoder is None:
+            raise RuntimeError("bev_decoder is disabled (enable_bev=False)")
+        return self.bev_decoder(latents)
 
     def condition_tokens(
         self,

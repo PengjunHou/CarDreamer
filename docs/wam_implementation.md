@@ -33,6 +33,7 @@
 | §13/§17 | Base Station 协同 policy | 🟡 placeholder（选全部候选） |
 | §4–§7 | policy-conditioned 异构图构造 | ✅ 已实现 |
 | Edge Update | obs_obj `det_confidence` + veh_veh `latency` 边属性；`s_det` 移出 object node（12→11） | ✅ 已实现（`det_confidence` 恒 1） |
+| §5.3 BEV | per-vehicle visibility-aware `B^sem` 栅格 + `E_bev` 真实输入 | ✅ 已实现（drivable 通道暂空） |
 | §5 | 三类 node 初始 embedding | ✅ 已实现 |
 | §9 | edge-attribute-aware graph transformer（TransformerConv+HeteroConv） | ✅ 已实现 |
 | §10 | Temporal Encoder | ✅ 已实现（GRU，仅 object 节点） |
@@ -40,11 +41,12 @@
 | §11.2 | Gaussian Trajectory Head（学习版 + `U^π`） | ✅ 已实现 + Stage 1 训练 |
 | §15.1/§15.2/§11.2 | perception loss / 轨迹 NLL / U^π | ✅ 函数已实现 |
 | §15.2 | GT 未来轨迹真值抽取 | ✅ 已实现 |
-| Update §2–§6 | BS condition tokens（per-vehicle graph token + request + driving-task + BEV-history） | ✅ 已实现（`WAMBSContextEncoder`；BEV-history 零占位） |
+| Update §2–§6 | BS condition tokens（per-vehicle graph token + request + driving-task + BEV-history） | ✅ 已实现（`WAMBSContextEncoder`；BEV-history 真实栅格编码） |
 | Update §7–§8 | BS-centric Diffusion UWM（future policy chunk + future BEV latent，解耦 `s_π`/`s_z` + register） | ✅ 模型已实现（未训练；X 不再生成） |
 | §13.1–§13.3 | flow 推理（rollout BEV / policy proposal / inverse + joint） | ✅ 已实现（Euler 积分） |
 | §15.3 | flow matching loss（policy + BEV，masked） | ✅ 函数已实现 |
-| §14 | BEV decoder | ❌ 未实现 |
+| §14 | BEV decoder `D_bev` | ✅ 已实现（`WAMBevDecoder`） |
+| §15.4 | BEV 重建 loss `CE(B̂^sem, B^sem)` | ✅ 已实现（`bev_reconstruction_loss`，Stage-2 接入） |
 | §16.1 | Stage 1：graph encoder + heads 预训练 + `U^π` | ✅ 已实现（recorder + dataset + trainer + checkpoint + Stage-2 warm-start） |
 | §16.2 | Stage 2：BS-centric Diffusion UWM 训练 | ✅ 已实现（recorder + dataset + trainer + checkpoint） |
 | §16.3 | Stage 3：policy search + planner 验证 | ❌ 未实现 |
@@ -139,7 +141,7 @@ WAM 运行参数（默认值，可在 `env.wam.*` 覆盖）：`notable_distance_
 
 **未实现**：
 - §6.2 BEV-to-object 边：`bev` observation 节点在第一版**不连** `obs_obj`。
-- 真实 per-vehicle BEV 语义图 `B^sem`：见下面 §5 的 `z^bev` 占位。
+- 真实 per-vehicle BEV 语义图 `B^sem`：已实现（visibility-aware 栅格 + `E_bev`），详见 [docs/wam_bev.md](docs/wam_bev.md)。
 
 ---
 
@@ -152,7 +154,7 @@ WAM 运行参数（默认值，可在 `env.wam.*` 覆盖）：`notable_distance_
   - `type` embedding 区分 vehicle / object / observation(objlist) / observation(bev)（共 4 个 type id）；
   - `agent` embedding 按 slot 索引（ego=0，协作车=1…Mmax）；`time` embedding（单步=0）；`class` embedding（object 类别）。
 - **objlist 模态特征**（§5.3 `z^objlist = AttentionPooling({MLP_obj(x^obj)})`）：用 `obs_obj` 边，把 observation 节点的 object 邻居的 `MLP_obj` 输出做 **attention pooling**（`softmax` over 边 + scatter）。
-- **bev 模态特征** `z^bev = E_bev(B^sem)`：用轻量 CNN，但**输入是全零占位** `B^sem`（真实 per-vehicle BEV 尚未接入）。
+- **bev 模态特征** `z^bev = E_bev(B^sem)`：`B^sem` 现为**真实 visibility-aware 栅格**（`rasterize_bev`，只含该车可见物体 + ego + route + drivable 通道），过共享 `E_bev`（CNN）得 `z^bev`；详见 [docs/wam_bev.md](docs/wam_bev.md)。
 
 **简化 / 未实现**：`z^bev` 是占位（零图过 CNN）；`time` 只有单步（K 步时序在 §10 处理）；img/text 模态未做。
 
@@ -234,7 +236,7 @@ WAM 运行参数（默认值，可在 `env.wam.*` 覆盖）：`notable_distance_
   - 对每辆覆盖车的 perception graph（local / V2V）跑 §9 edge-aware 编码器 + `WAMGraphContextPool` → 车级 token `g^cp_v`；
   - request token `g^req_q = g^cp_q + e^req`（`e^req` 即 type embedding `_T_REQUEST`，把 request 车标出来）；
   - driving-task tokens `T^task = {h^obj_o : o ∈ notable(q)}`：取 **request graph 编码后的 object embedding** 中 notable 行（notable 集合即驾驶任务，§4）；
-  - request BEV-latent tokens `{z^bev_{q,τ}}`（当前 + 历史，§5）—— **零占位**（无真实 per-vehicle BEV）。
+  - request BEV-latent tokens `{z^bev_{q,τ}}`（当前 + 历史，§5）—— 由 `E_bev(真实 B^sem 栅格)` 编码得到（不再零占位）。
   - 返回 `(cond_tokens [T_c,d], type_ids [T_c])`；批处理由 `pad_condition_tokens` 右 pad + mask。
 - **§7–§8 生成变量与 transformer**（`WAMFlowMatchingUWM`）：
   - noised tokens = **policy chunk** `[B,H,M,P]`（H·M 个 token，带 step/member/type/`e(s_π)`）+ **future BEV** `[B,H,Dz]`（H 个 token，带 step/type/`e(s_z)`）+ **register tokens**；条件 token 拼前面、不加噪。
@@ -246,7 +248,7 @@ WAM 运行参数（默认值，可在 `env.wam.*` 覆盖）：`notable_distance_
   `condition_tokens(_batch)(samples)` 与 `training_step(cond, …, policy_1, bev_1)`（采样→forward→loss，梯度回传 graph encoder）。仍是**训练侧 standalone**，未接入 live env。
 
 **简化 / 未实现**：
-- BEV-history 条件 token 与 future BEV 目标均为**零占位** → 生成的 BEV 那一半暂为退化目标（去噪向 0），待真实 per-vehicle BEV encoder（§5.3 `E_bev`）接入后才有意义。
+- BEV-history 条件 token 与 future BEV 目标现由真实 visibility-aware 栅格经 `E_bev` 编码得到（§5.3/§14/§15.4 已实现，见 [docs/wam_bev.md](docs/wam_bev.md)）；BEV-AE 采用 joint+detach 训练（diffusion 目标 detach，重建训 E_bev/D_bev）。
 - **per-vehicle 图 deferred**：录制/训练样本里 `vehicle_graphs` 暂为 `[request_graph]`（N=1）；为全部覆盖车构建 local 图（需 per-vehicle route/notable）留待后续。
 - `F=2`（objlist/bev）；img/text 未进图；模型**已实现但未训练**。
 
@@ -299,13 +301,13 @@ WAM 运行参数（默认值，可在 `env.wam.*` 覆盖）：`notable_distance_
 > 详细的设计→代码对照、简化清单与**后续完善逻辑**见专文 [docs/wam_stage2_training.md](docs/wam_stage2_training.md)。
 
 - **数据录制**（`WAMFlowDataRecorder`）：`observe_policy(step, policy)` 每步记 policy；`register(step, graph, candidate_ids, notable_object_ids)` 登记 request 车样本骨架；horizon（=H-1）到期后用 `encode_policy_chunk` 把 `policy(t..t+H-1)` 按样本的 candidate 顺序编码成 chunk，`torch.save` 成 `.pt`。CARLA 抽取在脚本里，recorder 纯逻辑可单测。
-- **样本字段**（一条 = request 车 q 在 t）：`vehicle_graphs:[HeteroData]`（v1 = `[request_graph]`）、`request_index`、`notable_object_ids`、`policy_chunk(π_1) [H,M,P]`、`member_mask [M]`、`policy_step_mask [H]`、`bev_history [K+1,Dz]`（零占位）、`bev_future(z_1) [H,Dz]`（零占位）、`bev_step_mask [H]`。
+- **样本字段**（一条 = request 车 q 在 t）：`vehicle_graphs:[HeteroData]`（v1 = `[request_graph]`）、`request_index`、`notable_object_ids`、`policy_chunk(π_1) [H,M,P]`、`member_mask [M]`、`policy_step_mask [H]`、`bev_history [K+1,C,H,W]`（真实栅格 uint8）、`bev_future [H,C,H,W]`（真实栅格 uint8，训练时 `E_bev` 编码为 `z_1`）、`bev_step_mask [H]`。
 - **Dataset / collate**：`WAMFlowDataset`（读 `.pt` 目录或内存 list）+ `collate_flow_samples`（`samples` 保持 list 逐图编码、张量 pad/stack 到 `[B, H, M/Dz]`）。
 - **训练循环** `WAMStage2Trainer`：每 batch → `model.condition_tokens_batch(samples)→ (cond, type_ids, mask)` → `model.training_step(cond, …, policy_1, bev_1)`（采样 `s_π/s_z` + 噪声 → forward → `flow_matching_loss`）→ backward + grad-clip + Adam。日志/定期 checkpoint/可选 val；**graph encoder 与 diffusion 联合端到端**（`freeze_encoder` 冻结 `context_encoder`）。
 - **配置**：`env.wam.flow.*`（含 `history_window`、`num_register_tokens`；去掉 `max_objects`/`max_bev_vehicles`）+ `env.wam.stage2.*`（`w_bev` 取代 `w_obs`），`hidden_dim`/`route_waypoints` 复用 `env.wam.graph.*`，由 `wam_configs_from_env` 读。
 
 **简化 / 未实现**：
-- `bev_future`/`bev_history` 零占位（仍纳入 `L`，训练退化目标）；待真实 per-vehicle BEV latent 接入后替换。
+- `bev_future`/`bev_history` 为真实 visibility-aware 栅格；trainer 用共享 `E_bev` 编码（diffusion 目标 detach）+ `D_bev` 重建 loss（§15.4）。`drivable` 通道暂空。
 - `vehicle_graphs = [request_graph]`（N=1）；per-vehicle local 图 deferred。
 - 逐图编码（Python 循环，非 PyG `Batch`）；policy 真值 `π_1` 来自占位策略（选全部候选），分布单一；未训练 Stage 1 → encoder 由 `L` 联合训练。
 
@@ -445,12 +447,12 @@ python scripts/train_wam_stage2.py --data-dir data/wam_flow --task carla_group_r
 - rule-based 运动预测是匀速 + 固定不确定度（visible 0.2 / invisible 2.0）。
 - placeholder policy 选全部候选；`B_t` 均分、`f_t=comm_period`。
 - 坐标 ego 帧、yaw 用 cos/sin（设计写原始值，信息等价）；object node state 11 维（`s_det` 已移到 obs_obj 边）。
-- BS condition 的 BEV-history 与 future BEV（`bev_future`）均为零占位 → 生成 BEV 半边退化（去噪向 0）；`enable_bev` 可整体关。
+- BEV 现为真实 visibility-aware 栅格（ego 帧、heading-up、只含可见物体 + ego/route/drivable 通道）；BEV-AE joint+detach 训练；`drivable` 通道暂空、`enable_bev` 可整体关。
 - BS 样本 `vehicle_graphs = [request_graph]`（N=1）；policy chunk 真值来自占位策略（选全部候选）。
 - diffusion 推理用定步长 Euler 积分（非高阶 solver）。
 
 **当前未实现（后续步骤）**
-- 真实 per-vehicle BEV latent（§5.3 `E_bev`）+ 真实 detector confidence（obs_obj `det_confidence` 暂恒 1）。
+- 真实 detector confidence（obs_obj `det_confidence` 暂恒 1）；BEV `drivable` 通道接地图、BEV-AE 预训练+冻结。**真实 per-vehicle BEV `B^sem` 已实现**（§5.3/§14/§15.4，见 [docs/wam_bev.md](docs/wam_bev.md)）。
 - live-env per-vehicle BS 图装配（全部覆盖车 local 图；需 per-vehicle route/notable）—— 当前 deferred。
 - §8.3 occluding object（occ 标签恒 0）。
 - §14 BEV decoder（把 `Ẑ^bev` 解码成 semantic map）、§15.4 BEV 重建 loss。

@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from .bev import BEV_NUM_CHANNELS, bev_reconstruction_loss
 from .flow_matching import WAMFlowMatchingConfig, WAMUnifiedWorldModel
 from .graph_model import WAMGraphModelConfig
 
@@ -50,23 +51,27 @@ def make_flow_sample(
     bev_history: Optional[torch.Tensor] = None,
     bev_future: Optional[torch.Tensor] = None,
     bev_step_mask: Optional[torch.Tensor] = None,
-    bev_latent_dim: Optional[int] = None,
+    bev_spec: Optional["BevSpec"] = None,
     history_window: int = 0,
 ) -> Dict[str, object]:
     """Assemble one BS-centric training sample (one = request vehicle q at time t).
 
     ``policy_chunk [H,M,P]`` is the GT future policy chunk; ``vehicle_graphs`` defaults to
     ``[request_graph]`` (per-vehicle local graphs for all coverage vehicles are deferred). The BEV
-    history/future default to zero placeholders.
+    history/future are visibility-aware ``B^sem`` rasters ``[*, C, S, S]`` (uint8 occupancy); the Stage-2
+    trainer encodes them with the shared ``E_bev``. Default to zero rasters when not supplied.
     """
+    from .bev import BevSpec
+
     h = int(policy_chunk.shape[0])
-    dz = int(bev_latent_dim if bev_latent_dim is not None else 0)
     if vehicle_graphs is None:
         vehicle_graphs = [request_graph]
+    spec = bev_spec if bev_spec is not None else BevSpec()
+    c, s = spec.channels, spec.size
     if bev_history is None:
-        bev_history = torch.zeros(int(history_window) + 1, dz, dtype=torch.float32)
+        bev_history = torch.zeros(int(history_window) + 1, c, s, s, dtype=torch.uint8)
     if bev_future is None:
-        bev_future = torch.zeros(h, dz, dtype=torch.float32)
+        bev_future = torch.zeros(h, c, s, s, dtype=torch.uint8)
     if bev_step_mask is None:
         bev_step_mask = torch.ones(h, dtype=torch.float32)
     return {
@@ -76,8 +81,8 @@ def make_flow_sample(
         "policy_chunk": policy_chunk.float(),
         "member_mask": member_mask.float(),
         "policy_step_mask": policy_step_mask.float(),
-        "bev_history": bev_history.float(),
-        "bev_future": bev_future.float(),
+        "bev_history": bev_history.to(torch.uint8),
+        "bev_future": bev_future.to(torch.uint8),
         "bev_step_mask": bev_step_mask.float(),
     }
 
@@ -115,22 +120,26 @@ def collate_flow_samples(
     b = len(batch)
     m, p = flow_config.max_members, flow_config.policy_width
     h = flow_config.horizon
-    dz = int(flow_config.bev_latent_dim)
 
     samples = [
         {
             "vehicle_graphs": s["vehicle_graphs"],
             "request_index": int(s.get("request_index", 0)),
             "notable_object_ids": s.get("notable_object_ids", ()),
-            "bev_history": s.get("bev_history"),
         }
         for s in batch
     ]
     policy_chunk = torch.zeros(b, h, m, p)
     member_mask = torch.zeros(b, m)
     policy_step_mask = torch.zeros(b, h)
-    bev_future = torch.zeros(b, h, dz)
     bev_step_mask = torch.zeros(b, h)
+
+    # BEV rasters: derive [C,S] and history length K+1 from the first sample.
+    bf0, bh0 = batch[0]["bev_future"], batch[0]["bev_history"]
+    c, s_pix = int(bf0.shape[1]), int(bf0.shape[2])
+    kp1 = int(bh0.shape[0])
+    bev_future = torch.zeros(b, h, c, s_pix, s_pix, dtype=torch.uint8)
+    bev_history = torch.zeros(b, kp1, c, s_pix, s_pix, dtype=torch.uint8)
 
     for i, s in enumerate(batch):
         nm = min(int(s["policy_chunk"].shape[1]), m)
@@ -138,9 +147,9 @@ def collate_flow_samples(
         policy_chunk[i, :nh, :nm] = s["policy_chunk"][:nh, :nm]
         member_mask[i, :nm] = s["member_mask"][:nm]
         policy_step_mask[i, :nh] = s["policy_step_mask"][:nh]
-        if dz > 0 and int(s["bev_future"].shape[-1]) == dz:
-            nhb = min(int(s["bev_future"].shape[0]), h)
-            bev_future[i, :nhb] = s["bev_future"][:nhb]
+        nhb = min(int(s["bev_future"].shape[0]), h)
+        bev_future[i, :nhb] = s["bev_future"][:nhb]
+        bev_history[i] = s["bev_history"][:kp1]
         bev_step_mask[i, :h] = s["bev_step_mask"][:h]
 
     return {
@@ -148,6 +157,7 @@ def collate_flow_samples(
         "policy_chunk": policy_chunk,
         "member_mask": member_mask,
         "policy_step_mask": policy_step_mask,
+        "bev_history": bev_history,
         "bev_future": bev_future,
         "bev_step_mask": bev_step_mask,
     }
@@ -165,6 +175,7 @@ class WAMStage2Config:
     max_steps: int = 2000
     w_policy: float = 1.0
     w_bev: float = 1.0
+    w_bev_recon: float = 1.0
     grad_clip: float = 1.0
     log_interval: int = 50
     ckpt_interval: int = 500
@@ -195,35 +206,56 @@ class WAMStage2Trainer:
     def _samples_to_device(self, samples: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
         out: List[Dict[str, object]] = []
         for s in samples:
-            graphs = [g.to(self.device) for g in s["vehicle_graphs"]]
-            bev_hist = s.get("bev_history")
             out.append(
                 {
-                    "vehicle_graphs": graphs,
+                    "vehicle_graphs": [g.to(self.device) for g in s["vehicle_graphs"]],
                     "request_index": int(s.get("request_index", 0)),
                     "notable_object_ids": s.get("notable_object_ids", ()),
-                    "bev_history": None if bev_hist is None else bev_hist.to(self.device),
                 }
             )
         return out
 
     def loss_on_batch(self, batch: Dict[str, object]) -> Dict[str, torch.Tensor]:
+        enable_bev = self.model.flow.config.enable_bev
         samples = self._samples_to_device(batch["samples"])
+
+        # ---- BEV history -> condition latents (E_bev), injected per sample ----
+        if enable_bev:
+            hist = batch["bev_history"].to(self.device).float()  # [B, K+1, C, S, S]
+            bsz, kp1 = hist.shape[0], hist.shape[1]
+            hist_lat = self.model.encode_bev(hist.reshape(bsz * kp1, *hist.shape[2:])).reshape(bsz, kp1, -1)
+            for i, s in enumerate(samples):
+                s["bev_history"] = hist_lat[i]
         cond, tids, mask = self.model.condition_tokens_batch(samples)
 
         policy_1 = batch["policy_chunk"].to(self.device)
-        bev_1 = batch["bev_future"].to(self.device)
         member_mask = batch["member_mask"].to(self.device)
         policy_step_mask = batch["policy_step_mask"].to(self.device)
         bev_step_mask = batch["bev_step_mask"].to(self.device)
-        # supervise only present (member, step) policy entries.
         policy_loss_mask = policy_step_mask.unsqueeze(-1) * member_mask.unsqueeze(1)
 
-        return self.model.training_step(
+        # ---- BEV future rasters -> latent diffusion target (detached) + reconstruction loss ----
+        bev_1 = None
+        recon = None
+        if enable_bev:
+            fut = batch["bev_future"].to(self.device).float()  # [B, H, C, S, S]
+            bsz, hh = fut.shape[0], fut.shape[1]
+            flat = fut.reshape(bsz * hh, *fut.shape[2:])
+            z_fut = self.model.encode_bev(flat)                       # [B*H, d]
+            bev_1 = z_fut.detach().reshape(bsz, hh, -1)               # diffusion target (stop-grad)
+            logits = self.model.decode_bev(z_fut)                     # [B*H, C, S, S]
+            recon = bev_reconstruction_loss(logits, flat, mask=bev_step_mask.reshape(bsz * hh))
+
+        losses = self.model.training_step(
             cond, tids, mask, policy_1, bev_1,
             member_mask=member_mask, policy_step_mask=policy_step_mask, bev_step_mask=bev_step_mask,
             policy_loss_mask=policy_loss_mask,
         )
+        if recon is not None:
+            losses = dict(losses)
+            losses["bev_recon"] = recon
+            losses["total"] = losses["total"] + self.config.w_bev_recon * recon
+        return losses
 
     def _loader(self, dataset: WAMFlowDataset, shuffle: bool) -> DataLoader:
         collate = functools.partial(collate_flow_samples, flow_config=self.model.flow.config)
@@ -351,8 +383,8 @@ def wam_configs_from_env(config) -> Tuple[WAMGraphModelConfig, WAMFlowMatchingCo
         hidden_dim=hidden_dim,
         num_layers=int(_cfg_get(graph, "num_layers", 3)),
         num_heads=int(_cfg_get(graph, "num_heads", 8)),
-        bev_channels=int(_cfg_get(graph, "bev_channels", 8)),
-        bev_size=int(_cfg_get(graph, "bev_size", 128)),
+        bev_channels=int(_cfg_get(graph, "bev_channels", BEV_NUM_CHANNELS)),
+        bev_size=int(_cfg_get(graph, "bev_size", 64)),
     )
     flow_cfg = WAMFlowMatchingConfig(
         hidden_dim=hidden_dim,
@@ -374,6 +406,7 @@ def wam_configs_from_env(config) -> Tuple[WAMGraphModelConfig, WAMFlowMatchingCo
         max_steps=int(_cfg_get(stage2, "steps", _cfg_get(stage2, "max_steps", 2000))),
         w_policy=float(_cfg_get(stage2, "w_policy", 1.0)),
         w_bev=float(_cfg_get(stage2, "w_bev", _cfg_get(stage2, "w_obs", 1.0))),
+        w_bev_recon=float(_cfg_get(stage2, "w_bev_recon", 1.0)),
         grad_clip=float(_cfg_get(stage2, "grad_clip", 1.0)),
         log_interval=int(_cfg_get(stage2, "log_interval", 50)),
         ckpt_interval=int(_cfg_get(stage2, "ckpt_interval", 500)),

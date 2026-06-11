@@ -96,6 +96,19 @@ def _register_current_graph(sim, recorder, step: int) -> bool:
     return True
 
 
+def _observe_request_bev(sim, recorder, step: int) -> None:
+    """Rasterize the request (ego) vehicle's visibility-aware B^sem from its visible objects + route."""
+    ego = getattr(sim, "ego", None)
+    if ego is None:
+        return
+    tf = ego.get_transform()
+    ego_pose = (float(tf.location.x), float(tf.location.y), float(tf.rotation.yaw))
+    objects = list(getattr(sim, "_wam_object_states", []))
+    visible = [s for s in objects if bool(getattr(s, "visible_to_ego", False))]
+    route_xy = sim._wam_route_xy() if hasattr(sim, "_wam_route_xy") else ()
+    recorder.observe_bev(step, ego_pose, visible, route_xy=route_xy)
+
+
 def main() -> int:
     known, passthrough = parse_args()
     if known.steps <= 0:
@@ -106,7 +119,7 @@ def main() -> int:
     _setup_carla_pythonapi()
 
     import car_dreamer
-    from car_dreamer.toolkit.wam import WAMFlowDataRecorder, wam_configs_from_env
+    from car_dreamer.toolkit.wam import BevSpec, WAMFlowDataRecorder, wam_configs_from_env
 
     env_args = [
         f"--env.world.carla_port={known.carla_port}",
@@ -116,7 +129,9 @@ def main() -> int:
     ]
     env, config = build_env(known.task, env_args)
     sim = env.unwrapped
-    _, flow_cfg, _ = wam_configs_from_env(config)
+    graph_cfg, flow_cfg, _ = wam_configs_from_env(config)
+    bev_range_m = float(getattr(getattr(getattr(config.env, "wam", None), "graph", None), "bev_range_m", 50.0))
+    bev_spec = BevSpec(size=int(graph_cfg.bev_size), range_m=bev_range_m)
     known.out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -129,7 +144,9 @@ def main() -> int:
             samples=int(flow_cfg.horizon),
             max_members=int(flow_cfg.max_members),
             num_formats=int(flow_cfg.num_formats),
-            bev_latent_dim=int(flow_cfg.bev_latent_dim),
+            history_window=int(flow_cfg.history_window),
+            bev_spec=bev_spec,
+            enable_bev=bool(flow_cfg.enable_bev),
         )
         print(
             f"Recording {known.steps} steps to {known.out_dir} "
@@ -144,6 +161,7 @@ def main() -> int:
         while int(getattr(sim, "_time_step", 0)) <= last_observe_step:
             current_step = int(getattr(sim, "_time_step", 0))
             recorder.observe_policy(current_step, getattr(sim, "_wam_policy", None))
+            _observe_request_bev(sim, recorder, current_step)
             if current_step <= last_record_step:
                 _register_current_graph(sim, recorder, current_step)
             recorder.flush_ready(current_step)

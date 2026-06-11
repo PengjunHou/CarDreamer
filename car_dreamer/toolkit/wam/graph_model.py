@@ -27,6 +27,7 @@ from torch_geometric.data import HeteroData
 from torch_geometric.nn import HeteroConv, TransformerConv
 from torch_geometric.utils import scatter, softmax
 
+from .bev import BEV_NUM_CHANNELS
 from .graph import (
     EDGE_ATTR_DIMS,
     MODALITY_TO_ID,
@@ -56,8 +57,8 @@ class WAMGraphModelConfig:
     num_agent_slots: int = 8
     num_time_slots: int = 1
     num_object_classes: int = 4
-    bev_channels: int = 8
-    bev_size: int = 128
+    bev_channels: int = BEV_NUM_CHANNELS
+    bev_size: int = 64
 
     @property
     def veh_state_dim(self) -> int:
@@ -150,11 +151,16 @@ class WAMHeteroGraphEmbedding(nn.Module):
             pooled = scatter(msg * weight.unsqueeze(-1), obs_idx, dim=0, dim_size=n_obs, reduce="sum")
             z = z + pooled
 
-        # bev: placeholder CNN over a zero B^sem (swap-in point for real per-vehicle BEV).
+        # bev: E_bev over the per-node visibility-aware B^sem (§5.3); falls back to zeros only if a graph
+        # was built without rasters (e.g. legacy / unit fixtures).
         bev_mask = modality == MODALITY_TO_ID.get("bev", -1)
         if bool(bev_mask.any()):
-            n_bev = int(bev_mask.sum().item())
-            bev_in = torch.zeros(n_bev, cfg.bev_channels, cfg.bev_size, cfg.bev_size, device=device)
+            raster = getattr(data[OBSERVATION], "bev_raster", None)
+            if raster is not None:
+                bev_in = raster.to(device).float()[bev_mask]
+            else:
+                n_bev = int(bev_mask.sum().item())
+                bev_in = torch.zeros(n_bev, cfg.bev_channels, cfg.bev_size, cfg.bev_size, device=device)
             z = z.clone()
             z[bev_mask] = self.bev_encoder(bev_in)
 
@@ -256,6 +262,11 @@ class WAMHeteroGraphNet(nn.Module):
             if etype in EDGE_ATTR_DIMS and hasattr(data[etype], "edge_attr")
         }
         return self.encoder(h0, edge_index_dict, edge_attr_dict)
+
+    def encode_bev(self, raster: torch.Tensor) -> torch.Tensor:
+        """``E_bev(B^sem) -> z^bev``: encode a ``[N,C,H,W]`` BEV raster batch with the shared BEV encoder."""
+        device = next(self.parameters()).device
+        return self.embedding.bev_encoder(raster.to(device).float())
 
     @staticmethod
     def config_device(h0: Dict[str, torch.Tensor]) -> torch.device:

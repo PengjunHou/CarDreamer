@@ -20,6 +20,15 @@ from .debug_recording import (
     predicted_future_waypoints,
     snapshot_from_carla_actor,
 )
+from .bev import (
+    BEV_CHANNEL_NAMES,
+    BEV_NUM_CHANNELS,
+    BevSpec,
+    WAMBevDecoder,
+    bev_iou,
+    bev_reconstruction_loss,
+    rasterize_bev,
+)
 from .graph import (
     EDGE_ATTR_DIMS,
     EDGE_TYPES,
@@ -120,6 +129,14 @@ __all__ = [
     "predicted_future_waypoints",
     "select_notable_objects",
     "snapshot_from_carla_actor",
+    # per-vehicle visibility-aware BEV (§5.3 / §14 / §15.4)
+    "BEV_CHANNEL_NAMES",
+    "BEV_NUM_CHANNELS",
+    "BevSpec",
+    "WAMBevDecoder",
+    "bev_iou",
+    "bev_reconstruction_loss",
+    "rasterize_bev",
     # hetero graph construction (§4-§7 + Edge Representation Update)
     "EDGE_ATTR_DIMS",
     "EDGE_TYPES",

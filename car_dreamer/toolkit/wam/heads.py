@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .bev import BEV_NUM_CHANNELS
 from .graph import OBJECT
 from .graph_model import WAMGraphModelConfig, WAMHeteroGraphNet
 
@@ -41,8 +42,8 @@ class WAMPerceptionConfig:
     num_heads: int = 8
     num_agent_slots: int = 8
     num_object_classes: int = 4
-    bev_channels: int = 8
-    bev_size: int = 128
+    bev_channels: int = BEV_NUM_CHANNELS
+    bev_size: int = 64
     # temporal encoder (§10) + heads (§11)
     temporal_hidden_dim: int = 256
     head_hidden_dim: int = 256

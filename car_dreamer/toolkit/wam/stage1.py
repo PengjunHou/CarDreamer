@@ -39,6 +39,7 @@ from .heads import (
     policy_uncertainty,
     trajectory_ade_fde,
 )
+from .bev import BEV_NUM_CHANNELS
 from .stage2 import _cfg_get
 
 EgoPose = Tuple[float, float, float]
@@ -358,8 +359,8 @@ def wam_stage1_configs_from_env(config) -> Tuple[WAMPerceptionConfig, WAMStage1C
         hidden_dim=int(_cfg_get(graph, "hidden_dim", 256)),
         num_layers=int(_cfg_get(graph, "num_layers", 3)),
         num_heads=int(_cfg_get(graph, "num_heads", 8)),
-        bev_channels=int(_cfg_get(graph, "bev_channels", 8)),
-        bev_size=int(_cfg_get(graph, "bev_size", 128)),
+        bev_channels=int(_cfg_get(graph, "bev_channels", BEV_NUM_CHANNELS)),
+        bev_size=int(_cfg_get(graph, "bev_size", 64)),
         temporal_hidden_dim=int(_cfg_get(stage1, "temporal_hidden_dim", 256)),
         head_hidden_dim=int(_cfg_get(stage1, "head_hidden_dim", 256)),
         traj_horizon_s=float(_cfg_get(stage1, "traj_horizon_s", 3.0)),

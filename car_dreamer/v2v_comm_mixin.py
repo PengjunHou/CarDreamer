@@ -59,11 +59,13 @@ from .toolkit import (
 from .toolkit.observer.handlers.utils import is_fov_visible
 from .toolkit.wam import (
     OBJECT_STATE_DIM,
+    BevSpec,
     GraphBuildSpec,
     ObjectState,
     ObservationNodeInput,
     VehicleNodeInput,
     WAMPolicy,
+    rasterize_bev,
     build_coop_request,
     build_placeholder_policy,
     build_wam_hetero_graph,
@@ -184,8 +186,10 @@ class V2VCommMixin:
         self._wam_graph_num_layers = int(getattr(graph_wam_cfg, "num_layers", 3))
         self._wam_graph_num_heads = int(getattr(graph_wam_cfg, "num_heads", 8))
         self._wam_graph_gamma_freshness = float(getattr(graph_wam_cfg, "gamma_freshness", 5.0))
-        self._wam_graph_bev_channels = int(getattr(graph_wam_cfg, "bev_channels", 8))
-        self._wam_graph_bev_size = int(getattr(graph_wam_cfg, "bev_size", 128))
+        self._wam_graph_bev_channels = int(getattr(graph_wam_cfg, "bev_channels", 7))
+        self._wam_graph_bev_size = int(getattr(graph_wam_cfg, "bev_size", 64))
+        self._wam_graph_bev_range_m = float(getattr(graph_wam_cfg, "bev_range_m", 50.0))
+        self._wam_bev_spec = BevSpec(size=self._wam_graph_bev_size, range_m=self._wam_graph_bev_range_m)
         self._wam_graph_net = None
         self._wam_graph_embeddings = None
 
@@ -637,9 +641,15 @@ class V2VCommMixin:
             collaborators.append(self._wam_vehicle_node_input(actor, is_ego=False, agent_slot=slot))
             slot += 1
             modality = str(policy.modality_by_vehicle.get(vid, self._wam_default_modality))
+            bev_raster = None
             if modality == "bev":
                 observed_ids = ()
                 payload = self._wam_bev_payload_bytes()
+                # rasterize this collaborator's visibility-aware B^sem (only objects it can see).
+                vis_objs = [s for s in objects if int(vid) in s.visible_to_collaborators]
+                tf = actor.get_transform()
+                veh_pose = (float(tf.location.x), float(tf.location.y), float(tf.rotation.yaw))
+                bev_raster = rasterize_bev(veh_pose, vis_objs, route_xy=(), spec=self._wam_bev_spec)
             else:
                 observed_ids = tuple(int(s.actor_id) for s in objects if int(vid) in s.visible_to_collaborators)
                 payload = self._wam_objlist_payload_bytes(len(observed_ids))
@@ -666,6 +676,7 @@ class V2VCommMixin:
                     freshness=freshness,
                     quality=1.0,
                     sample_age_s=0.0,
+                    bev_raster=bev_raster,
                 )
             )
 

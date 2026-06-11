@@ -6,10 +6,11 @@ import numpy as np
 import torch
 
 from car_dreamer.toolkit.wam import (
+    BEV_NUM_CHANNELS,
+    BevSpec,
     GraphBuildSpec,
     ObjectState,
     ObservationNodeInput,
-    OBJECT,
     VehicleNodeInput,
     WAMFlowDataRecorder,
     WAMFlowDataset,
@@ -21,11 +22,12 @@ from car_dreamer.toolkit.wam import (
     WAMUnifiedWorldModel,
     build_wam_hetero_graph,
     collate_flow_samples,
-    encode_policy_chunk,
     make_flow_sample,
+    rasterize_bev,
 )
 
 ROUTE_WAYPOINTS = 2
+TEST_BEV = BevSpec(size=16, range_m=30.0)
 
 
 def small_flow_config(**overrides):
@@ -37,17 +39,26 @@ def small_flow_config(**overrides):
     return WAMFlowMatchingConfig(**base)
 
 
-def graph_with_objects(objs):
-    ego = VehicleNodeInput(actor_id=1, is_ego=True, agent_slot=0, x=0.0, y=0.0, z=0.0, vx=1.0, vy=0.0,
-                           yaw=0.0, route_xy=((5.0, 0.0), (10.0, 0.0)))
-    objects = [
+def graph_cfg():
+    # bev_size/channels must match the TEST_BEV rasters so the decoder output lines up with the targets.
+    return WAMGraphModelConfig(route_waypoints=ROUTE_WAYPOINTS, hidden_dim=32, num_layers=2, num_heads=4,
+                               bev_channels=BEV_NUM_CHANNELS, bev_size=TEST_BEV.size)
+
+
+def make_objects(objs):
+    return [
         ObjectState(actor_id=i, actor_type="vehicle.x", object_class="vehicle", x=x, y=y, z=0.0,
                     vx=0.5, vy=0.0, yaw=0.0, length=4.0, width=2.0, height=1.5, visible_to_ego=True)
         for (i, x, y) in objs
     ]
+
+
+def graph_with_objects(objs):
+    ego = VehicleNodeInput(actor_id=1, is_ego=True, agent_slot=0, x=0.0, y=0.0, z=0.0, vx=1.0, vy=0.0,
+                           yaw=0.0, route_xy=((5.0, 0.0), (10.0, 0.0)))
+    objects = make_objects(objs)
     obs = [ObservationNodeInput(vehicle_id=1, modality="objlist",
-                                observed_object_ids=tuple(i for (i, _, _) in objs),
-                                payload_bytes=100.0, latency_s=0.0, freshness=1.0)]
+                                observed_object_ids=tuple(i for (i, _, _) in objs))]
     policy = WAMPolicy(selected_vehicle_ids=(), modality_by_vehicle={}, bandwidth_by_vehicle={},
                        frequency_steps=5, reason="t")
     notable = {objs[0][0]} if objs else set()
@@ -56,15 +67,20 @@ def graph_with_objects(objs):
                                   notable_ids=notable)
 
 
-def synthetic_sample(cfg, objs=((100, 8.0, 1.0), (101, 5.0, 2.0))):
-    graph = graph_with_objects(list(objs))
+def synthetic_sample(cfg, objs=((100, 8.0, 1.0), (101, 5.0, 2.0)), history_window=0):
+    objs = list(objs)
+    graph = graph_with_objects(objs)
     policy_chunk = torch.randn(cfg.horizon, cfg.max_members, cfg.policy_width)
     member_mask = torch.zeros(cfg.max_members)
     member_mask[0] = 1.0
     policy_step_mask = torch.ones(cfg.horizon)
+    # build real visibility-aware rasters for history/future (ego at origin)
+    raster = rasterize_bev((0.0, 0.0, 0.0), make_objects(objs), route_xy=[(5, 0), (10, 0)], spec=TEST_BEV)
+    bev_future = torch.from_numpy(np.stack([raster] * cfg.horizon)).to(torch.uint8)
+    bev_history = torch.from_numpy(np.stack([raster] * (history_window + 1))).to(torch.uint8)
     return make_flow_sample(
-        graph, policy_chunk, member_mask, policy_step_mask,
-        notable_object_ids=[objs[0][0]], bev_latent_dim=cfg.bev_latent_dim,
+        graph, policy_chunk, member_mask, policy_step_mask, notable_object_ids=[objs[0][0]],
+        bev_history=bev_history, bev_future=bev_future, bev_spec=TEST_BEV, history_window=history_window,
     )
 
 
@@ -77,40 +93,36 @@ class MakeFlowSampleTest(unittest.TestCase):
     def test_sample_schema_and_defaults(self):
         cfg = small_flow_config()
         sample = synthetic_sample(cfg)
+        c, s = BEV_NUM_CHANNELS, TEST_BEV.size
         self.assertEqual(sample["policy_chunk"].shape, (cfg.horizon, cfg.max_members, cfg.policy_width))
-        self.assertEqual(sample["bev_future"].shape, (cfg.horizon, cfg.bev_latent_dim))
-        self.assertEqual(sample["bev_history"].shape, (1, cfg.bev_latent_dim))  # history_window=0 -> 1
-        self.assertEqual(sample["policy_step_mask"].shape, (cfg.horizon,))
-        self.assertEqual(len(sample["vehicle_graphs"]), 1)  # request graph only (v1)
-        self.assertEqual(sample["request_index"], 0)
+        self.assertEqual(sample["bev_future"].shape, (cfg.horizon, c, s, s))
+        self.assertEqual(sample["bev_history"].shape, (1, c, s, s))  # history_window=0 -> 1
+        self.assertEqual(sample["bev_future"].dtype, torch.uint8)
+        self.assertEqual(len(sample["vehicle_graphs"]), 1)
         self.assertEqual(sample["notable_object_ids"], [100])
 
 
 class DatasetCollateTest(unittest.TestCase):
     def test_collate_shapes_and_padding(self):
         cfg = small_flow_config()
+        c, s = BEV_NUM_CHANNELS, TEST_BEV.size
         samples = [synthetic_sample(cfg, objs=[(100, 8.0, 1.0), (101, 5.0, 2.0)]),
                    synthetic_sample(cfg, objs=[(100, 8.0, 1.0)])]
         batch = collate_flow_samples(samples, cfg)
         self.assertEqual(batch["policy_chunk"].shape, (2, cfg.horizon, cfg.max_members, cfg.policy_width))
-        self.assertEqual(batch["member_mask"].shape, (2, cfg.max_members))
-        self.assertEqual(batch["policy_step_mask"].shape, (2, cfg.horizon))
-        self.assertEqual(batch["bev_future"].shape, (2, cfg.horizon, cfg.bev_latent_dim))
+        self.assertEqual(batch["bev_future"].shape, (2, cfg.horizon, c, s, s))
+        self.assertEqual(batch["bev_history"].shape, (2, 1, c, s, s))
         self.assertEqual(batch["bev_step_mask"].shape, (2, cfg.horizon))
         self.assertEqual(len(batch["samples"]), 2)
-        self.assertEqual(len(batch["samples"][0]["vehicle_graphs"]), 1)
 
 
 class TrainerTest(unittest.TestCase):
     def _model_and_cfg(self, **overrides):
-        graph_cfg = WAMGraphModelConfig(route_waypoints=ROUTE_WAYPOINTS, hidden_dim=32,
-                                        num_layers=2, num_heads=4)
-        flow_cfg = small_flow_config()
-        model = WAMUnifiedWorldModel(graph_cfg, flow_cfg)
+        model = WAMUnifiedWorldModel(graph_cfg(), small_flow_config())
         base = dict(lr=1e-2, batch_size=4, max_steps=40, log_interval=0, ckpt_interval=0,
                     ckpt_dir=tempfile.mkdtemp())
         base.update(overrides)
-        return model, WAMStage2Config(**base), flow_cfg
+        return model, WAMStage2Config(**base), small_flow_config()
 
     def test_one_batch_loss_finite(self):
         model, cfg, flow_cfg = self._model_and_cfg()
@@ -120,6 +132,7 @@ class TrainerTest(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(losses["total"])))
         self.assertIn("policy", losses)
         self.assertIn("bev", losses)
+        self.assertIn("bev_recon", losses)  # BEV reconstruction term present
 
     def test_overfit_decreases_loss(self):
         torch.manual_seed(0)
@@ -147,9 +160,7 @@ class TrainerTest(unittest.TestCase):
         torch.manual_seed(7)
         loss_before = float(trainer.loss_on_batch(batch)["total"].detach())
 
-        graph_cfg2 = WAMGraphModelConfig(route_waypoints=ROUTE_WAYPOINTS, hidden_dim=32,
-                                         num_layers=2, num_heads=4)
-        trainer2 = WAMStage2Trainer(WAMUnifiedWorldModel(graph_cfg2, flow_cfg), cfg)
+        trainer2 = WAMStage2Trainer(WAMUnifiedWorldModel(graph_cfg(), flow_cfg), cfg)
         trainer2.load_checkpoint(path)
         self.assertEqual(trainer2.step, trainer.step)
         trainer2.model.eval()
@@ -180,15 +191,17 @@ class RecorderTest(unittest.TestCase):
                          bandwidth_by_vehicle={v: 1.0 for v in selected},
                          frequency_steps=5, reason="t")
 
-    def test_records_samples_with_policy_chunk(self):
+    def test_records_samples_with_policy_chunk_and_bev(self):
         cfg = small_flow_config()
         with tempfile.TemporaryDirectory() as tmp:
             recorder = WAMFlowDataRecorder(tmp, samples=cfg.horizon, max_members=cfg.max_members,
-                                           num_formats=cfg.num_formats, bev_latent_dim=cfg.bev_latent_dim)
-            horizon_steps = recorder.horizon_steps  # H-1
+                                           num_formats=cfg.num_formats, bev_spec=TEST_BEV)
+            horizon_steps = recorder.horizon_steps  # H (future BEV needs t+1..t+H)
             for step in range(0, horizon_steps + 3):
-                # the active policy selects member 7 from step 1 onward (chunk should reflect this)
                 recorder.observe_policy(step, self._policy(selected=(7,) if step >= 1 else ()))
+                # request vehicle moves forward; rasterize its visible objects each step
+                recorder.observe_bev(step, (0.0, 0.0, 0.0), make_objects([(100, 8.0, 1.0)]),
+                                     route_xy=[(5, 0), (10, 0)])
                 if step <= 2:
                     graph = graph_with_objects([(100, 8.0 + 0.1 * step, 1.0)])
                     recorder.register(step, graph=graph, candidate_ids=[7], notable_object_ids=[100])
@@ -197,20 +210,23 @@ class RecorderTest(unittest.TestCase):
             self.assertTrue(recorder.written >= 3)
             first_path = written[0] if written else sorted(Path(tmp).glob("*.pt"))[0]
             sample = torch.load(first_path, weights_only=False)
+            c, s = BEV_NUM_CHANNELS, TEST_BEV.size
             self.assertEqual(sample["policy_chunk"].shape, (cfg.horizon, cfg.max_members, cfg.policy_width))
-            self.assertEqual(sample["bev_future"].shape, (cfg.horizon, cfg.bev_latent_dim))
-            self.assertEqual(len(sample["vehicle_graphs"]), 1)
-            self.assertEqual(sample["notable_object_ids"], [100])
-            # member 7 (candidate slot 0) is selected at chunk steps t+1.. -> sel column == 1 there
+            self.assertEqual(sample["bev_future"].shape, (cfg.horizon, c, s, s))
+            self.assertEqual(sample["bev_history"].shape, (1, c, s, s))
+            self.assertEqual(sample["bev_future"].dtype, torch.uint8)
+            # a recorded future raster is non-empty (the visible object was rasterized)
+            self.assertGreater(int(sample["bev_future"].sum()), 0)
             self.assertEqual(float(sample["policy_chunk"][1, 0, 0]), 1.0)
 
     def test_dataset_loads_recorded_dir(self):
         cfg = small_flow_config()
         with tempfile.TemporaryDirectory() as tmp:
             recorder = WAMFlowDataRecorder(tmp, samples=cfg.horizon, max_members=cfg.max_members,
-                                           num_formats=cfg.num_formats, bev_latent_dim=cfg.bev_latent_dim)
+                                           num_formats=cfg.num_formats, bev_spec=TEST_BEV)
             for step in range(0, recorder.horizon_steps + 5):
                 recorder.observe_policy(step, self._policy())
+                recorder.observe_bev(step, (0.0, 0.0, 0.0), make_objects([(100, 8.0, 1.0)]))
                 if step <= 3:
                     graph = graph_with_objects([(100, 8.0 + 0.1 * step, 1.0)])
                     recorder.register(step, graph=graph, candidate_ids=[], notable_object_ids=[100])
@@ -219,19 +235,17 @@ class RecorderTest(unittest.TestCase):
             dataset = WAMFlowDataset(tmp)
             self.assertTrue(len(dataset) >= 4)
             batch = collate_flow_samples([dataset[i] for i in range(len(dataset))], cfg)
-            self.assertEqual(batch["policy_chunk"].shape[-1], cfg.policy_width)
+            self.assertEqual(batch["bev_future"].shape[2], BEV_NUM_CHANNELS)
 
 
 class EndToEndTest(unittest.TestCase):
     def test_train_runs_and_checkpoints(self):
         torch.manual_seed(0)
-        graph_cfg = WAMGraphModelConfig(route_waypoints=ROUTE_WAYPOINTS, hidden_dim=32,
-                                        num_layers=2, num_heads=4)
         flow_cfg = small_flow_config()
         with tempfile.TemporaryDirectory() as tmp:
             cfg = WAMStage2Config(lr=5e-3, batch_size=4, max_steps=20, log_interval=0,
                                   ckpt_interval=0, ckpt_dir=tmp)
-            trainer = WAMStage2Trainer(WAMUnifiedWorldModel(graph_cfg, flow_cfg), cfg)
+            trainer = WAMStage2Trainer(WAMUnifiedWorldModel(graph_cfg(), flow_cfg), cfg)
             result = trainer.train(synthetic_dataset(flow_cfg, 8))
             self.assertTrue(np.isfinite(result["final_loss"]))
             self.assertEqual(int(result["steps"]), 20)

@@ -172,8 +172,11 @@ carla_group_right_turn_auto:
   env.wam.graph.route_waypoints: 6
   env.wam.graph.max_object_nodes: 32
   env.wam.graph.gamma_freshness: 5.0
-  env.wam.graph.bev_channels: 8
-  env.wam.graph.bev_size: 128
+  # per-vehicle visibility-aware BEV semantic raster B^sem (§5.3): channels = object classes (4) + ego +
+  # route + drivable = 7; bev_size is the raster H/W; bev_range_m is the half-extent (meters to each edge).
+  env.wam.graph.bev_channels: 7
+  env.wam.graph.bev_size: 64
+  env.wam.graph.bev_range_m: 50.0
   # WAM BS-centric Diffusion UWM (Design Update §7-§8, §13). hidden_dim/route_waypoints are shared with
   # wam.graph above; bev_latent_dim defaults to hidden_dim. Generated variables = future policy chunk
   # (H,M,P) + future request BEV latent (H,Dz); object-state X is a condition token, not generated.
@@ -211,6 +214,7 @@ carla_group_right_turn_auto:
   env.wam.stage2.steps: 2000
   env.wam.stage2.w_policy: 1.0
   env.wam.stage2.w_bev: 1.0
+  env.wam.stage2.w_bev_recon: 1.0
   env.wam.stage2.grad_clip: 1.0
   env.wam.stage2.log_interval: 50
   env.wam.stage2.ckpt_interval: 500

@@ -128,6 +128,8 @@ class ObservationNodeInput:
     # Per-detected-object confidence s_det ∈ [0, 1] (obs_obj edge attr). Missing ids default to 1.0
     # (ground-truth perception; a real detector fills this later).
     det_confidence_by_object: Dict[int, float] = field(default_factory=dict)
+    # Visibility-aware BEV semantic raster ``B^sem [C,H,W]`` for ``bev`` modality (§5.3); ``None`` otherwise.
+    bev_raster: Optional["np.ndarray"] = None
 
 
 @dataclass
@@ -346,6 +348,15 @@ def build_wam_hetero_graph(
     data[OBSERVATION].agent_slot = torch.from_numpy(obs_slot)
     data[OBSERVATION].node_id = torch.from_numpy(obs_veh_id)
     data[OBSERVATION].node_mask = torch.ones((n_obs,), dtype=torch.float32)
+
+    # ---- per-node BEV raster (§5.3): attach only when at least one observation carries B^sem ----
+    bev_shape = next((o.bev_raster.shape for o in obs_inputs if o.bev_raster is not None), None)
+    if bev_shape is not None:
+        bev_stack = np.zeros((n_obs,) + tuple(bev_shape), dtype=np.float32)
+        for i, obs in enumerate(obs_inputs):
+            if obs.bev_raster is not None:
+                bev_stack[i] = np.asarray(obs.bev_raster, dtype=np.float32)
+        data[OBSERVATION].bev_raster = torch.from_numpy(bev_stack)
 
     # ---- edges ----
     vo_src, vo_dst = [], []
