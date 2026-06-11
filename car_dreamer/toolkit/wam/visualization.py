@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from car_dreamer.toolkit.observer.handlers.renderer.constants import Color
+from car_dreamer.toolkit.wam.bev import BEV_CHANNEL_NAMES, BEV_NUM_CHANNELS
 
 
 Point2D = Tuple[float, float]
@@ -16,6 +17,19 @@ EGO_COLOR = Color.RED
 NOTABLE_OBJECT_COLOR = Color.GREEN
 GT_TRAJECTORY_COLOR = Color.BLUE
 PRED_TRAJECTORY_COLOR = Color.SKY_BLUE_0
+
+_BEV_RGB_COLORS = np.asarray(
+    [
+        Color.SKY_BLUE_0,     # vehicle
+        Color.ORANGE_0,       # pedestrian
+        Color.PLUM_0,         # bicycle
+        Color.ALUMINIUM_1,    # other
+        Color.SCARLET_RED_0,  # ego
+        Color.BUTTER_1,       # route
+        Color.ALUMINIUM_5,    # drivable
+    ],
+    dtype=np.float32,
+)
 
 
 def _map_surface(map_renderer) -> np.ndarray:
@@ -123,6 +137,75 @@ def _draw_waypoint_dots(
 ) -> None:
     for point in points:
         cv2.circle(canvas, point, radius, color, -1, cv2.LINE_AA)
+
+
+def render_bev_raster_rgb(
+    raster: np.ndarray,
+    *,
+    background: Tuple[int, int, int] = Color.BLACK,
+) -> np.ndarray:
+    """Render a WAM semantic BEV raster ``[C,H,W]`` as an RGB uint8 image.
+
+    Channels are alpha-composited in the canonical BEV order. Later semantic layers such as ego and
+    route remain visible over drivable/background cells.
+    """
+    arr = np.asarray(raster)
+    if arr.ndim != 3:
+        raise ValueError(f"expected BEV raster [C,H,W], got shape={arr.shape}")
+    if int(arr.shape[0]) != BEV_NUM_CHANNELS:
+        raise ValueError(f"expected {BEV_NUM_CHANNELS} BEV channels {BEV_CHANNEL_NAMES}, got {arr.shape[0]}")
+    h, w = int(arr.shape[1]), int(arr.shape[2])
+    img = np.zeros((h, w, 3), dtype=np.float32)
+    img[:] = np.asarray(background, dtype=np.float32)
+    occ = arr.astype(bool)
+    for ch, color in enumerate(_BEV_RGB_COLORS):
+        img[occ[ch]] = color
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def render_vehicle_centric_wam_bev(
+    *,
+    map_renderer,
+    vehicle: Mapping[str, object],
+    visible_objects: Sequence[Mapping[str, object]],
+    output_path: Path,
+    route_xy: Sequence[Point2D] = (),
+    image_size_px: int = 512,
+    bev_range_m: float = 64.0,
+    ego_offset_m: float = 12.0,
+    vehicle_color: Tuple[int, int, int] = Color.BLUE,
+    object_color: Tuple[int, int, int] = Color.GREEN,
+    route_color: Tuple[int, int, int] = Color.SKY_BLUE_0,
+) -> None:
+    """Render one vehicle-centric BEV frame with no text overlays.
+
+    The caller supplies the already visibility-filtered objects for this vehicle; objects not in
+    ``visible_objects`` are not drawn.
+    """
+    position = vehicle.get("position", (0.0, 0.0, 0.0))
+    center_px = _world_to_pixel(map_renderer, float(position[0]), float(position[1]))
+    source_pixels_per_meter = float(getattr(map_renderer, "_pixels_per_meter"))
+
+    canvas = _map_surface(map_renderer)
+    _draw_bbox_or_point(canvas, map_renderer, vehicle, vehicle_color, fill=False)
+    for obj in visible_objects:
+        _draw_bbox_or_point(canvas, map_renderer, obj, object_color, fill=False)
+    if len(route_xy) >= 2:
+        route_points = [_world_to_pixel(map_renderer, float(point[0]), float(point[1])) for point in route_xy]
+        _draw_polyline(canvas, route_points, route_color, thickness=6, dashed=False)
+
+    canvas = _ego_centric_warp(
+        canvas,
+        ego_center_px=center_px,
+        ego_yaw_deg=float(vehicle.get("yaw", 0.0)),
+        image_size_px=int(image_size_px),
+        bev_range_m=float(bev_range_m),
+        source_pixels_per_meter=source_pixels_per_meter,
+        ego_offset_m=float(ego_offset_m),
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), canvas)
 
 
 def _ego_centric_warp(
