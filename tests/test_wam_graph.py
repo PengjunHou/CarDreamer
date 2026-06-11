@@ -3,13 +3,13 @@ import unittest
 import torch
 
 from car_dreamer.toolkit.wam import (
-    COOP,
     OBJECT,
     OBJECT_STATE_DIM,
     OBS_OBJ,
     OBS_SCALAR_DIM,
     OBSERVATION,
     VEH_OBS,
+    VEH_VEH,
     VEHICLE,
     GraphBuildSpec,
     ObjectState,
@@ -52,7 +52,10 @@ def make_scene(*, selected):
     )
     objects = [make_object(100, 8.0, 1.0), make_object(101, 12.0, 6.0), make_object(102, 3.0, 0.5, object_class="pedestrian")]
     observations = [
-        ObservationNodeInput(vehicle_id=1, modality="objlist", observed_object_ids=(100, 102), latency_s=0.0, freshness=1.0, payload_bytes=200.0),
+        ObservationNodeInput(
+            vehicle_id=1, modality="objlist", observed_object_ids=(100, 102), latency_s=0.0, freshness=1.0,
+            payload_bytes=200.0, det_confidence_by_object={100: 0.92, 102: 0.55},
+        ),
         ObservationNodeInput(vehicle_id=2, modality="objlist", observed_object_ids=(101,), latency_s=0.03, freshness=0.8, payload_bytes=80.0),
     ]
     policy = WAMPolicy(
@@ -71,10 +74,11 @@ class WAMGraphConstructionTest(unittest.TestCase):
         data = build_wam_hetero_graph(
             ego=ego, collaborators=[collab], objects=objects, observations=observations,
             policy=policy, spec=GraphBuildSpec(route_waypoints=6, max_object_nodes=32), notable_ids={101},
+            latency_by_vehicle={2: 0.042},
         )
 
         self.assertEqual(data.metadata()[0], [VEHICLE, OBJECT, OBSERVATION])
-        self.assertEqual(set(data.metadata()[1]), {VEH_OBS, OBS_OBJ, COOP})
+        self.assertEqual(set(data.metadata()[1]), {VEH_OBS, OBS_OBJ, VEH_VEH})
 
         stats = hetero_graph_stats(data)
         self.assertEqual(stats["wam_graph_num_vehicle_nodes"], 2)  # ego + 1 selected
@@ -82,7 +86,38 @@ class WAMGraphConstructionTest(unittest.TestCase):
         self.assertEqual(stats["wam_graph_num_observation_nodes"], 2)
         self.assertEqual(stats["wam_graph_num_veh_obs_edges"], 2)
         self.assertEqual(stats["wam_graph_num_obs_obj_edges"], 3)  # ego 2 + collaborator 1
-        self.assertEqual(stats["wam_graph_num_coop_edges"], 1)
+        self.assertEqual(stats["wam_graph_num_veh_veh_edges"], 1)
+
+    def test_edge_attributes(self):
+        # obs_obj carries det_confidence; veh_veh carries policy latency; veh_obs stays structural.
+        ego, collab, objects, observations, policy = make_scene(selected=(2,))
+        data = build_wam_hetero_graph(
+            ego=ego, collaborators=[collab], objects=objects, observations=observations,
+            policy=policy, spec=GraphBuildSpec(route_waypoints=6, max_object_nodes=32),
+            latency_by_vehicle={2: 0.042},
+        )
+        # veh_obs: structural only (no edge_attr).
+        self.assertFalse(hasattr(data[VEH_OBS], "edge_attr"))
+        # obs_obj: one det_confidence per (obs, object) edge in [0, 1]; ego's 100/102 use the scene values.
+        oo_attr = data[OBS_OBJ].edge_attr
+        self.assertEqual(tuple(oo_attr.shape), (3, 1))
+        oo_src, oo_dst = data[OBS_OBJ].edge_index
+        node_id = data[OBJECT].node_id.tolist()
+        attr_by_obj = {node_id[int(d)]: float(oo_attr[i, 0]) for i, d in enumerate(oo_dst.tolist())}
+        self.assertAlmostEqual(attr_by_obj[100], 0.92, places=5)
+        self.assertAlmostEqual(attr_by_obj[102], 0.55, places=5)
+        self.assertAlmostEqual(attr_by_obj[101], 1.0, places=5)  # collaborator default 1.0
+        # veh_veh: one latency (seconds) per coop edge.
+        vv_attr = data[VEH_VEH].edge_attr
+        self.assertEqual(tuple(vv_attr.shape), (1, 1))
+        self.assertAlmostEqual(float(vv_attr[0, 0]), 0.042, places=5)
+
+    def test_veh_veh_edge_attr_empty_when_no_coop(self):
+        ego, collab, objects, observations, policy = make_scene(selected=())
+        data = build_wam_hetero_graph(
+            ego=ego, collaborators=[collab], objects=objects, observations=observations, policy=policy,
+        )
+        self.assertEqual(tuple(data[VEH_VEH].edge_attr.shape), (0, 1))
 
     def test_state_vector_dims(self):
         ego, collab, objects, observations, policy = make_scene(selected=(2,))
@@ -116,7 +151,7 @@ class WAMGraphConstructionTest(unittest.TestCase):
         )
         stats = hetero_graph_stats(data)
         self.assertEqual(stats["wam_graph_num_vehicle_nodes"], 1)
-        self.assertEqual(stats["wam_graph_num_coop_edges"], 0)
+        self.assertEqual(stats["wam_graph_num_veh_veh_edges"], 0)
         self.assertEqual(stats["wam_graph_num_observation_nodes"], 1)  # ego's own observation
         self.assertEqual(stats["wam_graph_num_object_nodes"], 2)  # only ego-visible 100,102
 

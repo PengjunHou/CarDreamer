@@ -24,10 +24,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import HeteroData
-from torch_geometric.nn import HGTConv
+from torch_geometric.nn import HeteroConv, TransformerConv
 from torch_geometric.utils import scatter, softmax
 
 from .graph import (
+    EDGE_ATTR_DIMS,
     MODALITY_TO_ID,
     OBJECT_STATE_DIM,
     OBJECT,
@@ -171,21 +172,58 @@ class WAMHeteroGraphEmbedding(nn.Module):
 
 
 class WAMHeteroGraphEncoder(nn.Module):
-    """§9 heterogeneous graph transformer: stacked HGTConv + residual + LayerNorm."""
+    """§9 + Edge Representation Update heterogeneous graph transformer.
+
+    Each relation gets its own edge-attribute-aware :class:`TransformerConv` wrapped in a
+    :class:`HeteroConv`, implementing ``α_ij = softmax(Q_i·(K_j + φ(a_ij)))`` (the edge encoder ``φ``
+    is TransformerConv's built-in ``lin_edge``). Relations with an attr use ``edge_dim`` from
+    :data:`car_dreamer.toolkit.wam.graph.EDGE_ATTR_DIMS` (``obs_obj``: det_confidence, ``veh_veh``:
+    latency); ``veh_obs`` stays structural (``edge_dim=None``). Residual + per-type LayerNorm and
+    carry-forward of node types with no incoming edges match the previous HGT encoder.
+    """
 
     def __init__(self, hidden_dim: int, num_layers: int, num_heads: int, metadata=WAM_METADATA):
         super().__init__()
         self.node_types = list(metadata[0])
+        self.edge_types = list(metadata[1])
+        self.attr_edge_types = [et for et in self.edge_types if et in EDGE_ATTR_DIMS]
+        if hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})")
+        head_dim = hidden_dim // num_heads
         self.convs = nn.ModuleList(
-            [HGTConv(hidden_dim, hidden_dim, metadata, heads=num_heads) for _ in range(num_layers)]
+            [
+                HeteroConv(
+                    {
+                        et: TransformerConv(
+                            hidden_dim,
+                            head_dim,
+                            heads=num_heads,
+                            concat=True,
+                            beta=False,
+                            dropout=0.0,
+                            edge_dim=EDGE_ATTR_DIMS.get(et),
+                        )
+                        for et in self.edge_types
+                    },
+                    aggr="sum",
+                )
+                for _ in range(num_layers)
+            ]
         )
         self.norms = nn.ModuleList(
             [nn.ModuleDict({nt: nn.LayerNorm(hidden_dim) for nt in self.node_types}) for _ in range(num_layers)]
         )
 
-    def forward(self, x_dict: Dict[str, torch.Tensor], edge_index_dict) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x_dict: Dict[str, torch.Tensor],
+        edge_index_dict,
+        edge_attr_dict: Dict[object, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        # only relations that carry an attr are forwarded as edge_attr (veh_obs is structural).
+        attr_dict = {et: edge_attr_dict[et] for et in self.attr_edge_types if et in edge_attr_dict}
         for conv, norm in zip(self.convs, self.norms):
-            out = conv(x_dict, edge_index_dict)
+            out = conv(x_dict, edge_index_dict, edge_attr_dict=attr_dict)
             updated: Dict[str, torch.Tensor] = {}
             for nt in x_dict:
                 h = out.get(nt, None)
@@ -210,8 +248,14 @@ class WAMHeteroGraphNet(nn.Module):
 
     def forward(self, data: HeteroData) -> Dict[str, torch.Tensor]:
         h0 = self.embedding(data)
-        edge_index_dict = {etype: data[etype].edge_index.to(self.config_device(h0)) for etype in data.edge_types}
-        return self.encoder(h0, edge_index_dict)
+        device = self.config_device(h0)
+        edge_index_dict = {etype: data[etype].edge_index.to(device) for etype in data.edge_types}
+        edge_attr_dict = {
+            etype: data[etype].edge_attr.to(device)
+            for etype in data.edge_types
+            if etype in EDGE_ATTR_DIMS and hasattr(data[etype], "edge_attr")
+        }
+        return self.encoder(h0, edge_index_dict, edge_attr_dict)
 
     @staticmethod
     def config_device(h0: Dict[str, torch.Tensor]) -> torch.device:

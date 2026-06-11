@@ -13,10 +13,12 @@ Node types (§5):
                           rather than a separate node type, so the three edge relations
                           below match §9 exactly.
 
-Edge relations (§6):
-    * ``(vehicle, veh_obs, observation)``  -- vehicle v provides modality-r observation (§6.1)
-    * ``(observation, obs_obj, object)``   -- observation associates object o (§6.2)
-    * ``(vehicle, coop, vehicle)``         -- member m collaborates with ego e (§6.3)
+Edge relations (§6 + Edge Representation Update):
+    * ``(vehicle, veh_obs, observation)``  -- vehicle v provides modality-r observation (§6.1); structural, no attr
+    * ``(observation, obs_obj, object)``   -- observation detects object o (§6.2); ``edge_attr = [det_confidence]``
+    * ``(vehicle, veh_veh, vehicle)``      -- collaborator m transmits to request vehicle q under the policy (§6.3);
+                                             ``edge_attr = [latency_s]`` (policy-conditioned). Only present when m
+                                             cooperates (the "V2V perception graph"); absent in the local graph.
 
 The builder is intentionally CARLA-agnostic: it consumes plain dataclasses
 (:class:`VehicleNodeInput`, :class:`ObservationNodeInput`) and :class:`ObjectState`
@@ -52,8 +54,15 @@ NODE_TYPES: Tuple[str, ...] = (VEHICLE, OBJECT, OBSERVATION)
 
 VEH_OBS = (VEHICLE, "veh_obs", OBSERVATION)
 OBS_OBJ = (OBSERVATION, "obs_obj", OBJECT)
-COOP = (VEHICLE, "coop", VEHICLE)
-EDGE_TYPES: Tuple[Tuple[str, str, str], ...] = (VEH_OBS, OBS_OBJ, COOP)
+VEH_VEH = (VEHICLE, "veh_veh", VEHICLE)
+EDGE_TYPES: Tuple[Tuple[str, str, str], ...] = (VEH_OBS, OBS_OBJ, VEH_VEH)
+
+# Per-edge attribute widths (Edge Representation Update). ``veh_obs`` stays structural.
+#   obs_obj: [det_confidence]   -- detection confidence s_det ∈ [0, 1] of the (obs, object) pair
+#   veh_veh: [latency_s]        -- policy-conditioned transmission latency L^π in seconds
+OBS_OBJ_EDGE_DIM = 1
+VEH_VEH_EDGE_DIM = 1
+EDGE_ATTR_DIMS: Dict[Tuple[str, str, str], int] = {OBS_OBJ: OBS_OBJ_EDGE_DIM, VEH_VEH: VEH_VEH_EDGE_DIM}
 
 # torch_geometric metadata tuple ``(node_types, edge_types)``.
 WAM_METADATA = (list(NODE_TYPES), list(EDGE_TYPES))
@@ -66,8 +75,10 @@ CLASS_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(OBJECT_CLASSES)}
 
 # Numeric state-vector layouts (the learnable z^r / class / type / agent / time
 # embeddings are added on top inside graph_model.py and are NOT counted here).
-#   object: [x, y, z, vx, vy, cos_yaw, sin_yaw, l, w, h, s_det, dt]
-OBJECT_STATE_DIM = 12
+#   object: [x, y, z, vx, vy, cos_yaw, sin_yaw, l, w, h, dt]
+# Detection confidence s_det is NOT an object property (Edge Representation Update): it is a
+# per-(observation, object) property carried on the obs_obj edge attr, so it is no longer here.
+OBJECT_STATE_DIM = 11
 #   observation scalars: [payload_kb, latency_s, freshness, quality, sample_age_s]
 OBS_SCALAR_DIM = 5
 # bytes used to estimate an object-list payload size per object (state floats).
@@ -114,6 +125,9 @@ class ObservationNodeInput:
     freshness: float = 1.0
     quality: float = 1.0
     sample_age_s: float = 0.0
+    # Per-detected-object confidence s_det ∈ [0, 1] (obs_obj edge attr). Missing ids default to 1.0
+    # (ground-truth perception; a real detector fills this later).
+    det_confidence_by_object: Dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -189,6 +203,7 @@ def build_wam_hetero_graph(
     policy: WAMPolicy,
     spec: GraphBuildSpec = GraphBuildSpec(),
     notable_ids: Optional[Set[int]] = None,
+    latency_by_vehicle: Optional[Dict[int, float]] = None,
 ) -> HeteroData:
     """Assemble the policy-conditioned heterogeneous graph ``G_t^{e,π}`` (§7).
 
@@ -196,7 +211,14 @@ def build_wam_hetero_graph(
     Only collaborators in ``policy.selected_vehicle_ids`` (and the modalities in
     ``policy.modality_by_vehicle``) are added, so an empty/no-coop policy yields a valid
     ego-only graph.
+
+    Edge attributes (Edge Representation Update):
+      * ``obs_obj.edge_attr = [det_confidence]`` -- from each observation's
+        ``det_confidence_by_object`` (default 1.0).
+      * ``veh_veh.edge_attr = [latency_s]`` -- policy-conditioned transmission latency in seconds,
+        from ``latency_by_vehicle`` (default 0.0; ego→ego style self-latency is 0).
     """
+    latency_by_vehicle = {int(k): float(v) for k, v in (latency_by_vehicle or {}).items()}
     notable_ids = {int(i) for i in (notable_ids or set())}
     selected = {int(v) for v in policy.selected_vehicle_ids}
     modality_by_vehicle = _normalize_modalities(policy.modality_by_vehicle)
@@ -282,7 +304,7 @@ def build_wam_hetero_graph(
         px, py = frame.xy(s.x, s.y)
         vx, vy = frame.vec(s.vx, s.vy)
         cyaw, syaw = frame.yaw_cos_sin(s.yaw)
-        obj_x[i] = [px, py, float(s.z), vx, vy, cyaw, syaw, float(s.length), float(s.width), float(s.height), 1.0, 0.0]
+        obj_x[i] = [px, py, float(s.z), vx, vy, cyaw, syaw, float(s.length), float(s.width), float(s.height), 0.0]
         obj_class[i] = CLASS_TO_ID.get(str(s.object_class), CLASS_TO_ID["other"])
         obj_node_id[i] = int(s.actor_id)
         oid = int(s.actor_id)
@@ -327,7 +349,7 @@ def build_wam_hetero_graph(
 
     # ---- edges ----
     vo_src, vo_dst = [], []
-    oo_src, oo_dst = [], []
+    oo_src, oo_dst, oo_attr = [], [], []
     for i, obs in enumerate(obs_inputs):
         vo_src.append(veh_id_to_idx[int(obs.vehicle_id)])
         vo_dst.append(i)
@@ -336,17 +358,23 @@ def build_wam_hetero_graph(
             if j is not None:
                 oo_src.append(i)
                 oo_dst.append(j)
+                # obs_obj edge attr: detection confidence of this (observation, object) pair (§11).
+                oo_attr.append(float(obs.det_confidence_by_object.get(int(oid), 1.0)))
 
     ego_idx = veh_id_to_idx[int(ego.actor_id)]
-    co_src, co_dst = [], []
+    vv_src, vv_dst, vv_attr = [], [], []
     for v in veh_inputs:
         if int(v.actor_id) in selected and not v.is_ego:
-            co_src.append(veh_id_to_idx[int(v.actor_id)])
-            co_dst.append(ego_idx)
+            vv_src.append(veh_id_to_idx[int(v.actor_id)])
+            vv_dst.append(ego_idx)
+            # veh_veh edge attr: policy-conditioned transmission latency m -> ego (§12).
+            vv_attr.append(latency_by_vehicle.get(int(v.actor_id), 0.0))
 
     data[VEH_OBS].edge_index = _edge_index(vo_src, vo_dst)
     data[OBS_OBJ].edge_index = _edge_index(oo_src, oo_dst)
-    data[COOP].edge_index = _edge_index(co_src, co_dst)
+    data[OBS_OBJ].edge_attr = torch.tensor(oo_attr, dtype=torch.float32).reshape(-1, OBS_OBJ_EDGE_DIM)
+    data[VEH_VEH].edge_index = _edge_index(vv_src, vv_dst)
+    data[VEH_VEH].edge_attr = torch.tensor(vv_attr, dtype=torch.float32).reshape(-1, VEH_VEH_EDGE_DIM)
 
     return data
 
@@ -369,5 +397,5 @@ def hetero_graph_stats(data: HeteroData) -> Dict[str, int]:
         "wam_graph_num_observation_nodes": n_nodes(OBSERVATION),
         "wam_graph_num_veh_obs_edges": n_edges(VEH_OBS),
         "wam_graph_num_obs_obj_edges": n_edges(OBS_OBJ),
-        "wam_graph_num_coop_edges": n_edges(COOP),
+        "wam_graph_num_veh_veh_edges": n_edges(VEH_VEH),
     }

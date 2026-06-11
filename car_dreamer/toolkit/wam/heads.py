@@ -304,3 +304,74 @@ def policy_uncertainty(
         weight = weight * valid_mask
     weight = weight.expand_as(trace)
     return (weight * trace).sum() / weight.sum().clamp_min(eps)
+
+
+# =====================================================================
+# Stage-1 evaluation metrics (§20.1 perception / §20.2 motion prediction)
+# =====================================================================
+
+
+def perception_metrics(
+    prob: torch.Tensor,
+    label: torch.Tensor,
+    *,
+    threshold: float = 0.5,
+    eps: float = 1e-6,
+) -> Dict[str, float]:
+    """§20.1 precision / recall / F1 for a binary head (``prob``/``label``: ``[Q]``)."""
+    if prob.numel() == 0:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+    pred = (prob >= float(threshold)).float()
+    target = (label >= 0.5).float()
+    tp = float((pred * target).sum())
+    fp = float((pred * (1.0 - target)).sum())
+    fn = float(((1.0 - pred) * target).sum())
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = 2.0 * precision * recall / (precision + recall + eps)
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def trajectory_ade_fde(
+    mu: torch.Tensor,
+    target_xy: torch.Tensor,
+    *,
+    valid_mask: Optional[torch.Tensor] = None,
+    notable_weight: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+) -> Dict[str, float]:
+    """§20.2 ADE / FDE (+ task-weighted) over future positions.
+
+    ``mu``/``target_xy``: ``[Q, H, 2]``; ``valid_mask``: ``[Q, H]``; ``notable_weight``: ``[Q]``.
+    ADE averages per-step displacement over valid steps; FDE uses the last valid step per object.
+    """
+    if mu.numel() == 0:
+        return {"ade": 0.0, "fde": 0.0, "ade_notable": 0.0, "fde_notable": 0.0}
+    dist = torch.linalg.norm(target_xy - mu, dim=-1)  # [Q, H]
+    vmask = torch.ones_like(dist) if valid_mask is None else valid_mask.to(dist.dtype)
+    nweight = torch.ones(mu.shape[0], device=mu.device) if notable_weight is None else notable_weight.to(dist.dtype)
+
+    def _ade(w_obj: torch.Tensor) -> float:
+        w = vmask * w_obj.unsqueeze(-1)
+        return float((dist * w).sum() / w.sum().clamp_min(eps))
+
+    def _fde(w_obj: torch.Tensor) -> float:
+        # last valid step per object.
+        steps = torch.arange(dist.shape[1], device=dist.device).unsqueeze(0).expand_as(dist)
+        masked_steps = torch.where(vmask > 0.5, steps, torch.full_like(steps, -1))
+        last = masked_steps.max(dim=1).values  # [Q]; -1 if no valid step
+        has = last >= 0
+        if not bool(has.any()):
+            return 0.0
+        idx = last.clamp_min(0)
+        fde = dist.gather(1, idx.unsqueeze(1)).squeeze(1)  # [Q]
+        w = has.float() * w_obj
+        return float((fde * w).sum() / w.sum().clamp_min(eps))
+
+    ones = torch.ones_like(nweight)
+    return {
+        "ade": _ade(ones),
+        "fde": _fde(ones),
+        "ade_notable": _ade(nweight),
+        "fde_notable": _fde(nweight),
+    }

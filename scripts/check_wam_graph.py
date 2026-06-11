@@ -65,7 +65,7 @@ _GRAPH_KEYS = (
     "wam_graph_num_object_nodes",
     "wam_graph_num_veh_obs_edges",
     "wam_graph_num_obs_obj_edges",
-    "wam_graph_num_coop_edges",
+    "wam_graph_num_veh_veh_edges",
 )
 
 

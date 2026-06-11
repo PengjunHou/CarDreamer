@@ -627,6 +627,7 @@ class V2VCommMixin:
         ]
 
         collaborators = []
+        latency_by_vehicle: dict = {}
         slot = 1
         out_degree = max(len(selected), 1)
         for vid in selected:
@@ -654,6 +655,7 @@ class V2VCommMixin:
                 )
             )
             freshness = math.exp(-float(self._wam_graph_gamma_freshness) * latency_s)
+            latency_by_vehicle[int(vid)] = latency_s
             observations.append(
                 ObservationNodeInput(
                     vehicle_id=int(vid),
@@ -680,6 +682,7 @@ class V2VCommMixin:
             policy=policy,
             spec=spec,
             notable_ids=notable_ids,
+            latency_by_vehicle=latency_by_vehicle,
         )
         if self._wam_graph_embed:
             self._run_wam_graph_embedding()

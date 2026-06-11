@@ -3,8 +3,19 @@
 本文记录 **Graph Flow-Matching Unified World Model (WAM)** 当前已落地的实现，逐节对照设计文档说明：
 **对应代码在哪、做了哪些简化、还有哪些没实现、输出是什么、有无文档/日志、以及如何验证**。
 
-> 适用提交范围：rule-based runtime（步骤 1–3）、policy-conditioned 异构图 + 初始 embedding + HGT
-> 编码器（§4–§7、§5、§9）、temporal encoder + deterministic task heads（§10、§11）、轨迹真值抽取（§15.2）。
+> 适用提交范围：rule-based runtime（步骤 1–3）、policy-conditioned 异构图 + 初始 embedding +
+> **edge-attribute-aware 编码器**（§4–§7、§5、§9 + Edge Representation Update）、temporal encoder +
+> deterministic task heads（§10、§11）、轨迹真值抽取（§15.2）、**BS-centric Diffusion UWM**
+> + 多种 flow 推理模式（Design Update §2–§8、§13）、Stage-2 离线训练（§16.2）。
+>
+> **本轮更新（两份设计更新文档）**：
+> 1. **Graph Edge Representation Update** —— obs_obj 边带 `det_confidence`、veh_veh 边带 policy-conditioned
+>    `latency`，编码器在 attention 中消费 edge attribute（`α_ij = softmax(Q·K + φ(a_ij))`）；`s_det` 从
+>    object node 移到 obs_obj 边，object state 由 12 维降为 11 维；`coop` 边更名 `veh_veh`。
+> 2. **BS-centric UWM** —— UWM 改为以 **BS 全局 condition tokens**（所有车 perception graph token +
+>    request token + notable/driving-task token + request BEV-history token，全部 clean 不加噪）为条件，
+>    联合去噪 **future policy chunk** `π_{q,t:t+H-1}` 与 **future request BEV latent** `z^bev_{q,t+1:t+H}`
+>    （解耦 diffusion time `s_π`/`s_z` + register tokens）；object-state X 不再作为生成变量。
 
 ---
 
@@ -21,17 +32,22 @@
 | §11.2（规则版） | notable 运动预测 + 不确定度 | ✅ 已实现（匀速 + 固定不确定度） |
 | §13/§17 | Base Station 协同 policy | 🟡 placeholder（选全部候选） |
 | §4–§7 | policy-conditioned 异构图构造 | ✅ 已实现 |
+| Edge Update | obs_obj `det_confidence` + veh_veh `latency` 边属性；`s_det` 移出 object node（12→11） | ✅ 已实现（`det_confidence` 恒 1） |
 | §5 | 三类 node 初始 embedding | ✅ 已实现 |
-| §9 | Heterogeneous Graph Transformer (HGT) | ✅ 已实现 |
+| §9 | edge-attribute-aware graph transformer（TransformerConv+HeteroConv） | ✅ 已实现 |
 | §10 | Temporal Encoder | ✅ 已实现（GRU，仅 object 节点） |
-| §11.1 | Notable Object Head（+ vis/inv/occ） | ✅ 已实现（occ 标签恒 0） |
-| §11.2 | Gaussian Trajectory Head（学习版） | ✅ 模型已实现（未训练） |
+| §11.1 | Notable Object Head（+ vis/inv/occ） | ✅ 已实现 + Stage 1 训练（occ 标签恒 0） |
+| §11.2 | Gaussian Trajectory Head（学习版 + `U^π`） | ✅ 已实现 + Stage 1 训练 |
 | §15.1/§15.2/§11.2 | perception loss / 轨迹 NLL / U^π | ✅ 函数已实现 |
 | §15.2 | GT 未来轨迹真值抽取 | ✅ 已实现 |
-| §12 | Graph Flow-Matching UWM | ❌ 未实现 |
-| §13.1–§13.3 | flow 推理（rollout / proposal / inverse） | ❌ 未实现 |
+| Update §2–§6 | BS condition tokens（per-vehicle graph token + request + driving-task + BEV-history） | ✅ 已实现（`WAMBSContextEncoder`；BEV-history 零占位） |
+| Update §7–§8 | BS-centric Diffusion UWM（future policy chunk + future BEV latent，解耦 `s_π`/`s_z` + register） | ✅ 模型已实现（未训练；X 不再生成） |
+| §13.1–§13.3 | flow 推理（rollout BEV / policy proposal / inverse + joint） | ✅ 已实现（Euler 积分） |
+| §15.3 | flow matching loss（policy + BEV，masked） | ✅ 函数已实现 |
 | §14 | BEV decoder | ❌ 未实现 |
-| §16 | 训练 pipeline（Stage 1/2/3） | ❌ 未实现（模块已就绪，缺训练循环 + 数据管线） |
+| §16.1 | Stage 1：graph encoder + heads 预训练 + `U^π` | ✅ 已实现（recorder + dataset + trainer + checkpoint + Stage-2 warm-start） |
+| §16.2 | Stage 2：BS-centric Diffusion UWM 训练 | ✅ 已实现（recorder + dataset + trainer + checkpoint） |
+| §16.3 | Stage 3：policy search + planner 验证 | ❌ 未实现 |
 | §17 | policy search（按 U^π reranking） | ❌ 未实现（当前选全部候选） |
 
 ---
@@ -44,6 +60,9 @@ car_dreamer/toolkit/wam/
 ├── graph.py              # §4-§7：policy-conditioned 异构图构造（HeteroData）
 ├── graph_model.py        # §5 初始 embedding + §9 HGT 编码器
 ├── heads.py              # §10 temporal encoder + §11 task heads + §15/§11.2 loss/reward
+├── flow_matching.py      # §12 Graph Flow-Matching UWM + §13 推理模式 + §15.3 loss
+├── stage2.py             # §16.2 Stage-2 训练：dataset / collate / trainer / 目标构造
+├── flow_recorder.py      # §16.2 数据录制：把 live env 的 (graph, GT future, policy) 写成 .pt
 ├── targets.py            # §15.2 GT 未来轨迹真值抽取
 ├── debug_recording.py    # rule-based notable/预测 的调试记录器（JSONL）
 ├── visualization.py      # 调试 BEV 渲染
@@ -53,6 +72,8 @@ car_dreamer/v2v_comm_mixin.py   # 把 runtime + 图构造接入仿真环境（�
 car_dreamer/configs/tasks.yaml  # carla_group_right_turn_auto 的 env.wam.* 配置
 scripts/check_wam_graph.py          # 在线验证：打印每步图统计 / H_t 形状
 scripts/record_wam_notable_debug.py # 在线记录 notable + 预测 vs 真值（JSONL + BEV 帧）
+scripts/record_wam_flow_data.py     # §16.2 在线录制 Stage-2 训练样本（.pt，需 CARLA）
+scripts/train_wam_stage2.py         # §16.2 离线训练 flow-matching UWM（不需 CARLA）
 tests/test_wam_*.py                 # 离线单测（不需要 CARLA）
 ```
 
@@ -98,9 +119,11 @@ WAM 运行参数（默认值，可在 `env.wam.*` 覆盖）：`notable_distance_
 
 - **§4 三类 node**：`vehicle` / `object` / `observation`。modality（`objlist`/`bev`）作为 observation 节点上的**特征 + type id**，而不是独立 node type —— 这样 §9 的三类 edge relation 完全对应。第一版 `M_0={objlist,bev}`。
 - **§5.1 vehicle node state**：`[x,y,z, vx,vy, cos_yaw, sin_yaw, q_comm, q_comp, route(2·K)]`，维度 `9+2·route_waypoints`。
-- **§5.2 object node state**：`[x,y,z, vx,vy, cos_yaw, sin_yaw, l, w, h, s_det, Δt]`，维度 12；object class 用单独 embedding（不在数值向量内）。
+- **§5.2 object node state**：`[x,y,z, vx,vy, cos_yaw, sin_yaw, l, w, h, Δt]`，维度 **11**（Edge Update：`s_det` 移到 obs_obj 边）；object class 用单独 embedding（不在数值向量内）。
 - **§5.3 observation node state**：modality id + 标量 `[payload_kb, latency_s, freshness, quality, sample_age_s]`（维度 5）。模态特征 `z^r` 在 embedding 模块里算（见 §5）。
-- **§6 三类 edge**（无 edge attribute）：`(vehicle, veh_obs, observation)`、`(observation, obs_obj, object)`、`(vehicle, coop, vehicle)`。
+- **§6 三类 edge**（Edge Representation Update）：`(vehicle, veh_obs, observation)`（结构、无属性）、`(observation, obs_obj, object)`（`edge_attr=[det_confidence]`）、`(vehicle, veh_veh, vehicle)`（`edge_attr=[latency_s]`，policy-conditioned；仅协同时存在）。`COOP` 常量更名为 `VEH_VEH`，方向仍是 collaborator m → request/ego。`EDGE_ATTR_DIMS` 声明各关系的属性维度。
+  - obs_obj `det_confidence` 来自 `ObservationNodeInput.det_confidence_by_object`（缺省 1.0，ground-truth 感知；真实 detector 后续填）。
+  - veh_veh `latency_s` 由 `_build_wam_graph` 复用 `SimpleWirelessLatency.compute_latency_s`（与 observation node `latency_s` 同一计算）汇成 `latency_by_vehicle` 传入。
 - **§7 policy-conditioned 装配规则**（`build_wam_hetero_graph`）：
   - ego 永远在图里，自带 `objlist` observation（`L=0, c_fresh=1`），并连到其可见 object；
   - 对每个 `m ∈ policy.selected_vehicle_ids`：加 vehicle 节点 + `coop` 边 `m→ego`；对其激活模态加 observation 节点 + `veh_obs` 边；`objlist` 再连 `m` 可见的 object（`obs_obj`）；
@@ -139,12 +162,12 @@ WAM 运行参数（默认值，可在 `env.wam.*` 覆盖）：`notable_distance_
 
 文件：[car_dreamer/toolkit/wam/graph_model.py](car_dreamer/toolkit/wam/graph_model.py) → `WAMHeteroGraphEncoder` / `WAMHeteroGraphNet`。
 
-- 用 PyG `HGTConv` 堆叠（默认 hidden=256、layers=3、heads=8）+ 残差 + LayerNorm。relation-specific 投影与 relation bias 由 HGTConv 提供，对应设计的 `α^r_{ij}` 与 `W_r`。
+- **Edge Representation Update**：由 `HGTConv` 换成 **per-relation `TransformerConv(edge_dim=...)` 包进 `HeteroConv`**（PyG 2.7.0），在 attention 中消费 edge attribute：`α_ij = softmax(Q_i·(K_j + φ(a_ij)))`，其中 `φ` 是 TransformerConv 自带的 `lin_edge`。obs_obj 用 `det_confidence`、veh_veh 用 `latency` 作 `edge_dim`；veh_obs 无属性（`edge_dim=None`）。默认 hidden=256、layers=3、heads=8（要求 hidden 可被 heads 整除）+ 残差 + per-type LayerNorm。
 - 无入边的 node type（如无协同时的 vehicle）自动 carry-forward。
 - 输出 `H_t = {h^veh, h^obs, h^obj}`（每类 `[N, hidden]`）。
-- `WAMHeteroGraphNet.forward(HeteroData) → H_t`（先 embedding 再 encoder）。
+- `WAMHeteroGraphNet.forward(HeteroData) → H_t`：embedding → 构造 `edge_attr_dict`（仅带属性的关系）→ encoder。
 
-**简化**：与设计基本一致。HGTConv 自带 type/relation 参数化，未额外引入 edge attribute（设计本就说 edge 不带复杂属性）。
+**简化**：换 conv 后保留 relation-specific 投影（`HeteroConv` 每关系独立 conv）；`φ` 用 TransformerConv 内置线性边投影（设计写的显式 `edge_encoder` 由它实现，未额外加 MLP）。
 
 ---
 
@@ -200,6 +223,94 @@ WAM 运行参数（默认值，可在 `env.wam.*` 覆盖）：`notable_distance_
 
 ---
 
+### Update §2–§8：BS-centric Diffusion Unified World Model
+
+文件：[car_dreamer/toolkit/wam/flow_matching.py](car_dreamer/toolkit/wam/flow_matching.py)。
+
+设计修正（Update §1）：UWM 在 **Base Station**，以「policy 确定前就能构建」的 BS 全局上下文为条件，去噪未来 policy 与
+未来 BEV latent：`p_θ(π_{q,t:t+H-1}, z^bev_{q,t+1:t+H} | C^BS_{q,t-K:t})`。
+
+- **§2–§6 BS condition tokens**（`WAMBSContextEncoder`，clean 不加噪）：
+  - 对每辆覆盖车的 perception graph（local / V2V）跑 §9 edge-aware 编码器 + `WAMGraphContextPool` → 车级 token `g^cp_v`；
+  - request token `g^req_q = g^cp_q + e^req`（`e^req` 即 type embedding `_T_REQUEST`，把 request 车标出来）；
+  - driving-task tokens `T^task = {h^obj_o : o ∈ notable(q)}`：取 **request graph 编码后的 object embedding** 中 notable 行（notable 集合即驾驶任务，§4）；
+  - request BEV-latent tokens `{z^bev_{q,τ}}`（当前 + 历史，§5）—— **零占位**（无真实 per-vehicle BEV）。
+  - 返回 `(cond_tokens [T_c,d], type_ids [T_c])`；批处理由 `pad_condition_tokens` 右 pad + mask。
+- **§7–§8 生成变量与 transformer**（`WAMFlowMatchingUWM`）：
+  - noised tokens = **policy chunk** `[B,H,M,P]`（H·M 个 token，带 step/member/type/`e(s_π)`）+ **future BEV** `[B,H,Dz]`（H 个 token，带 step/type/`e(s_z)`）+ **register tokens**；条件 token 拼前面、不加噪。
+  - 解耦 diffusion time：`interpolate`、`s_π`/`s_z` 独立；`sample_training_batch(policy_1, bev_1)` 给插值输入 + 目标速度 `u_π=π_1-π_0`、`u_z=z_1-z_0`。
+  - 过 `nn.TransformerEncoder`（`key_padding_mask` 屏蔽 pad 成员/步/条件），输出 `û_π=Head_π`、`û_z=Head_bev`。
+  - **object-state X 不再是生成变量**（Q2 faithful）—— 它只活在 driving-task 条件 token 里。
+- **Loss**：`flow_matching_loss` = `w_π·‖û_π-u_π‖² + w_z·‖û_z-u_z‖²`（masked mean；policy_mask `[B,H,M]`、bev_mask `[B,H]`）。
+- **整体组合**：`WAMUnifiedWorldModel` = `WAMBSContextEncoder` + `WAMFlowMatchingUWM`，提供
+  `condition_tokens(_batch)(samples)` 与 `training_step(cond, …, policy_1, bev_1)`（采样→forward→loss，梯度回传 graph encoder）。仍是**训练侧 standalone**，未接入 live env。
+
+**简化 / 未实现**：
+- BEV-history 条件 token 与 future BEV 目标均为**零占位** → 生成的 BEV 那一半暂为退化目标（去噪向 0），待真实 per-vehicle BEV encoder（§5.3 `E_bev`）接入后才有意义。
+- **per-vehicle 图 deferred**：录制/训练样本里 `vehicle_graphs` 暂为 `[request_graph]`（N=1）；为全部覆盖车构建 local 图（需 per-vehicle route/notable）留待后续。
+- `F=2`（objlist/bev）；img/text 未进图；模型**已实现但未训练**。
+
+---
+
+### §13：Diffusion 推理模式
+
+文件：同上（`WAMFlowMatchingUWM` 的方法）。统一**定步长 Euler** ODE 积分（`n_inference_steps`，可传 `n_steps` 覆盖），均以 BS condition tokens 为条件。
+
+- **§13.1 Forward BEV Rollout** `rollout_future_bev(cond…, policy)`：固定 `s_π=1`（给定 policy chunk），BEV 从 `N(0,I)` 沿 `s_z:0→1` 积分 → `Ẑ^bev [B,H,Dz]`。
+- **§13.2 Policy Proposal** `propose_policies(cond…, n_candidates)`：固定 `s_z=0`（BEV 边缘化），policy 沿 `s_π:0→1` 一批生成 → `[B,N,H,M,P]`；`decode_policy_vector` 解读 `sel/fmt`（sigmoid）与 `freq/bw`。
+- **§13.3 Inverse Policy Search** `inverse_policy_search(cond…, bev_target)`：固定 `s_z=1` 钉住目标未来 BEV，policy 沿 `s_π:0→1` 反推。
+- **joint 生成** `joint_generate(cond…)`：两个 diffusion time 同步积分，联合采样 `(π chunk, Ẑ^bev)`。
+
+**简化 / 未实现**：定步长 Euler（可换高阶 solver）；§13.2 候选 reranking 不在本模块（属 §17）。
+
+---
+
+### §16.1：Stage-1 训练 Pipeline（encoder + deterministic heads 预训练）
+
+文件：[car_dreamer/toolkit/wam/stage1.py](car_dreamer/toolkit/wam/stage1.py) +
+[car_dreamer/toolkit/wam/stage1_recorder.py](car_dreamer/toolkit/wam/stage1_recorder.py) +
+[scripts/record_wam_stage1_data.py](scripts/record_wam_stage1_data.py) +
+[scripts/train_wam_stage1.py](scripts/train_wam_stage1.py)。
+
+目标：预训练 graph encoder + temporal encoder + §11.1 Notable Head + §11.2 高斯轨迹头，学到 task-aware 环境理解
+与可信的预测不确定度 `U^π`（policy search 的 reward）。**离线录制 + 离线训练**两段式（录制需 CARLA，训练不需）。
+
+> 详细的设计→代码对照、简化清单与后续完善见专文 [docs/wam_stage1_training.md](docs/wam_stage1_training.md)。
+
+- **数据录制**（`WAMStage1DataRecorder`，仿 `TrajectoryTargetBuffer`）：维护最近 `K+1` 张图的滑动窗口；`observe(step, snapshots)` 记全场 actor 世界坐标；`register(step, graph, ego_pose)` 把当前图滑入窗口并登记样本（窗口快照 + 最后一张图的有效 object ids，`valid_object_ids` 与 `WAMPerceptionModel` 的筛选一致以保证对齐）；horizon 到期后用 `build_trajectory_targets` 生成 GT 未来轨迹 `target_xy [Q,H,2]` + `valid [Q,H]`，`torch.save` 成 `.pt`。perception 标签（notable/visible/invisible）已挂在图的 object node 上，**无需单独记录**。
+- **样本字段**：`window:[HeteroData×(K+1)]`、`target_xy [Q,H,2]`、`valid [Q,H]`、`object_node_ids [Q]`。
+- **训练循环** `WAMStage1Trainer`：每个 window → `WAMPerceptionModel.forward` → `perception_loss`（§15.1 BCE，notable/vis/inv，`λ_occ=0`）+ `gaussian_trajectory_nll`（§15.2，notable 加权，按 `valid` 屏蔽）；`L = λ_perc·perc + λ_traj·nll`，batch 内逐样本求和取平均，backward + grad-clip + Adam。`evaluate` 报告 §20.1/§20.2 指标（notable F1 / invisible recall / ADE / FDE / mean `U^π`）。
+- **Stage-2 warm-start**：`init_encoder_from_stage1(stage2_model, ckpt)` 把 Stage-1 的 `graph_net.*` 权重装进 `WAMUnifiedWorldModel.context_encoder.graph_net`（同 `WAMHeteroGraphNet`，键完全匹配）；脚本 `train_wam_stage2.py --init-from-stage1 <ckpt>`（可配 `--freeze-encoder`）。
+- **配置**：`env.wam.stage1.*`（lr/batch/steps/λ/history_window/temporal/head/traj），`hidden_dim`/`route_waypoints` 复用 `env.wam.graph.*`，由 `wam_stage1_configs_from_env` 读成 `(WAMPerceptionConfig, WAMStage1Config)`。
+
+**简化 / 未实现**：occluding（§8.3）未实现 → occ 标签恒 0、`λ_occ=0`；window 逐样本编码（非 batch 向量化）；样本每步一张 request 图（per-vehicle 图属 Stage-2 侧 deferred）；早期 step 的 window 长度 < K+1（模型对任意 L≥1 鲁棒）。
+
+---
+
+### §16.2：Stage-2 训练 Pipeline（BS-centric Diffusion UWM）
+
+文件：[car_dreamer/toolkit/wam/stage2.py](car_dreamer/toolkit/wam/stage2.py) +
+[car_dreamer/toolkit/wam/flow_recorder.py](car_dreamer/toolkit/wam/flow_recorder.py) +
+[scripts/record_wam_flow_data.py](scripts/record_wam_flow_data.py) +
+[scripts/train_wam_stage2.py](scripts/train_wam_stage2.py)。
+
+目标：最小化 `L`，学习 `p_θ(π_{q,t:t+H-1}, z^bev_{q,t+1:t+H} | C^BS)`。**离线录制 + 离线训练**两段式（录制需 CARLA，训练不需）。
+
+> 详细的设计→代码对照、简化清单与**后续完善逻辑**见专文 [docs/wam_stage2_training.md](docs/wam_stage2_training.md)。
+
+- **数据录制**（`WAMFlowDataRecorder`）：`observe_policy(step, policy)` 每步记 policy；`register(step, graph, candidate_ids, notable_object_ids)` 登记 request 车样本骨架；horizon（=H-1）到期后用 `encode_policy_chunk` 把 `policy(t..t+H-1)` 按样本的 candidate 顺序编码成 chunk，`torch.save` 成 `.pt`。CARLA 抽取在脚本里，recorder 纯逻辑可单测。
+- **样本字段**（一条 = request 车 q 在 t）：`vehicle_graphs:[HeteroData]`（v1 = `[request_graph]`）、`request_index`、`notable_object_ids`、`policy_chunk(π_1) [H,M,P]`、`member_mask [M]`、`policy_step_mask [H]`、`bev_history [K+1,Dz]`（零占位）、`bev_future(z_1) [H,Dz]`（零占位）、`bev_step_mask [H]`。
+- **Dataset / collate**：`WAMFlowDataset`（读 `.pt` 目录或内存 list）+ `collate_flow_samples`（`samples` 保持 list 逐图编码、张量 pad/stack 到 `[B, H, M/Dz]`）。
+- **训练循环** `WAMStage2Trainer`：每 batch → `model.condition_tokens_batch(samples)→ (cond, type_ids, mask)` → `model.training_step(cond, …, policy_1, bev_1)`（采样 `s_π/s_z` + 噪声 → forward → `flow_matching_loss`）→ backward + grad-clip + Adam。日志/定期 checkpoint/可选 val；**graph encoder 与 diffusion 联合端到端**（`freeze_encoder` 冻结 `context_encoder`）。
+- **配置**：`env.wam.flow.*`（含 `history_window`、`num_register_tokens`；去掉 `max_objects`/`max_bev_vehicles`）+ `env.wam.stage2.*`（`w_bev` 取代 `w_obs`），`hidden_dim`/`route_waypoints` 复用 `env.wam.graph.*`，由 `wam_configs_from_env` 读。
+
+**简化 / 未实现**：
+- `bev_future`/`bev_history` 零占位（仍纳入 `L`，训练退化目标）；待真实 per-vehicle BEV latent 接入后替换。
+- `vehicle_graphs = [request_graph]`（N=1）；per-vehicle local 图 deferred。
+- 逐图编码（Python 循环，非 PyG `Batch`）；policy 真值 `π_1` 来自占位策略（选全部候选），分布单一；未训练 Stage 1 → encoder 由 `L` 联合训练。
+
+---
+
 ## 3. 输出说明
 
 ### 3.1 环境 `info`（每步 step / reset 返回）
@@ -230,6 +341,20 @@ WAM 运行参数（默认值，可在 `env.wam.*` 覆盖）：`notable_distance_
 
 `build_trajectory_targets` / `TrajectoryTargetBuffer` 返回 numpy：`target_xy [Q,H,2]`、`valid_mask [Q,H]`。
 
+### 3.4 BS-centric Diffusion UWM 返回（`WAMFlowMatchingUWM`）
+
+- `WAMBSContextEncoder(vehicle_graphs, request_index, notable_object_ids, bev_history)` → `(cond_tokens [T_c,d], type_ids [T_c])`；`pad_condition_tokens` → `(cond [B,T,d], type_ids [B,T], mask [B,T])`。
+- `forward(cond, type_ids, mask, policy_s, bev_s, s_pi, s_z, …)` → `dict`：`u_pi [B,H,M,P]`、`u_bev [B,H,Dz]`（`enable_bev=False` 时为 `None`）。
+- `rollout_future_bev` → `Ẑ^bev [B,H,Dz]`；`propose_policies` → `[B,N,H,M,P]`；`inverse_policy_search` → `[B,H,M,P]`；`joint_generate` → `{policy [B,H,M,P], bev [B,H,Dz]}`。
+- `flow_matching_loss(pred, target, ...)` → `{total, policy, bev}`。`WAMUnifiedWorldModel.training_step(...)` 同结构。
+
+### 3.5 Stage-2 训练产出
+
+- **数据样本**：`record_wam_flow_data.py` → `data/wam_flow/sample_*.pt`（每个是 §16.2 的样本 dict）。
+- **checkpoint**：`train_wam_stage2.py` → `outputs/wam_stage2/stage2_step{N}.pt`（`{model, optimizer, step, graph_config, flow_config}`），
+  可被 `WAMStage2Trainer.load_checkpoint` 还原。
+- **训练日志**：`[wam-stage2] step=… L=… policy=… bev=…`（`WAMStage2Trainer.train`，按 `log_interval`）。
+
 ---
 
 ## 4. 文档 / 日志输出
@@ -246,9 +371,10 @@ WAM 运行参数（默认值，可在 `env.wam.*` 覆盖）：`notable_distance_
 ### 5.1 离线（不需要 CARLA，推荐）
 
 ```bash
-# 全套 WAM 单测：runtime / graph / heads / targets / debug
+# 全套 WAM 单测：runtime / graph / heads / targets / flow-matching / stage2
 conda run -n cardreamer_gnn python -m unittest \
-  tests.test_wam_runtime tests.test_wam_graph tests.test_wam_heads tests.test_wam_targets -v
+  tests.test_wam_runtime tests.test_wam_graph tests.test_wam_heads tests.test_wam_targets \
+  tests.test_wam_flow_matching tests.test_wam_stage1 tests.test_wam_stage2 -v
 
 # 全部测试
 conda run -n cardreamer_gnn python -m unittest discover -s tests -p "test_*.py"
@@ -265,6 +391,13 @@ conda run -n cardreamer_gnn python -c "import car_dreamer, gymnasium as gym; \
 - `test_wam_graph`：policy 条件下的节点/边计数、state 维度、invisible 标记、ego-only 图合法、HGT forward 形状/有限性、BEV 占位节点可跑。
 - `test_wam_heads`：`align_object_history` 对齐 + presence mask、`WAMPerceptionModel` 输出形状/有限性、单图窗口、三类 loss、NLL 在 `μ→target` 时下降、`policy_uncertainty` 与手算公式一致。
 - `test_wam_targets`：ego 帧变换 + 旋转 + 缺失 mask、buffer 在 horizon 后正确发射对齐真值。
+- `test_wam_flow_matching`：time embedding / `interpolate` 端点+速度；`WAMGraphContextPool` 形状+凸组合+mask 排除+真实图；
+  `WAMFlowMatchingUWM.forward` 形状/有限性、`key_padding_mask` 不产生 NaN、`enable_bev=False` 通路；
+  `flow_matching_loss` 在 pred==target 时为 0、mask 成员被排除、过拟合小 batch 时 `L_FM` 下降；
+  四种推理模式（rollout/proposal/inverse/joint）形状；policy 编解码；`WAMUnifiedWorldModel` 端到端（梯度回传 graph encoder + rollout）。
+- `test_wam_stage2`：`build_object_state_target`（位置=GT/速度=有限差分/static 保持/缺失 mask）；`WAMFlowDataset`+collate 形状与 pad；
+  trainer 单 batch 有限、过拟合时 `L_FM` 下降、checkpoint 存取还原 loss、`freeze_encoder` 切换 encoder 梯度；
+  `WAMFlowDataRecorder` 纯逻辑（喂假数据 → flush 出带正确 X 真值的样本）；离线端到端训练 + 落 checkpoint。
 
 ### 5.2 端到端 smoke（无需 CARLA）
 
@@ -285,26 +418,42 @@ python scripts/check_wam_graph.py --task carla_group_right_turn_auto --carla-por
 python scripts/record_wam_notable_debug.py --task carla_group_right_turn_auto --carla-port 2000 --steps 300
 ```
 
+### 5.4 Stage-2 训练（录制需 CARLA；训练不需）
+
+```bash
+# 1) 录制训练样本（需 CARLA）
+python scripts/record_wam_flow_data.py --task carla_group_right_turn_auto --carla-port 2000 \
+  --steps 400 --out-dir data/wam_flow
+# 2) 离线训练 flow-matching UWM（不需 CARLA）
+python scripts/train_wam_stage2.py --data-dir data/wam_flow --task carla_group_right_turn_auto --steps 2000
+```
+期望：`data/wam_flow/sample_*.pt` 出现；训练日志 `L_FM` 随 step 下降；`outputs/wam_stage2/stage2_step*.pt` 写出且可被
+`WAMStage2Trainer.load_checkpoint` 还原。
+
 ---
 
 ## 6. 已知约束与简化清单
 
 **一致性约束**
 - 图构造的 `GraphBuildSpec.route_waypoints` 必须等于模型 `WAMPerceptionConfig.route_waypoints` / `WAMGraphModelConfig.route_waypoints`（vehicle state 维度依赖它）。环境里两者都来自 `env.wam.graph.route_waypoints`，天然一致。
-- `HGTConv` 要求每类 node ≥1：图构造对空 object 类型做 pad + mask。
+- edge-aware 编码器（`TransformerConv`+`HeteroConv`）要求每类 node ≥1：图构造对空 object 类型做 pad + mask；`hidden_dim` 须被 `num_heads` 整除。
+- `WAMUnifiedWorldModel` 要求 `WAMGraphModelConfig.hidden_dim == WAMFlowMatchingConfig.hidden_dim`（构造时校验），且 `bev_latent_dim` 默认取 `hidden_dim`（§5 BEV 编码输出维度）。
+- Stage-2：训练用的 `route_waypoints` / `hidden_dim`（`wam_configs_from_env` 从 `env.wam.graph.*` 读）必须与录制样本里 graph 的一致；`flow.horizon` 必须等于 recorder 的 `samples`（policy chunk 长度 H）。
 
 **主要简化**
-- 用 ground-truth + FOV/遮挡几何判可见性，而非真实 detector；`s_det=1`、`Δt=0`、`quality=1`。
+- 用 ground-truth + FOV/遮挡几何判可见性，而非真实 detector；`s_det`（obs_obj 边属性）恒 1、`Δt=0`、`quality=1`。
 - rule-based 运动预测是匀速 + 固定不确定度（visible 0.2 / invisible 2.0）。
 - placeholder policy 选全部候选；`B_t` 均分、`f_t=comm_period`。
-- 坐标 ego 帧、yaw 用 cos/sin（设计写原始值，信息等价）。
-- 轨迹 NLL 默认用加权平均（设计是求和）。
-- `z^bev` 为零占位（无真实 per-vehicle BEV）。
+- 坐标 ego 帧、yaw 用 cos/sin（设计写原始值，信息等价）；object node state 11 维（`s_det` 已移到 obs_obj 边）。
+- BS condition 的 BEV-history 与 future BEV（`bev_future`）均为零占位 → 生成 BEV 半边退化（去噪向 0）；`enable_bev` 可整体关。
+- BS 样本 `vehicle_graphs = [request_graph]`（N=1）；policy chunk 真值来自占位策略（选全部候选）。
+- diffusion 推理用定步长 Euler 积分（非高阶 solver）。
 
 **当前未实现（后续步骤）**
+- 真实 per-vehicle BEV latent（§5.3 `E_bev`）+ 真实 detector confidence（obs_obj `det_confidence` 暂恒 1）。
+- live-env per-vehicle BS 图装配（全部覆盖车 local 图；需 per-vehicle route/notable）—— 当前 deferred。
 - §8.3 occluding object（occ 标签恒 0）。
-- §12 Graph Flow-Matching UWM、§13 flow 推理（rollout/proposal/inverse）、§14 BEV decoder。
-- §16 训练 pipeline（Stage 1 预训练 graph encoder + heads；Stage 2 UWM；Stage 3 policy search 验证）与 replay 数据管线。
-- §17 按 `U^π` 的 policy reranking / 候选枚举（当前直接选全部候选）。
-- §10 对 vehicle/observation 节点的时序编码（机制相同，仅 object 已接）。
-- §6.2 BEV-to-object 边；img/text 模态。
+- §14 BEV decoder（把 `Ẑ^bev` 解码成 semantic map）、§15.4 BEV 重建 loss。
+- §16.3 Stage 3（policy search + planner 验证）。**§16.1 Stage 1 已实现**（encoder + heads 预训练 + `U^π` + Stage-2 warm-start）。
+- §17 按 `U^π` 的 policy reranking / 候选枚举（当前直接选全部候选）——`U^π` 已可由 Stage-1 训练好的轨迹头给出，待接入 §16.3。
+- §10 对 vehicle/observation 节点的时序编码（机制相同，仅 object 已接）；§6.2 BEV-to-object 边；img/text 模态。

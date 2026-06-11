@@ -21,7 +21,7 @@ from .debug_recording import (
     snapshot_from_carla_actor,
 )
 from .graph import (
-    COOP,
+    EDGE_ATTR_DIMS,
     EDGE_TYPES,
     MODALITIES,
     MODALITY_TO_ID,
@@ -30,9 +30,12 @@ from .graph import (
     OBJECT_CLASSES,
     OBJECT_STATE_DIM,
     OBS_OBJ,
+    OBS_OBJ_EDGE_DIM,
     OBS_SCALAR_DIM,
     OBSERVATION,
     VEH_OBS,
+    VEH_VEH,
+    VEH_VEH_EDGE_DIM,
     VEHICLE,
     WAM_METADATA,
     GraphBuildSpec,
@@ -57,12 +60,48 @@ from .heads import (
     align_object_history,
     gaussian_trajectory_nll,
     perception_loss,
+    perception_metrics,
     policy_uncertainty,
+    trajectory_ade_fde,
 )
 from .targets import (
     TrajectoryTargetBuffer,
     build_trajectory_targets,
 )
+from .flow_matching import (
+    SinusoidalTimeEmbedding,
+    WAMBSContextEncoder,
+    WAMFlowMatchingConfig,
+    WAMFlowMatchingUWM,
+    WAMGraphContextPool,
+    WAMUnifiedWorldModel,
+    decode_policy_vector,
+    encode_policy,
+    encode_policy_chunk,
+    flow_matching_loss,
+    interpolate,
+    pad_condition_tokens,
+    sample_training_batch,
+)
+from .stage2 import (
+    WAMFlowDataset,
+    WAMStage2Config,
+    WAMStage2Trainer,
+    collate_flow_samples,
+    make_flow_sample,
+    wam_configs_from_env,
+)
+from .flow_recorder import WAMFlowDataRecorder
+from .stage1 import (
+    WAMStage1Config,
+    WAMStage1Dataset,
+    WAMStage1Trainer,
+    collate_stage1_samples,
+    init_encoder_from_stage1,
+    make_stage1_sample,
+    wam_stage1_configs_from_env,
+)
+from .stage1_recorder import WAMStage1DataRecorder, valid_object_ids
 
 __all__ = [
     "ActorSnapshot",
@@ -81,8 +120,8 @@ __all__ = [
     "predicted_future_waypoints",
     "select_notable_objects",
     "snapshot_from_carla_actor",
-    # hetero graph construction (§4-§7)
-    "COOP",
+    # hetero graph construction (§4-§7 + Edge Representation Update)
+    "EDGE_ATTR_DIMS",
     "EDGE_TYPES",
     "MODALITIES",
     "MODALITY_TO_ID",
@@ -91,9 +130,12 @@ __all__ = [
     "OBJECT_CLASSES",
     "OBJECT_STATE_DIM",
     "OBS_OBJ",
+    "OBS_OBJ_EDGE_DIM",
     "OBS_SCALAR_DIM",
     "OBSERVATION",
     "VEH_OBS",
+    "VEH_VEH",
+    "VEH_VEH_EDGE_DIM",
     "VEHICLE",
     "WAM_METADATA",
     "GraphBuildSpec",
@@ -116,8 +158,42 @@ __all__ = [
     "align_object_history",
     "gaussian_trajectory_nll",
     "perception_loss",
+    "perception_metrics",
     "policy_uncertainty",
+    "trajectory_ade_fde",
     # ground-truth trajectory targets (§15.2)
     "TrajectoryTargetBuffer",
     "build_trajectory_targets",
+    # BS-centric diffusion unified world model (Design Update §2-§8, §13)
+    "SinusoidalTimeEmbedding",
+    "WAMBSContextEncoder",
+    "WAMFlowMatchingConfig",
+    "WAMFlowMatchingUWM",
+    "WAMGraphContextPool",
+    "WAMUnifiedWorldModel",
+    "decode_policy_vector",
+    "encode_policy",
+    "encode_policy_chunk",
+    "flow_matching_loss",
+    "interpolate",
+    "pad_condition_tokens",
+    "sample_training_batch",
+    # stage-2 training pipeline (§16.2)
+    "WAMFlowDataset",
+    "WAMFlowDataRecorder",
+    "WAMStage2Config",
+    "WAMStage2Trainer",
+    "collate_flow_samples",
+    "make_flow_sample",
+    "wam_configs_from_env",
+    # stage-1 training pipeline (§16.1) + warm-start
+    "WAMStage1Config",
+    "WAMStage1Dataset",
+    "WAMStage1DataRecorder",
+    "WAMStage1Trainer",
+    "collate_stage1_samples",
+    "init_encoder_from_stage1",
+    "make_stage1_sample",
+    "valid_object_ids",
+    "wam_stage1_configs_from_env",
 ]
