@@ -123,15 +123,100 @@ class NetResource:
 
 @dataclass
 class V2VMessage:
+    """A single bundled V2V message (Communication Model §4).
+
+    One message corresponds to one collaborator ``sender_id`` producing data at one sensor
+    sampling time ``t_sense`` under policy ``policy_id`` and streaming it to the request
+    vehicle ``receiver_id``. Per the project deviation from the design doc, a message bundles
+    *all* modalities the collaborator sends under the current policy: ``modalities`` lists the
+    types and ``data`` holds one field per modality (plus ``"feat"``/``"pose"``/``"vel"`` for
+    the legacy vehicle-node graph).
+
+    ``t_sense`` and ``t_recv`` are simulation **step** indices (the sensor tick and the delivery
+    step); ``t_ready`` and ``t_send`` are continuous **seconds**; the delay fields are **seconds**:
+        ``t_ready_s = t_sense * dt + T_proc``
+        ``t_send_s  = max(t_ready_s, sender-queue busy_until)``     (queueing, §7)
+        ``t_recv_s  = t_send_s + tx_delay``                          (transmission, §8)
+        ``total_latency = t_recv_s - t_sense * dt`` == proc + queue + tx (summed exactly, §5)
+        ``t_recv = t_sense + round(total_latency / dt)``  (the SUM is rounded to a step ONCE)
+    """
+
+    msg_id: int
+    policy_id: int
     sender_id: int
     receiver_id: int
-    group_id: int
-    payload: Any
-    payload_bytes: int
-    created_step: int
-    deliver_step: int
-    latency_s: float
-    distance_m: float
+    modalities: Tuple[str, ...]
+    payload_size: int
+    data: Dict[str, Any]
+    # --- per-message timeline ---
+    t_sense: int          # sensor tick (step index)
+    t_ready: float        # processing complete (seconds)
+    t_send: float         # transmission start (seconds)
+    t_recv: int           # delivery step (round of the summed latency)
+    # --- delay decomposition (seconds) ---
+    proc_delay: float = 0.0
+    queue_delay: float = 0.0
+    tx_delay: float = 0.0
+    total_latency: float = 0.0
+    distance_m: float = 0.0
+
+    # ---- backward-compatible aliases (legacy graph_build / scripts) ----
+    @property
+    def created_step(self) -> int:
+        return int(self.t_sense)
+
+    @property
+    def deliver_step(self) -> int:
+        return int(self.t_recv)
+
+    @property
+    def latency_s(self) -> float:
+        return float(self.total_latency)
+
+    @property
+    def payload_bytes(self) -> int:
+        return int(self.payload_size)
+
+    @property
+    def payload(self) -> Dict[str, Any]:
+        return self.data
+
+
+def shannon_rate_bps(
+    distance_m: float,
+    bandwidth_hz: float,
+    *,
+    tx_power_dbm: float = 20.0,
+    noise_figure_db: float = 9.0,
+    carrier_freq_hz: float = 5.9e9,
+    distance_decay_m: float = 60.0,
+    min_rate_factor: float = 0.2,
+) -> float:
+    """Shannon link rate (bps) under a free-space-path-loss + noise-floor model.
+
+    Shared by :class:`SimpleWirelessLatency` (legacy contention path) and the new
+    policy-conditioned per-message transmission (Communication Model §8), where ``bandwidth_hz``
+    is the policy-allocated bandwidth ``B^π_{m,q}`` rather than a contention share.
+
+        FSPL(dB) = 20log10(d_km) + 20log10(f_MHz) + 32.44
+        Pr(dBm)  = Pt(dBm) - FSPL
+        N(dBm)   = -174 + 10log10(B) + NF
+        C(bps)   = B * log2(1 + 10^((Pr - N)/10))
+
+    ``distance_decay_m`` / ``min_rate_factor`` retain the original non-ideal attenuation factor.
+    """
+    d = max(float(distance_m), 0.0)
+    distance_factor = max(float(min_rate_factor), math.exp(-d / max(float(distance_decay_m), 1e-6)))
+    bandwidth_hz = max(float(bandwidth_hz) * distance_factor, 1.0)
+
+    d_km = max(d, 1.0) / 1000.0
+    f_mhz = float(carrier_freq_hz) / 1e6
+    fspl_db = 20.0 * math.log10(d_km) + 20.0 * math.log10(f_mhz) + 32.44
+    pr_dbm = float(tx_power_dbm) - fspl_db
+    noise_dbm = -174.0 + 10.0 * math.log10(bandwidth_hz) + float(noise_figure_db)
+    snr_linear = 10.0 ** ((pr_dbm - noise_dbm) / 10.0)
+    return max(bandwidth_hz * math.log2(1.0 + max(snr_linear, 0.0)), 1.0)
+
 
 class LatencyModel:
     """
@@ -209,35 +294,19 @@ class SimpleWirelessLatency(LatencyModel):
         uplink = max(sender_res.uplink_bps / out_degree, 1.0)
         downlink = max(receiver_res.downlink_bps / in_degree, 1.0)
 
-        # distance attenuation factor (keep your original factor)
-        distance_factor = math.exp(-d / max(self.distance_decay_m, 1e-6))
-        distance_factor = max(self.min_rate_factor, float(distance_factor))
-
         # ---- Shannon capacity part ----
-        # Effective bandwidth under contention + distance degradation
+        # Effective bandwidth under contention; FSPL/SNR + distance degradation in shannon_rate_bps.
         B_sender = max(float(sender_res.bandwidth_hz) / out_degree, 1.0)
         B_receiver = max(float(receiver_res.bandwidth_hz) / in_degree, 1.0)
-        bandwidth_hz = min(B_sender, B_receiver) * distance_factor
-        bandwidth_hz = max(bandwidth_hz, 1.0)
-
-        # Free-space path loss (FSPL)
-        # FSPL(dB) = 20log10(d_km) + 20log10(f_MHz) + 32.44
-        d_km = max(d, 1.0) / 1000.0
-        f_mhz = float(sender_res.carrier_freq_hz) / 1e6
-        fspl_db = 20.0 * math.log10(d_km) + 20.0 * math.log10(f_mhz) + 32.44
-
-        # Received power (dBm)
-        pr_dbm = float(sender_res.tx_power_dbm) - fspl_db
-
-        # Noise floor (dBm): -174 dBm/Hz + 10log10(B) + NF
-        noise_dbm = -174.0 + 10.0 * math.log10(bandwidth_hz) + float(receiver_res.noise_figure_db)
-
-        # SNR
-        snr_db = pr_dbm - noise_dbm
-        snr_linear = 10.0 ** (snr_db / 10.0)
-
-        # Shannon capacity (bps)
-        shannon_bps = bandwidth_hz * math.log2(1.0 + max(snr_linear, 0.0))
+        shannon_bps = shannon_rate_bps(
+            d,
+            min(B_sender, B_receiver),
+            tx_power_dbm=float(sender_res.tx_power_dbm),
+            noise_figure_db=float(receiver_res.noise_figure_db),
+            carrier_freq_hz=float(sender_res.carrier_freq_hz),
+            distance_decay_m=self.distance_decay_m,
+            min_rate_factor=self.min_rate_factor,
+        )
 
         # Practical throughput cap (KEEP uplink/downlink variables)
         rate_bps = min(shannon_bps, uplink, downlink)

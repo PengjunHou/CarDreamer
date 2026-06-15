@@ -181,9 +181,14 @@ def print_scene(env, tag: str) -> None:
     ego = getattr(sim, "ego", None)
     ego_id = int(ego.id) if ego is not None else None
     group_vehs = list(getattr(sim, "group_vehs", []))
-    in_flight = len(getattr(sim, "_in_flight", []))
-    received = getattr(sim, "_received", {})
-    ego_msgs = len(received.get(ego_id, [])) if ego_id is not None else 0
+    comm_proc = getattr(sim, "_comm_process", None)
+    step = int(getattr(sim, "_time_step", 0))
+    if comm_proc is not None:
+        in_flight = len(comm_proc.in_flight)
+        ego_msgs = len(comm_proc.available_messages(step)) if comm_proc.policy is not None else 0
+    else:
+        in_flight = 0
+        ego_msgs = 0
     vehicles, walkers = _live_actor_counts(sim)
 
     print(

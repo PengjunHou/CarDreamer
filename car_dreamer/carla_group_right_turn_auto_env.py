@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
 from typing import Any, Dict, Optional
 
 from runtime_logging import get_runtime_logger, get_runtime_logging_config, should_log_periodic
@@ -59,19 +58,22 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, CarlaWptFixedEnv):
         )
 
     def on_step(self) -> None:
-        self._deliver_messages()
+        step = int(self._time_step)
+        # Streaming V2V communication: refresh observations + local perception, decide the
+        # Base-Station policy (lifetime Td), then advance the comm process (deliver + sensor stream).
         self._update_group_observations()
-        if self._time_step % max(self.comm_period, 1) == 0:
-            self._run_group_communication()
+        self._update_wam_runtime_state()
+        self._update_policy_lifecycle(step)
+        self._run_comm_step(step)
         self._cleanup_actor_flow()
         runtime_cfg = get_runtime_logging_config()
-        print(f"Step {self._time_step}: in_flight={len(self._in_flight)} received_for_ego={len(self._received.get(int(self.ego.id), []))}")
-        if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=AUTO_ENV_LOGGER):
+        if should_log_periodic(step, int(runtime_cfg["step_debug_interval"]), logger=AUTO_ENV_LOGGER):
+            proc = self._ensure_comm_process()
             AUTO_ENV_LOGGER.debug(
-                "Right-turn auto step=%d in_flight=%d received_for_ego=%d",
-                self._time_step,
-                len(self._in_flight),
-                len(self._received.get(int(self.ego.id), deque())),
+                "Right-turn auto step=%d in_flight=%d available_for_ego=%d",
+                step,
+                len(proc.in_flight),
+                len(proc.available_messages(step)),
             )
         super().on_step()
 

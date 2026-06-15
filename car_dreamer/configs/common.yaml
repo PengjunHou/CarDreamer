@@ -172,17 +172,30 @@ env:
     continuous_steer: [-1.0, 1.0] # continuous value of steering angles
     n_commands: 3 # number of text commands for message handler
 
-  communication: # V2V communication global default settings
-    group_update_period: 20   # how often to recompute groups (steps)
-    comm_period: 1            # how often to trigger intra-group communication (steps)
-    uplink_bps: 6000000.0     # per-vehicle uplink bandwidth (bps)
-    downlink_bps: 12000000.0  # per-vehicle downlink bandwidth (bps)
-    base_rtt_s: 0.02          # base round-trip time (seconds)
-    proc_delay_s: 0.005       # processing delay (seconds)
-    distance_decay_m: 60.0    # distance decay constant for latency model (meters)
+  communication: # V2V streaming communication model (Communication Model Specification)
+    # --- timing parameters (seconds; converted to steps via world.fixed_delta_seconds) ---
+    policy_duration_s: 2.0          # Td  -- cooperative policy lifetime (§2.1)
+    sensor_period_s: 0.2            # Ts  -- collaborator sensor sampling / streaming period (§2.2)
+    prediction_window_s: 2.0        # Tw  -- receive-queue window on sensor time (§2.3)
+    action_period_s: 1.0            # Ta  -- notable-motion prediction cadence (§2.4)
+    proc_delay_s: 0.05              # T_proc -- per-message processing delay (§2.2; summed then rounded)
+    flush_old_policy_queue: False   # §9  -- keep (True) vs drop (False) old-policy queued messages
+    allow_cross_policy_messages: False  # §11 -- use only the active policy's messages
+    collaborator_modalities: [objlist]  # bundled modalities each collaborator streams per message
+    # --- transmission rate model (policy-allocated bandwidth + FSPL/SNR, §8) ---
+    uplink_bps: 6000000.0     # total uplink bandwidth split across collaborators (bps)
+    downlink_bps: 12000000.0  # per-vehicle downlink bandwidth (bps, legacy latency model)
+    bandwidth_hz: 10000000.0  # channel bandwidth for Shannon rate (Hz)
+    tx_power_dbm: 20.0        # transmit power (dBm)
+    noise_figure_db: 9.0      # receiver noise figure (dB)
+    carrier_freq_hz: 5900000000.0  # carrier frequency (Hz)
+    distance_decay_m: 60.0    # distance decay constant for the rate model (meters)
     min_rate_factor: 0.2      # minimum rate factor (prevents rate from dropping to zero)
-    jitter_s: 0.0             # random jitter added to latency (seconds, 0 = disabled)
     overhead_bytes: 64        # fixed protocol overhead per message (bytes)
+    # --- legacy SimpleWirelessLatency knobs (kept for offline Stage-1 recording scripts) ---
+    group_update_period: 20   # how often to recompute groups (steps)
+    base_rtt_s: 0.02          # base round-trip time (seconds)
+    jitter_s: 0.0             # random jitter added to latency (seconds, 0 = disabled)
 
   wam:
     enabled: True

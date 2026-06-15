@@ -55,6 +55,7 @@ def make_stage1_sample(
     target_xy: torch.Tensor,
     valid: torch.Tensor,
     object_node_ids: Sequence[int],
+    metadata: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """Assemble one Stage-1 sample.
 
@@ -62,12 +63,15 @@ def make_stage1_sample(
     the GT future positions of the **last graph's valid object nodes** (in node order). Perception labels
     (notable/visible/invisible) ride inside ``window[-1]`` object nodes -- no separate label tensor.
     """
-    return {
+    sample: Dict[str, object] = {
         "window": list(window),
         "target_xy": target_xy.float(),
         "valid": valid.float(),
         "object_node_ids": [int(i) for i in object_node_ids],
     }
+    if metadata is not None:
+        sample["metadata"] = dict(metadata)
+    return sample
 
 
 class WAMStage1Dataset(Dataset):

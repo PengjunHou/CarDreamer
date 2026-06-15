@@ -5,9 +5,11 @@ inside ``carla_group_right_turn_auto`` so that any task env can opt into it:
 
 * a per-vehicle camera/observer pool of cooperative vehicles,
 * per-episode random participation (candidate pool) for generalization,
-* a per-step collaboration-policy hook (``_select_collaborators``),
-* V2V message passing with a wireless latency model and a delivery queue, and
-* an ego-centric GNN graph built from the ego's received messages.
+* a Base-Station policy lifecycle (``_update_policy_lifecycle``) with lifetime ``Td`` (§3),
+* the streaming communication process (``CommunicationProcess``): sensor sampling at ``Ts``,
+  per-link sender queues (proc + queue + tx delay), and a receive queue with a ``Tw`` window, and
+* a cooperative GNN graph rebuilt from the **messages actually available in the receive queue**,
+  which gives genuine local <-> V2V switching (§12-§14).
 
 Cooperative vehicles are declared in the task's ``scenario_actors.vehicles`` config: any
 vehicle with a ``start`` point is spawned by the reusable ``ScenarioActorManager`` and then
@@ -21,8 +23,8 @@ A host task opts in by:
   3. ``on_reset``: ``self._reset_group_runtime_state(); self._destroy_group_observers();
      super().on_reset(); self.groups.setdefault(GROUP_ID, set()).add(int(self.ego.id))``.
      (Candidate vehicles are registered automatically by the base-env scenario hook.)
-  4. ``on_step``: ``self._deliver_messages(); self._update_group_observations()`` and
-     ``self._run_group_communication()`` every ``comm_period`` steps.
+  4. ``on_step``: ``self._update_group_observations(); self._update_wam_runtime_state();
+     self._update_policy_lifecycle(step); self._run_comm_step(step)``.
   5. ``step`` / ``reset``: merge ``self._merge_step_info(info, action)`` /
      ``self._build_reset_info()`` into the returned info dict.
 
@@ -36,8 +38,7 @@ and (for graph reset info) ``self.get_wpt_dist``. The task config must provide a
 from __future__ import annotations
 
 import math
-from collections import defaultdict, deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import carla
 import numpy as np
@@ -45,16 +46,20 @@ import torch
 from runtime_logging import get_runtime_logger, get_runtime_logging_config, should_log_periodic
 
 from .toolkit import (
+    CommConfig,
+    CommPolicy,
+    CommunicationProcess,
     GraphBuildConfig,
     NetResource,
     Observer,
+    SenseSnapshot,
     SimpleWirelessLatency,
-    V2VMessage,
     VehicleNodeGraphBuilder,
     _dist_m,
-    _tx_bytes_for_latency,
     get_vehicle_pos,
+    make_local_policy,
     payload_fn_llm,
+    shannon_rate_bps,
 )
 from .toolkit.observer.handlers.utils import is_fov_visible
 from .toolkit.wam import (
@@ -67,7 +72,6 @@ from .toolkit.wam import (
     WAMPolicy,
     rasterize_bev,
     build_coop_request,
-    build_placeholder_policy,
     build_wam_hetero_graph,
     hetero_graph_stats,
     predict_notable_motion,
@@ -105,16 +109,17 @@ class V2VCommMixin:
         # --- communication config / latency model ---
         comm_cfg = getattr(self._config, "communication", None)
         self.group_update_period = int(getattr(comm_cfg, "group_update_period", 20))
-        self.comm_period = int(getattr(comm_cfg, "comm_period", 5))
         uplink_bps = float(getattr(comm_cfg, "uplink_bps", 6e6))
         downlink_bps = float(getattr(comm_cfg, "downlink_bps", 12e6))
         base_rtt_s = float(getattr(comm_cfg, "base_rtt_s", 0.02))
-        proc_delay_s = float(getattr(comm_cfg, "proc_delay_s", 0.005))
+        proc_delay_s = float(getattr(comm_cfg, "proc_delay_s", 0.05))
         distance_decay_m = float(getattr(comm_cfg, "distance_decay_m", 60.0))
         min_rate_factor = float(getattr(comm_cfg, "min_rate_factor", 0.2))
         jitter_s = float(getattr(comm_cfg, "jitter_s", 0.0))
         overhead_bytes = int(getattr(comm_cfg, "overhead_bytes", 64))
+        self._comm_uplink_bps = uplink_bps
         self._default_net_res = NetResource(uplink_bps=uplink_bps, downlink_bps=downlink_bps)
+        # Kept for backward compatibility (offline Stage-1 recording scripts call compute_latency_s).
         self.latency_model = SimpleWirelessLatency(
             base_rtt_s=base_rtt_s,
             proc_delay_s=proc_delay_s,
@@ -123,12 +128,39 @@ class V2VCommMixin:
             jitter_s=jitter_s,
             overhead_bytes=overhead_bytes,
         )
+        # FSPL / SNR parameters for the policy-conditioned per-message transmission rate (§8).
+        self._comm_rate_params = dict(
+            tx_power_dbm=float(getattr(comm_cfg, "tx_power_dbm", self._default_net_res.tx_power_dbm)),
+            noise_figure_db=float(getattr(comm_cfg, "noise_figure_db", self._default_net_res.noise_figure_db)),
+            carrier_freq_hz=float(getattr(comm_cfg, "carrier_freq_hz", self._default_net_res.carrier_freq_hz)),
+            distance_decay_m=distance_decay_m,
+            min_rate_factor=min_rate_factor,
+        )
+
+        # --- streaming communication process (Td/Ts/Tw/Ta + sender/receive queues) ---
+        dt = float(getattr(getattr(self._config, "world", None), "fixed_delta_seconds", 0.1))
+        self._comm_config = CommConfig.from_seconds(
+            dt=dt,
+            policy_duration_s=float(getattr(comm_cfg, "policy_duration_s", 2.0)),
+            sensor_period_s=float(getattr(comm_cfg, "sensor_period_s", 0.5)),
+            prediction_window_s=float(getattr(comm_cfg, "prediction_window_s", 2.0)),
+            action_period_s=float(getattr(comm_cfg, "action_period_s", getattr(comm_cfg, "sensor_period_s", 0.5))),
+            proc_delay_s=proc_delay_s,
+            flush_old_policy_queue=bool(getattr(comm_cfg, "flush_old_policy_queue", False)),
+            allow_cross_policy_messages=bool(getattr(comm_cfg, "allow_cross_policy_messages", False)),
+        )
+        # Bundled modalities every collaborator streams under a cooperative policy (one message).
+        modalities = getattr(comm_cfg, "collaborator_modalities", None)
+        if modalities is None:
+            modalities = [str(getattr(getattr(self._config, "wam", None), "default_modality", "objlist"))]
+        self._collaborator_modalities = tuple(str(m) for m in modalities) or ("objlist",)
+        # `comm_period` retained as an alias of the sensor period (frequency_steps in WAMPolicy views).
+        self.comm_period = int(self._comm_config.sensor_period_steps)
+        self._comm_process: Optional[CommunicationProcess] = None
+        self._comm_policy_counter = 0
+
         self.payload_fn = payload_fn_llm
         self.trans_msg_type = str(getattr(self._config, "trans_msg_type", "image"))
-        self._in_flight: List[V2VMessage] = []
-        self._received: Dict[int, Deque[V2VMessage]] = defaultdict(
-            lambda: deque(maxlen=RECEIVED_BUFFER_SIZE)
-        )
         self._veh_net_res: Dict[int, NetResource] = {}
 
         # --- graph builder ---
@@ -244,8 +276,8 @@ class V2VCommMixin:
         self.selected_collaborators = set()
         self._prev_action = None
         self._actor_cache = {}
-        self._in_flight = []
-        self._received = defaultdict(lambda: deque(maxlen=RECEIVED_BUFFER_SIZE))
+        self._comm_process = None  # lazily (re)created per episode once the ego exists
+        self._comm_policy_counter = 0
         self._veh_net_res = {}
         self._reset_wam_runtime_state()
         V2V_LOGGER.debug("V2V runtime state reset.")
@@ -253,6 +285,7 @@ class V2VCommMixin:
     def _reset_wam_runtime_state(self) -> None:
         self._wam_notable_records = []
         self._wam_object_states = []
+        self._wam_object_states_step = -1  # last step the (per-step) visibility scan ran
         self._wam_motion_predictions = {}
         self._wam_coop_request = None
         self._wam_graph = None
@@ -264,7 +297,7 @@ class V2VCommMixin:
             frequency_steps=int(getattr(self, "comm_period", 1)),
             reason="not_initialized",
         )
-        self._wam_last_update_step = -1
+        self._wam_last_predict_step = -1  # last step the (Ta-gated) notable/request ran
 
     def _destroy_group_observers(self) -> None:
         for observer in self._other_observers.values():
@@ -323,30 +356,152 @@ class V2VCommMixin:
     # Communication
     # =========================================================
 
-    def _make_payload(self, sender: carla.Actor) -> Dict[str, Any]:
-        obs = self.obs if int(sender.id) == int(self.ego.id) else self.group_obs.get(int(sender.id), {})
-        payload: Dict[str, Any] = {}
-        if self.payload_fn is not None:
-            payload = self.payload_fn(
-                sender,
-                obs,
-                self.feature_size,
-            )
+    def _ensure_comm_process(self) -> CommunicationProcess:
+        """Lazily create the per-episode communication process (needs the ego id)."""
+        if self._comm_process is None:
+            self._comm_process = CommunicationProcess(self._comm_config, int(self.ego.id))
+        return self._comm_process
 
-        tf = sender.get_transform()
-        vel = sender.get_velocity()
-        payload.update(
-            {
-                "pose": {
-                    "x": float(tf.location.x),
-                    "y": float(tf.location.y),
-                    "yaw": float(tf.rotation.yaw),
-                },
-                "vel": {"vx": float(vel.x), "vy": float(vel.y)},
-                "sender_id": int(sender.id),
-            }
+    def _next_policy_id(self) -> int:
+        pid = int(self._comm_policy_counter)
+        self._comm_policy_counter += 1
+        return pid
+
+    def _link_rate_bps(self, sender_id: int, distance_m: float, bandwidth_hz: float) -> float:
+        """Policy-conditioned Shannon link rate m -> ego (§8); ``bandwidth_hz`` is B^π_{m,q}."""
+        return shannon_rate_bps(float(distance_m), float(bandwidth_hz), **self._comm_rate_params)
+
+    def _build_coop_policy(self, step: int, candidates: List[int]) -> CommPolicy:
+        """Base-Station cooperative policy: all candidates collaborate, bundled modalities (§3)."""
+        share = float(self._comm_uplink_bps) / float(max(len(candidates), 1))
+        modalities = tuple(self._collaborator_modalities)
+        return CommPolicy(
+            policy_id=self._next_policy_id(),
+            request_vehicle_id=int(self.ego.id),
+            start_step=int(step),
+            duration_steps=int(self._comm_config.policy_duration_steps),
+            selected_collaborators=tuple(int(c) for c in candidates),
+            modalities_by_vehicle={int(c): modalities for c in candidates},
+            bandwidth_by_vehicle={int(c): share for c in candidates},
+            reason="coop_request",
         )
-        return payload
+
+    def _sync_policy_views(self, policy: CommPolicy) -> None:
+        """Mirror the active :class:`CommPolicy` into the WAMPolicy view used for info/graph."""
+        self.selected_collaborators = set(int(c) for c in policy.selected_collaborators)
+        self._wam_policy = WAMPolicy(
+            selected_vehicle_ids=tuple(int(c) for c in policy.selected_collaborators),
+            modality_by_vehicle={int(c): tuple(m) for c, m in policy.modalities_by_vehicle.items()},
+            bandwidth_by_vehicle=dict(policy.bandwidth_by_vehicle),
+            frequency_steps=int(self._comm_config.sensor_period_steps),
+            reason=str(policy.reason),
+        )
+
+    def _update_policy_lifecycle(self, step: int) -> None:
+        """Install / expire the Base-Station policy with lifetime Td (§3, §9).
+
+        A cooperative policy runs for its full ``Td``; a ``local-only`` policy is interruptible
+        by a fresh high-uncertainty request and otherwise refreshed every ``Td``.
+        """
+        if not bool(getattr(self, "_wam_enabled", True)):
+            return
+        proc = self._ensure_comm_process()
+        active = proc.policy
+        if active is not None and not active.is_local_only and active.active_at(step):
+            return  # an active cooperative policy runs for its full duration
+
+        request = getattr(self, "_wam_coop_request", None)
+        candidates = sorted(int(v) for v in getattr(self, "coop_participant_ids", set()))
+        if request is not None and candidates:
+            policy = self._build_coop_policy(step, candidates)
+        elif active is not None and active.is_local_only and active.active_at(step):
+            return  # keep the current local-only policy (no request) to avoid churn
+        else:
+            policy = make_local_policy(
+                policy_id=self._next_policy_id(),
+                request_vehicle_id=int(self.ego.id),
+                start_step=int(step),
+                duration_steps=int(self._comm_config.policy_duration_steps),
+            )
+        proc.set_policy(policy, int(step))
+        self._sync_policy_views(policy)
+
+    def _build_sense_snapshot(
+        self, sender_id: int, actor: carla.Actor, object_states: List[ObjectState], policy: CommPolicy
+    ) -> Optional[SenseSnapshot]:
+        """Bundle one collaborator's per-modality observation at this sensor tick (§2.2, §13)."""
+        modalities = policy.modalities_by_vehicle.get(int(sender_id), self._collaborator_modalities)
+        observed = [s for s in object_states if int(sender_id) in s.visible_to_collaborators]
+        tf = actor.get_transform()
+        vel = actor.get_velocity()
+        data: Dict[str, Any] = {
+            "sender_id": int(sender_id),
+            "pose": {
+                "x": float(tf.location.x),
+                "y": float(tf.location.y),
+                "z": float(tf.location.z),
+                "yaw": float(tf.rotation.yaw),
+            },
+            "vel": {"vx": float(vel.x), "vy": float(vel.y)},
+            "object_states": tuple(observed),
+        }
+        # Legacy vehicle-node-graph feature (consumed by VehicleNodeGraphBuilder).
+        if self.payload_fn is not None:
+            feat_payload = self.payload_fn(actor, self.group_obs.get(int(sender_id), {}), self.feature_size)
+            data["feat"] = feat_payload.get("feat")
+            feat_dim = feat_payload.get("feat_dim")
+            if feat_dim is not None:
+                data["feat_dim"] = int(feat_dim)
+
+        overhead = int(getattr(self.latency_model, "overhead_bytes", 64))
+        payload_size = overhead
+        for modality in modalities:
+            if modality == "bev":
+                veh_pose = (float(tf.location.x), float(tf.location.y), float(tf.rotation.yaw))
+                data["bev"] = rasterize_bev(veh_pose, observed, route_xy=(), spec=self._wam_bev_spec)
+                payload_size += int(self._wam_bev_payload_bytes())
+            else:
+                data["objlist"] = {"observed_object_ids": tuple(int(s.actor_id) for s in observed)}
+                payload_size += int(max(len(observed), 0) * OBJECT_STATE_DIM * 4)
+        return SenseSnapshot(
+            sender_id=int(sender_id),
+            distance_m=float(_dist_m(actor, self.ego)),
+            payload_size=int(payload_size),
+            modalities=tuple(modalities),
+            data=data,
+        )
+
+    def _run_comm_step(self, step: int) -> None:
+        """One simulation step of the streaming comm process: deliver, then stream at sensor ticks."""
+        proc = self._ensure_comm_process()
+        proc.deliver(int(step))
+        if not proc.is_sensor_tick(int(step)):
+            return
+        self._refresh_object_states(int(step))  # collaborator snapshots use current visibility (Ts)
+        policy = proc.policy
+        object_states = list(getattr(self, "_wam_object_states", []))
+        actor_map = self._build_group_actor_map()
+        snapshots: Dict[int, SenseSnapshot] = {}
+        for sender_id in policy.selected_collaborators:
+            actor = actor_map.get(int(sender_id)) or self._get_group_member_actor(int(sender_id))
+            if actor is None:
+                continue
+            snapshot = self._build_sense_snapshot(int(sender_id), actor, object_states, policy)
+            if snapshot is not None:
+                snapshots[int(sender_id)] = snapshot
+        emitted = proc.generate(int(step), snapshots, self._link_rate_bps)
+        runtime_cfg = get_runtime_logging_config()
+        if should_log_periodic(int(step), int(runtime_cfg["step_debug_interval"]), logger=V2V_LOGGER):
+            V2V_LOGGER.debug(
+                "Comm tick step=%d policy=%s local_only=%s collaborators=%s emitted=%d in_flight=%d recv=%d",
+                step,
+                policy.policy_id,
+                policy.is_local_only,
+                sorted(policy.selected_collaborators),
+                len(emitted),
+                len(proc.in_flight),
+                len(proc.receive_queue),
+            )
 
     def _build_group_actor_map(self) -> Dict[int, carla.Actor]:
         actor_map: Dict[int, carla.Actor] = {}
@@ -357,30 +512,8 @@ class V2VCommMixin:
         self._actor_cache.update(actor_map)
         return actor_map
 
-    def _select_collaborators(self, candidate_ids: set) -> set:
-        """Pick which candidate vehicles share with the ego this communication step.
-
-        This is the collaboration-policy hook (WAM's ``S_t``). The candidate pool
-        (``coop_participant_ids``) is fixed for the episode; the policy chooses a subset
-        of it to actually collaborate with at each communication step.
-
-        The default returns the full candidate set, preserving the prior
-        "every participant shares" behaviour. Override / replace this method with the
-        collaboration policy; it may read any runtime state via ``self`` (ego, graph,
-        ``group_obs``, distances, bandwidth budget, ...).
-
-        :param candidate_ids: candidate vehicle ids (this episode's participants).
-        :return: the subset of ``candidate_ids`` that shares with the ego this step.
-        """
-        if not bool(getattr(self, "_wam_enabled", True)):
-            return set(candidate_ids)
-        policy = getattr(self, "_wam_policy", None)
-        if policy is None:
-            return set()
-        return set(int(vehicle_id) for vehicle_id in policy.selected_vehicle_ids) & set(candidate_ids)
-
     # =========================================================
-    # WAM runtime: notable objects -> request -> placeholder policy
+    # WAM runtime: notable objects -> request (policy decided in _update_policy_lifecycle)
     # =========================================================
 
     def _actor_polygon_xy(self, actor: carla.Actor):
@@ -517,18 +650,42 @@ class V2VCommMixin:
                 V2V_LOGGER.debug("Failed to build WAM object state actor_id=%s", getattr(actor, "id", None))
         return object_states
 
+    def _refresh_object_states(self, step: Optional[int] = None) -> None:
+        """Rebuild the per-actor visibility scan (``_wam_object_states``) at most once per step.
+
+        This is the *perception* input shared by ego's local observation and every collaborator's
+        sensor snapshot, so it must stay current at each sensor tick (``Ts``) -- independent of the
+        slower ``Ta`` prediction cadence.
+        """
+        if not bool(getattr(self, "_wam_enabled", True)):
+            return
+        if step is None:
+            step = int(getattr(self, "_time_step", 0))
+        if int(getattr(self, "_wam_object_states_step", -1)) == int(step):
+            return
+        self._wam_object_states = self._wam_build_object_states()
+        self._wam_object_states_step = int(step)
+
     def _update_wam_runtime_state(self, *, force: bool = False) -> None:
+        """Refresh perception every step; recompute motion uncertainty + request every ``Ta`` (§2.4).
+
+        This is the ego's own *local sensing -> notable-object motion prediction -> request* chain.
+        It no longer decides the policy (see :meth:`_update_policy_lifecycle`) nor builds the graph
+        (see :meth:`_build_wam_graph`), both of which are driven by the receive queue.
+        """
         if not bool(getattr(self, "_wam_enabled", True)):
             return
         step = int(getattr(self, "_time_step", 0))
-        if not force and int(getattr(self, "_wam_last_update_step", -1)) == step:
-            return
+        self._refresh_object_states(step)  # perception: every step (deduped)
+
+        last = int(getattr(self, "_wam_last_predict_step", -1))
+        action_period = max(int(self._comm_config.action_period_steps), 1)
+        if not force and last >= 0 and (step - last) < action_period:
+            return  # notable-motion prediction / request runs only every Ta
 
         route_points = self._wam_reference_route_points()
-        object_states = self._wam_build_object_states()
-        self._wam_object_states = object_states
         self._wam_notable_records = select_notable_objects(
-            object_states,
+            self._wam_object_states,
             route_points,
             notable_distance_m=float(self._wam_notable_distance_m),
             max_notable_objects=int(self._wam_max_notable_objects),
@@ -547,24 +704,14 @@ class V2VCommMixin:
             predictions=self._wam_motion_predictions,
             uncertainty_threshold=float(self._wam_uncertainty_threshold),
         )
-        self._wam_policy = build_placeholder_policy(
-            request=self._wam_coop_request,
-            candidate_vehicle_ids=self.coop_participant_ids,
-            uplink_bps=float(getattr(self._default_net_res, "uplink_bps", 0.0)),
-            frequency_steps=int(self.comm_period),
-            default_modality=str(self._wam_default_modality),
-        )
-        if self._wam_build_graph:
-            self._build_wam_graph()
-        self._wam_last_update_step = step
+        self._wam_last_predict_step = step
         if should_log_periodic(step, int(get_runtime_logging_config()["step_debug_interval"]), logger=V2V_LOGGER):
             V2V_LOGGER.debug(
-                "WAM step=%d notable=%s max_uncertainty=%.3f triggered=%s selected=%s",
+                "WAM step=%d notable=%s max_uncertainty=%.3f triggered=%s",
                 step,
                 [record.object_state.actor_id for record in self._wam_notable_records],
                 self._wam_max_uncertainty(),
                 self._wam_coop_request is not None,
-                list(self._wam_policy.selected_vehicle_ids),
             )
 
     def _wam_max_uncertainty(self) -> float:
@@ -607,16 +754,43 @@ class V2VCommMixin:
     def _wam_bev_payload_bytes(self) -> float:
         return float(int(self._wam_graph_bev_channels) * int(self._wam_graph_bev_size) ** 2)
 
-    def _build_wam_graph(self) -> None:
-        """Assemble the policy-conditioned hetero graph for the current ``π_t`` (§7)."""
-        policy = self._wam_policy
-        objects = list(getattr(self, "_wam_object_states", []))
-        selected = [int(vid) for vid in policy.selected_vehicle_ids]
-
-        ego = self._wam_vehicle_node_input(
-            self.ego, is_ego=True, agent_slot=0, route_xy=self._wam_route_xy()
+    def _wam_collaborator_node_from_message(self, message, *, agent_slot: int) -> VehicleNodeInput:
+        """Collaborator vehicle node from the message's pose snapshot at ``t_sense`` (§5.1, §13)."""
+        pose = message.data.get("pose", {})
+        vel = message.data.get("vel", {})
+        return VehicleNodeInput(
+            actor_id=int(message.sender_id),
+            is_ego=False,
+            agent_slot=int(agent_slot),
+            x=float(pose.get("x", 0.0)),
+            y=float(pose.get("y", 0.0)),
+            z=float(pose.get("z", 0.0)),
+            vx=float(vel.get("vx", 0.0)),
+            vy=float(vel.get("vy", 0.0)),
+            yaw=float(pose.get("yaw", 0.0)),
+            q_comm=1.0,
+            q_comp=1.0,
+            route_xy=(),
         )
-        ego_visible = [s for s in objects if bool(s.visible_to_ego)]
+
+    def _build_wam_graph(self, step: Optional[int] = None) -> None:
+        """Assemble the cooperative graph from the **receive queue** (§12-§14).
+
+        The graph at time ``t`` is decided by the messages actually available (Tw / policy
+        filtered), not by the policy directly: no available messages -> ego-only *local* graph;
+        otherwise a V2V graph whose ``veh_veh`` edges carry the **measured** latency ``L_M``.
+        Collaborator observations come from each message's ``t_sense`` snapshot; ego's own
+        observation uses its live local sensing at ``t``.
+        """
+        if step is None:
+            step = int(getattr(self, "_time_step", 0))
+        proc = self._ensure_comm_process()
+        messages = proc.available_messages(int(step)) if proc.policy is not None else []
+        dt = float(self._comm_config.dt)
+        live_states = list(getattr(self, "_wam_object_states", []))
+
+        ego = self._wam_vehicle_node_input(self.ego, is_ego=True, agent_slot=0, route_xy=self._wam_route_xy())
+        ego_visible = [s for s in live_states if bool(s.visible_to_ego)]
         observations = [
             ObservationNodeInput(
                 vehicle_id=int(self.ego.id),
@@ -630,56 +804,64 @@ class V2VCommMixin:
             )
         ]
 
-        collaborators = []
-        latency_by_vehicle: dict = {}
-        slot = 1
-        out_degree = max(len(selected), 1)
-        for vid in selected:
-            actor = self._get_group_member_actor(vid)
-            if actor is None:
-                continue
-            collaborators.append(self._wam_vehicle_node_input(actor, is_ego=False, agent_slot=slot))
-            slot += 1
-            modality = str(policy.modality_by_vehicle.get(vid, self._wam_default_modality))
-            bev_raster = None
-            if modality == "bev":
-                observed_ids = ()
-                payload = self._wam_bev_payload_bytes()
-                # rasterize this collaborator's visibility-aware B^sem (only objects it can see).
-                vis_objs = [s for s in objects if int(vid) in s.visible_to_collaborators]
-                tf = actor.get_transform()
-                veh_pose = (float(tf.location.x), float(tf.location.y), float(tf.rotation.yaw))
-                bev_raster = rasterize_bev(veh_pose, vis_objs, route_xy=(), spec=self._wam_bev_spec)
-            else:
-                observed_ids = tuple(int(s.actor_id) for s in objects if int(vid) in s.visible_to_collaborators)
-                payload = self._wam_objlist_payload_bytes(len(observed_ids))
-            latency_s = float(
-                self.latency_model.compute_latency_s(
-                    sender=actor,
-                    receiver=self.ego,
-                    payload_size_bytes=int(payload),
-                    sender_res=self._veh_net_res.get(int(vid), self._default_net_res),
-                    receiver_res=self._default_net_res,
-                    out_degree=out_degree,
-                    in_degree=out_degree,
-                )
-            )
-            freshness = math.exp(-float(self._wam_graph_gamma_freshness) * latency_s)
-            latency_by_vehicle[int(vid)] = latency_s
-            observations.append(
-                ObservationNodeInput(
-                    vehicle_id=int(vid),
-                    modality=modality,
-                    observed_object_ids=observed_ids,
-                    payload_bytes=payload,
-                    latency_s=latency_s,
-                    freshness=freshness,
-                    quality=1.0,
-                    sample_age_s=0.0,
-                    bev_raster=bev_raster,
-                )
-            )
+        # Most-recent message per collaborator (§13.2): its latency drives the veh_veh edge.
+        latest_by_sender: Dict[int, Any] = {}
+        for message in messages:
+            current = latest_by_sender.get(int(message.sender_id))
+            if current is None or int(message.t_sense) >= int(current.t_sense):
+                latest_by_sender[int(message.sender_id)] = message
 
+        collaborators: List[VehicleNodeInput] = []
+        latency_by_vehicle: Dict[int, float] = {}
+        modality_by_vehicle: Dict[int, tuple] = {}
+        objects_by_id: Dict[int, ObjectState] = {}
+        slot = 1
+        for sender_id, message in sorted(latest_by_sender.items()):
+            collaborators.append(self._wam_collaborator_node_from_message(message, agent_slot=slot))
+            slot += 1
+            latency_s = float(message.total_latency)
+            latency_by_vehicle[int(sender_id)] = latency_s
+            freshness = math.exp(-float(self._wam_graph_gamma_freshness) * latency_s)
+            sample_age = float(int(step) - int(message.t_sense)) * dt
+            modalities = tuple(message.modalities)
+            modality_by_vehicle[int(sender_id)] = modalities
+            for snap_state in message.data.get("object_states", ()):  # snapshot @ t_sense
+                objects_by_id.setdefault(int(snap_state.actor_id), snap_state)
+            for modality in modalities:
+                if modality == "bev":
+                    observed_ids: tuple = ()
+                    bev_raster = message.data.get("bev")
+                    payload = self._wam_bev_payload_bytes()
+                else:
+                    observed_ids = tuple(message.data.get("objlist", {}).get("observed_object_ids", ()))
+                    bev_raster = None
+                    payload = self._wam_objlist_payload_bytes(len(observed_ids))
+                observations.append(
+                    ObservationNodeInput(
+                        vehicle_id=int(sender_id),
+                        modality=modality,
+                        observed_object_ids=observed_ids,
+                        payload_bytes=payload,
+                        latency_s=latency_s,
+                        freshness=freshness,
+                        quality=1.0,
+                        sample_age_s=sample_age,
+                        bev_raster=bev_raster,
+                    )
+                )
+
+        # Ego's fresh local states override stale snapshot states for the same object.
+        for state in ego_visible:
+            objects_by_id[int(state.actor_id)] = state
+        objects = list(objects_by_id.values())
+
+        policy_view = WAMPolicy(
+            selected_vehicle_ids=tuple(sorted(latest_by_sender.keys())),
+            modality_by_vehicle=modality_by_vehicle,
+            bandwidth_by_vehicle={},
+            frequency_steps=int(self._comm_config.sensor_period_steps),
+            reason="receive_queue",
+        )
         spec = GraphBuildSpec(
             route_waypoints=int(self._wam_graph_route_waypoints),
             max_object_nodes=int(self._wam_graph_max_object_nodes),
@@ -690,7 +872,7 @@ class V2VCommMixin:
             collaborators=collaborators,
             objects=objects,
             observations=observations,
-            policy=policy,
+            policy=policy_view,
             spec=spec,
             notable_ids=notable_ids,
             latency_by_vehicle=latency_by_vehicle,
@@ -723,6 +905,8 @@ class V2VCommMixin:
 
     def _wam_info(self) -> Dict[str, Any]:
         self._update_wam_runtime_state()
+        if self._wam_build_graph:
+            self._build_wam_graph(int(getattr(self, "_time_step", 0)))
         notable = list(getattr(self, "_wam_notable_records", []))
         policy = getattr(self, "_wam_policy", None)
         info = {
@@ -743,126 +927,6 @@ class V2VCommMixin:
             info.update(hetero_graph_stats(graph))
         return info
 
-    def _enqueue_message(
-        self,
-        group_id: int,
-        sender_id: int,
-        receiver_id: int,
-        payload: Dict[str, Any],
-        payload_bytes: int,
-        latency_s: float,
-        distance_m: float,
-        fixed_dt: float,
-    ) -> None:
-        delay_steps = max(int(math.ceil(latency_s / max(fixed_dt, 1e-6))), 0)
-        deliver_step = int(self._time_step + delay_steps)
-        self._in_flight.append(
-            V2VMessage(
-                sender_id=int(sender_id),
-                receiver_id=int(receiver_id),
-                group_id=int(group_id),
-                payload=payload,
-                payload_bytes=int(payload_bytes),
-                created_step=int(self._time_step),
-                deliver_step=deliver_step,
-                latency_s=float(latency_s),
-                distance_m=float(distance_m),
-            )
-        )
-
-    def _run_group_communication(self) -> None:
-        self._update_wam_runtime_state()
-        candidate_ids = set(self.coop_participant_ids)
-        # Collaboration policy selects the subset that shares with the ego this step.
-        selected = set(self._select_collaborators(candidate_ids)) & candidate_ids
-        self.selected_collaborators = selected
-        if not selected:
-            return
-
-        # Communicating members = ego + the policy-selected collaborators (full-mesh).
-        member_ids = [int(self.ego.id)] + sorted(selected)
-        actor_map = self._build_group_actor_map()
-        fixed_dt = float(self._world._settings.fixed_delta_seconds)
-        degree = max(len(member_ids) - 1, 0)  # contention degree for this round
-        enqueued_count = 0
-        sender_ids = set()
-        total_payload_bytes = 0
-
-        for sender_id in member_ids:
-            sender = actor_map.get(int(sender_id))
-            if sender is None:
-                continue
-            sender_ids.add(int(sender_id))
-            payload = self._make_payload(sender)
-            payload_bytes = _tx_bytes_for_latency(
-                payload,
-                overhead_bytes=getattr(self.latency_model, "overhead_bytes", 64),
-            )
-            for receiver_id in member_ids:
-                if int(receiver_id) == int(sender_id):
-                    continue
-                receiver = actor_map.get(int(receiver_id))
-                if receiver is None:
-                    continue
-                sender_res = self._veh_net_res.get(int(sender_id), self._default_net_res)
-                receiver_res = self._veh_net_res.get(int(receiver_id), self._default_net_res)
-                latency_s = self.latency_model.compute_latency_s(
-                    sender=sender,
-                    receiver=receiver,
-                    payload_size_bytes=payload_bytes,
-                    sender_res=sender_res,
-                    receiver_res=receiver_res,
-                    out_degree=max(degree, 1),
-                    in_degree=max(degree, 1),
-                )
-                self._enqueue_message(
-                    group_id=GROUP_ID,
-                    sender_id=int(sender_id),
-                    receiver_id=int(receiver_id),
-                    payload=payload,
-                    payload_bytes=payload_bytes,
-                    latency_s=latency_s,
-                    distance_m=_dist_m(sender, receiver),
-                    fixed_dt=fixed_dt,
-                )
-                enqueued_count += 1
-                total_payload_bytes += int(payload_bytes)
-        runtime_cfg = get_runtime_logging_config()
-        if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=V2V_LOGGER):
-            V2V_LOGGER.debug(
-                "Communication round step=%d candidates=%s selected=%s senders=%s enqueued=%d in_flight=%d payload_bytes=%d",
-                self._time_step,
-                sorted(candidate_ids),
-                sorted(selected),
-                sorted(sender_ids),
-                enqueued_count,
-                len(self._in_flight),
-                total_payload_bytes,
-            )
-
-    def _deliver_messages(self) -> None:
-        if not self._in_flight:
-            return
-        current_step = int(self._time_step)
-        remaining: List[V2VMessage] = []
-        delivered_count = 0
-        for msg in self._in_flight:
-            if int(msg.deliver_step) <= current_step:
-                self._received[int(msg.receiver_id)].append(msg)
-                delivered_count += 1
-            else:
-                remaining.append(msg)
-        self._in_flight = remaining
-        runtime_cfg = get_runtime_logging_config()
-        if should_log_periodic(current_step, int(runtime_cfg["step_debug_interval"]), logger=V2V_LOGGER):
-            V2V_LOGGER.debug(
-                "Delivered messages step=%d delivered=%d remaining_in_flight=%d ego_received=%d",
-                current_step,
-                delivered_count,
-                len(self._in_flight),
-                len(self._received.get(int(self.ego.id), deque())),
-            )
-
     # =========================================================
     # Graph info construction
     # =========================================================
@@ -873,7 +937,8 @@ class V2VCommMixin:
             self.obs,
             self.feature_size,
         )
-        msgs = self._received.get(int(self.ego.id), deque())
+        proc = self._ensure_comm_process()
+        msgs = proc.available_messages(int(self._time_step)) if proc.policy is not None else []
         device = "cuda" if torch.cuda.is_available() else "cpu"
         return self._graph_builder.build(
             ego_actor=self.ego,
@@ -910,7 +975,8 @@ class V2VCommMixin:
         if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=V2V_LOGGER):
             valid_nodes = int(np.asarray(shared_data.get("node_mask", np.zeros(0))).sum())
             edge_index = np.asarray(shared_data.get("edge_index", np.zeros((2, 0))))
-            msg_count = len(self._received.get(int(self.ego.id), deque()))
+            proc = self._ensure_comm_process()
+            msg_count = len(proc.available_messages(int(self._time_step))) if proc.policy is not None else 0
             V2V_LOGGER.debug(
                 "Step info merged step=%d valid_nodes=%d num_edges=%d ego_received_msgs=%d reward_keys=%s",
                 self._time_step,

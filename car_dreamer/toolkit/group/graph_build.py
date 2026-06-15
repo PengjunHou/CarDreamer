@@ -115,12 +115,12 @@ class VehicleNodeGraphBuilder:
         )
 
         # 1) 选窗口内消息 + 按 sender 分组
+        # 消息已由通信进程按 Tw 过滤(基于 sense 时间);此处用 sense 时间做二次窗口约束,
+        # 与 Communication Model §11 的 ``t - Tw <= t_sense <= t`` 一致。
         msgs_by_sender: Dict[int, List[Any]] = {}
         for m in msgs:
-            # 用“到达时间”判定是否在窗口内
-            t_deliver = float(m.deliver_step) * float(dt)
-            # print(f"[Build] t_now: {t_now}, t_deliver: {t_deliver}, window_s: {cfg.window_s}, diff: {t_now - t_deliver}")
-            if (t_now - t_deliver) <= cfg.window_s:
+            t_sense = float(m.t_sense) * float(dt)
+            if (t_now - t_sense) <= cfg.window_s:
                 sid = int(m.sender_id)
                 msgs_by_sender.setdefault(sid, []).append(m)
 
