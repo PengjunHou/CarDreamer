@@ -61,7 +61,7 @@ def make_scene(*, selected):
     policy = WAMPolicy(
         selected_vehicle_ids=tuple(selected),
         modality_by_vehicle={vid: "objlist" for vid in selected},
-        bandwidth_by_vehicle={vid: 3e6 for vid in selected},
+        bandwidth_by_vehicle={vid: 1.0 for vid in selected},
         frequency_steps=5,
         reason="test",
     )
@@ -194,7 +194,7 @@ class WAMGraphModelTest(unittest.TestCase):
         # collaborator shares BEV instead of objlist (placeholder z^bev).
         bev_obs = ObservationNodeInput(vehicle_id=2, modality="bev", observed_object_ids=(), payload_bytes=131072.0, latency_s=0.05, freshness=0.6)
         observations = [observations[0], bev_obs]
-        policy = WAMPolicy(selected_vehicle_ids=(2,), modality_by_vehicle={2: "bev"}, bandwidth_by_vehicle={2: 3e6}, frequency_steps=5, reason="bev")
+        policy = WAMPolicy(selected_vehicle_ids=(2,), modality_by_vehicle={2: "bev"}, bandwidth_by_vehicle={2: 1.0}, frequency_steps=5, reason="bev")
         data = build_wam_hetero_graph(
             ego=ego, collaborators=[collab], objects=objects, observations=observations, policy=policy,
         )

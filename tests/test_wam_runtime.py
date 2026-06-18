@@ -120,20 +120,21 @@ class WAMRuntimeTest(unittest.TestCase):
         policy = build_placeholder_policy(
             request=request,
             candidate_vehicle_ids={21, 20},
-            uplink_bps=6000000.0,
+            bandwidth_ratio=0.5,
             frequency_steps=1,
             default_modality="objlist",
         )
 
         self.assertEqual(policy.selected_vehicle_ids, (20, 21))
         self.assertEqual(policy.modality_by_vehicle, {20: "objlist", 21: "objlist"})
-        self.assertAlmostEqual(policy.bandwidth_by_vehicle[20], 3000000.0)
+        self.assertAlmostEqual(policy.bandwidth_by_vehicle[20], 0.5)
+        self.assertAlmostEqual(policy.bandwidth_by_vehicle[21], 0.5)
 
     def test_placeholder_policy_is_empty_without_request(self):
         policy = build_placeholder_policy(
             request=None,
             candidate_vehicle_ids={20, 21},
-            uplink_bps=6000000.0,
+            bandwidth_ratio=1.0,
             frequency_steps=1,
             default_modality="objlist",
         )

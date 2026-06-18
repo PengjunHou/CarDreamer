@@ -96,24 +96,17 @@ step, policy_label, policy_id=None, extra=None)`:从 [graph.py](car_dreamer/tool
 - `write_graph_timeline_html(records, html, fps)` **自包含交互 HTML**:每帧渲成内嵌 base64 PNG +
   `<input type=range>` **时间步滑块** + ▶/⏸ 播放 + 每步 caption。
 `group_records_to_frames` 把扁平 record 列表按 **`(episode, step)`** 分帧(episode 取 `extra.episode`,
-默认 0),所以**不同 episode 的同号步不会串到同一帧**;每帧 `panels{label:record}`(mode-A 一 panel,
-mode-B 一帧多 panel 竖排)。`append_record_jsonl/load_records_jsonl` 做 JSONL 持久化。
+默认 0),所以**不同 episode 的同号步不会串到同一帧**;每帧 `panels{label:record}`。
+`append_record_jsonl/load_records_jsonl` 做 JSONL 持久化。
 
 ---
 
-## 4. 两种数据来源(都支持)
+## 4. 数据来源
 
-- **mode-A(实际时间线,需 CARLA)** [scripts/record_wam_graph_timeline.py](scripts/record_wam_graph_timeline.py):
+- **实际时间线(需 CARLA)** [scripts/record_wam_graph_timeline.py](scripts/record_wam_graph_timeline.py):
   仿 run_env 逐步跑 env,每步把 `sim._wam_graph` + 当前激活 policy(`sim._comm_process.policy`:local /
   coop[ids])抽成 record 追加进 JSONL。**只录单个 episode**:episode 结束(terminated/truncated)即停止,
   不再 reset 续录(避免不同 episode 步号撞车串帧)。policy 随 Td 切换体现为一个 episode 内的变化。
-- **mode-B(反事实并排,需 CARLA)** [scripts/record_wam_stage1_policy_data.py](scripts/record_wam_stage1_policy_data.py)
-  `--graph-timeline-jsonl PATH`:复用已有的 `_policy_graphs_for_step`(每步对固定 policy 家族
-  `enumerate_stage1_policies` + `build_stage1_policy_graph` 各建一张图),每张图额外抽一条 timeline
-  record(`policy_label = policy_label(type, selected)`)写入同一 JSONL。**设了该开关时只录单个 episode**
-  (一个 episode 内候选车集合稳定,`all_candidates_*` 是同一组,不跨 episode 串帧);不设时仍是原本的
-  多 episode 训练数据采集。离线 `--policies` 按 **policy 家族名**(`extra.policy_type` / 标签前缀)过滤,
-  所以 `all_candidates_objlist` 能匹中带 id 后缀的 `all_candidates_objlist[551,554,...]`。
 
 离线渲染 [scripts/visualize_wam_graph_timeline.py](scripts/visualize_wam_graph_timeline.py)
 `--jsonl IN --html/--gif/--png-dir [--policies a,b] [--fps]`(CARLA-free)。
@@ -125,15 +118,13 @@ mode-B 一帧多 panel 竖排)。`append_record_jsonl/load_records_jsonl` 做 JS
 1. **单一 matplotlib 渲染核**喂 PNG+GIF+HTML;「交互」= 滑块翻 matplotlib 帧,延迟/新鲜度/policy
    直接画进帧,无需 hover。plotly 原生节点-边图(每帧重建箭头注记)对「逐步变结构」太繁琐,暂不做。
 2. **车辆友好短标签**用枚举 `V1/V2`(真实 actor id 以小字 `id=` 标注),不强绑 node_id;对象标 `O<id>`。
-3. mode-B 的 `latency_by_vehicle` 仍走旧的 `latency_model.compute_latency_s`(瞬时,反事实场景没有真实
-   发送队列);mode-A 是接收队列里的实测 `L_M`。两者口径不同,已分别标注。
-4. 对象超过 `max_object_nodes` 会被图构建侧截断(可视化只画图里实际有的)。
+3. 对象超过 `max_object_nodes` 会被图构建侧截断(可视化只画图里实际有的)。
 
 ---
 
 ## 6. 后续计划
 
-- HTML 增加 per-policy 复选(mode-B 并排时动态增删 panel)与按 `policy_id` 着色的时间轴缩略带。
+- HTML 增加 per-policy 复选(多 panel 时动态增删 panel)与按 `policy_id` 着色的时间轴缩略带。
 - 帧上叠加 BEV 缩略图(对 bev modality 的观测节点),把 `docs/wam_bev.md` 的栅格和结构图并看。
 - 可选 plotly 原生交互(hover 看完整 obs 标量/edge attr),用于精细排查。
 
@@ -147,7 +138,7 @@ modality 标签、`veh_veh` 延迟、`obs_obj` 置信度、JSONL round-trip)、�
 matplotlib 渲染返回非空 Figure、**V/O 标签 + notable=红/非notable=灰 填充**(拓扑)、**record 含 ego-frame 位置
 + class_id/朝向/尺寸 且拓扑+BEV 两栏**、**有 birdeye 图时 BEV 用 imshow(按 ego id+step 解析路径)且叠加
 `EGO` 星标/`O<id>`**、**vehicle 类 object 叠成 `Polygon` 框(数量==车类对象数)+ BEV 坐标轴恒等于图像边界
-(固定不抖)**、**HTML 用独立 per-policy `<img>`**、mode-A 单 panel / mode-B 多 panel 分帧、
+(固定不抖)**、**HTML 用独立 per-policy `<img>`**、单 panel / 多 panel 分帧、
 **`(episode, step)` 分帧不串帧**、PNG/GIF/HTML 写出非空。
 
 运行:`conda run -n cardreamer_gnn python -m unittest tests.test_wam_graph_timeline_viz`(14 项);

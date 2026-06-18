@@ -56,7 +56,7 @@ def _graph(*, selected, modalities=None, latency=None):
     policy = WAMPolicy(
         selected_vehicle_ids=tuple(selected),
         modality_by_vehicle={vid: modalities.get(vid, "objlist") for vid in selected},
-        bandwidth_by_vehicle={vid: 3e6 for vid in selected}, frequency_steps=5, reason="test",
+        bandwidth_by_vehicle={vid: 1.0 for vid in selected}, frequency_steps=5, reason="test",
     )
     return build_wam_hetero_graph(
         ego=ego, collaborators=[collab2, collab3], objects=objects, observations=observations,

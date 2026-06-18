@@ -64,7 +64,7 @@ def policy_key(policy_type: str, policy: WAMPolicy) -> str:
 def enumerate_stage1_policies(
     candidate_vehicle_ids: Iterable[int],
     *,
-    uplink_bps: float,
+    bandwidth_ratio: float,
     frequency_steps: int,
 ) -> List[Tuple[str, WAMPolicy]]:
     """Rule-enumerate the Stage-1 policy family for one live step."""
@@ -85,11 +85,11 @@ def enumerate_stage1_policies(
 
     def make_policy(policy_type: str, selected: Sequence[int], modality: str) -> WAMPolicy:
         selected_tuple = tuple(int(v) for v in selected)
-        share = float(uplink_bps) / float(len(selected_tuple)) if selected_tuple else 0.0
+        ratio = min(max(float(bandwidth_ratio), 0.0), 1.0) if selected_tuple else 0.0
         return WAMPolicy(
             selected_vehicle_ids=selected_tuple,
             modality_by_vehicle={vid: str(modality) for vid in selected_tuple},
-            bandwidth_by_vehicle={vid: share for vid in selected_tuple},
+            bandwidth_by_vehicle={vid: ratio for vid in selected_tuple},
             frequency_steps=freq,
             reason=f"stage1_{policy_type}",
         )

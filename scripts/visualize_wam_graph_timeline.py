@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Render a recorded WAM cooperative-graph timeline (JSONL) to HTML / PNG / GIF.
 
-CARLA-free. Reads the JSONL produced by ``scripts/record_wam_graph_timeline.py`` (mode-A: actual
-per-step graph under the active policy) or by the counterfactual emitter in
-``scripts/record_wam_stage1_policy_data.py`` (mode-B: several fixed policies per step) and writes:
+CARLA-free. Reads the JSONL produced by ``scripts/record_wam_graph_timeline.py`` (actual per-step
+graph under the active policy) and writes:
 
   * an interactive HTML with a time-step slider (``--html``),
   * one PNG per step (``--png-dir``),
   * an animated GIF (``--gif``).
 
-For mode-B, records that share a step are laid out side by side (one panel per policy), so policies
-are compared at the same step. Use ``--policies`` to restrict which policy labels are shown.
+Records that share a step are laid out as separate panels. Use ``--policies`` to restrict which
+policy labels are shown.
 
 Examples
 --------
@@ -33,9 +32,9 @@ if str(REPO_ROOT) not in sys.path:
 def _policy_matches(record, keep) -> bool:
     """Match a record against --policies tokens.
 
-    mode-B labels carry an actor-id suffix (e.g. ``all_candidates_objlist[551,554]``), so a clean
-    family name like ``all_candidates_objlist`` is matched against the record's ``extra.policy_type``
-    AND the label's prefix (text before ``[``), not just the full label.
+    Labels can carry an actor-id suffix (e.g. ``coop[551,554]``), so a clean family name is matched
+    against the record's ``extra.policy_type`` AND the label's prefix (text before ``[``), not just
+    the full label.
     """
     label = str(record.get("policy_label", ""))
     base = label.split("[", 1)[0]
@@ -50,9 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gif", default=None, help="write animated GIF to this path")
     parser.add_argument("--png-dir", default=None, help="write one PNG per step into this directory")
     parser.add_argument("--policies", default=None,
-                        help="comma-separated policy family names or labels to keep (mode-B). "
-                             "Family names (e.g. all_candidates_objlist) match the actor-id-suffixed "
-                             "labels too. Default: all.")
+                        help="comma-separated policy family names or labels to keep. Family names "
+                             "match actor-id-suffixed labels too. Default: all.")
     parser.add_argument("--birdeye-dir", default=None,
                         help="directory of real CARLA birdeye dumps (data/birdeye_frames). When given, "
                              "the BEV panel uses <dir>/vehicle_<egoid>/birdeye_<step>.png as background "

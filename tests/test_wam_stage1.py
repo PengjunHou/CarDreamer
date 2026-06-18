@@ -156,7 +156,7 @@ class RecorderTest(unittest.TestCase):
 
 class PolicyAugmentedStage1Test(unittest.TestCase):
     def test_policy_enumeration_covers_fixed_family(self):
-        policies = enumerate_stage1_policies([3, 2], uplink_bps=6_000_000.0, frequency_steps=5)
+        policies = enumerate_stage1_policies([3, 2], bandwidth_ratio=1.0, frequency_steps=5)
         types = [name for name, _ in policies]
         self.assertEqual(types.count("ego_only"), 1)
         self.assertEqual(types.count("single_candidate_objlist"), 2)
@@ -166,7 +166,7 @@ class PolicyAugmentedStage1Test(unittest.TestCase):
         all_obj = next(policy for name, policy in policies if name == "all_candidates_objlist")
         self.assertEqual(all_obj.selected_vehicle_ids, (2, 3))
         self.assertTrue(all(v == "objlist" for v in all_obj.modality_by_vehicle.values()))
-        self.assertAlmostEqual(sum(all_obj.bandwidth_by_vehicle.values()), 6_000_000.0)
+        self.assertTrue(all(v == 1.0 for v in all_obj.bandwidth_by_vehicle.values()))
 
     def test_policy_graphs_change_with_selection_and_modality(self):
         ego, collaborators, objects = policy_scene_inputs()

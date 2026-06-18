@@ -206,19 +206,15 @@ env:
     allow_cross_policy_messages: False  # §11 -- use only the active policy's messages
     collaborator_modalities: [objlist]  # bundled modalities each collaborator streams per message
     # --- transmission rate model (policy-allocated bandwidth + FSPL/SNR, §8) ---
-    uplink_bps: 6000000.0     # total uplink bandwidth split across collaborators (bps)
-    downlink_bps: 12000000.0  # per-vehicle downlink bandwidth (bps, legacy latency model)
-    bandwidth_hz: 10000000.0  # channel bandwidth for Shannon rate (Hz)
+    policy_bandwidth_hz: 6000000.0  # base bandwidth (Hz); actual B = policy_bandwidth_hz * ratio
+    bandwidth_ratio: 1.0       # per-collaborator bandwidth ratio in [0, 1]; ratios need not sum to 1
     tx_power_dbm: 20.0        # transmit power (dBm)
     noise_figure_db: 9.0      # receiver noise figure (dB)
     carrier_freq_hz: 5900000000.0  # carrier frequency (Hz)
     distance_decay_m: 60.0    # distance decay constant for the rate model (meters)
     min_rate_factor: 0.2      # minimum rate factor (prevents rate from dropping to zero)
     overhead_bytes: 64        # fixed protocol overhead per message (bytes)
-    # --- legacy SimpleWirelessLatency knobs (kept for offline Stage-1 recording scripts) ---
     group_update_period: 20   # how often to recompute groups (steps)
-    base_rtt_s: 0.02          # base round-trip time (seconds)
-    jitter_s: 0.0             # random jitter added to latency (seconds, 0 = disabled)
 
   wam:
     enabled: True

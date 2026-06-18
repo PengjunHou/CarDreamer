@@ -621,8 +621,7 @@ def group_records_to_frames(records: Sequence[Mapping[str, Any]]) -> List[Dict[s
 
     Frames are keyed by ``(episode, step)`` -- the episode comes from ``record.extra.episode``
     (default 0) -- so records from different episodes that share a step number do NOT collide into
-    the same frame. Each frame's ``panels`` map holds one record per policy label (mode-A: a single
-    panel; mode-B counterfactual: one panel per fixed policy).
+    the same frame. Each frame's ``panels`` map holds one record per policy label.
     """
     by_key: Dict[Tuple[int, int], Dict[str, Any]] = {}
     for rec in records:
@@ -783,7 +782,7 @@ def write_graph_timeline_html(
     """Write a self-contained interactive HTML: a time-step slider over per-step frames.
 
     Each frame embeds its policies as **independent images** (one per policy, stacked one per row),
-    not a single composite image, so mode-B policy panels stay separate and fixed-size.
+    not a single composite image, so policy panels stay separate and fixed-size.
     """
     frames = group_records_to_frames(records)
     if not frames:

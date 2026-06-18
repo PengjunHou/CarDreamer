@@ -50,10 +50,8 @@ from .toolkit import (
     CommPolicy,
     CommunicationProcess,
     GraphBuildConfig,
-    NetResource,
     Observer,
     SenseSnapshot,
-    SimpleWirelessLatency,
     VehicleNodeGraphBuilder,
     _dist_m,
     get_vehicle_pos,
@@ -90,7 +88,7 @@ class V2VCommMixin:
     # =========================================================
 
     def _init_v2v(self) -> None:
-        """Initialize cooperative-group state, latency model, and graph builder.
+        """Initialize cooperative-group state, communication process, and graph builder.
 
         Call once from the host env ``__init__`` after ``super().__init__()``.
         """
@@ -106,33 +104,23 @@ class V2VCommMixin:
         # Per-episode probability that each camera vehicle joins cooperative perception.
         self.coop_participation_prob = float(getattr(self._config, "coop_participation_prob", 0.5))
 
-        # --- communication config / latency model ---
+        # --- communication config / link-rate model ---
         comm_cfg = getattr(self._config, "communication", None)
         self.group_update_period = int(getattr(comm_cfg, "group_update_period", 20))
-        uplink_bps = float(getattr(comm_cfg, "uplink_bps", 6e6))
-        downlink_bps = float(getattr(comm_cfg, "downlink_bps", 12e6))
-        base_rtt_s = float(getattr(comm_cfg, "base_rtt_s", 0.02))
+        policy_bandwidth_hz = float(getattr(comm_cfg, "policy_bandwidth_hz", 6e6))
+        bandwidth_ratio = float(getattr(comm_cfg, "bandwidth_ratio", 1.0))
         proc_delay_s = float(getattr(comm_cfg, "proc_delay_s", 0.05))
         distance_decay_m = float(getattr(comm_cfg, "distance_decay_m", 60.0))
         min_rate_factor = float(getattr(comm_cfg, "min_rate_factor", 0.2))
-        jitter_s = float(getattr(comm_cfg, "jitter_s", 0.0))
         overhead_bytes = int(getattr(comm_cfg, "overhead_bytes", 64))
-        self._comm_uplink_bps = uplink_bps
-        self._default_net_res = NetResource(uplink_bps=uplink_bps, downlink_bps=downlink_bps)
-        # Kept for backward compatibility (offline Stage-1 recording scripts call compute_latency_s).
-        self.latency_model = SimpleWirelessLatency(
-            base_rtt_s=base_rtt_s,
-            proc_delay_s=proc_delay_s,
-            distance_decay_m=distance_decay_m,
-            min_rate_factor=min_rate_factor,
-            jitter_s=jitter_s,
-            overhead_bytes=overhead_bytes,
-        )
+        self._comm_policy_bandwidth_hz = policy_bandwidth_hz
+        self._comm_bandwidth_ratio = float(np.clip(bandwidth_ratio, 0.0, 1.0))
+        self._comm_overhead_bytes = overhead_bytes
         # FSPL / SNR parameters for the policy-conditioned per-message transmission rate (§8).
         self._comm_rate_params = dict(
-            tx_power_dbm=float(getattr(comm_cfg, "tx_power_dbm", self._default_net_res.tx_power_dbm)),
-            noise_figure_db=float(getattr(comm_cfg, "noise_figure_db", self._default_net_res.noise_figure_db)),
-            carrier_freq_hz=float(getattr(comm_cfg, "carrier_freq_hz", self._default_net_res.carrier_freq_hz)),
+            tx_power_dbm=float(getattr(comm_cfg, "tx_power_dbm", 20.0)),
+            noise_figure_db=float(getattr(comm_cfg, "noise_figure_db", 9.0)),
+            carrier_freq_hz=float(getattr(comm_cfg, "carrier_freq_hz", 5.9e9)),
             distance_decay_m=distance_decay_m,
             min_rate_factor=min_rate_factor,
         )
@@ -161,7 +149,6 @@ class V2VCommMixin:
 
         self.payload_fn = payload_fn_llm
         self.trans_msg_type = str(getattr(self._config, "trans_msg_type", "image"))
-        self._veh_net_res: Dict[int, NetResource] = {}
 
         # --- graph builder ---
         self.feature_size = int(getattr(self._config, "feature_size", 64))
@@ -278,7 +265,6 @@ class V2VCommMixin:
         self._actor_cache = {}
         self._comm_process = None  # lazily (re)created per episode once the ego exists
         self._comm_policy_counter = 0
-        self._veh_net_res = {}
         self._reset_wam_runtime_state()
         V2V_LOGGER.debug("V2V runtime state reset.")
 
@@ -367,13 +353,15 @@ class V2VCommMixin:
         self._comm_policy_counter += 1
         return pid
 
-    def _link_rate_bps(self, sender_id: int, distance_m: float, bandwidth_hz: float) -> float:
-        """Policy-conditioned Shannon link rate m -> ego (§8); ``bandwidth_hz`` is B^π_{m,q}."""
-        return shannon_rate_bps(float(distance_m), float(bandwidth_hz), **self._comm_rate_params)
+    def _link_rate_bps(self, sender_id: int, distance_m: float, bandwidth_ratio: float) -> float:
+        """Policy-conditioned Shannon link rate m -> ego (§8)."""
+        ratio = float(np.clip(float(bandwidth_ratio), 0.0, 1.0))
+        bandwidth_hz = float(self._comm_policy_bandwidth_hz) * ratio
+        return shannon_rate_bps(float(distance_m), bandwidth_hz, **self._comm_rate_params)
 
     def _build_coop_policy(self, step: int, candidates: List[int]) -> CommPolicy:
         """Base-Station cooperative policy: all candidates collaborate, bundled modalities (§3)."""
-        share = float(self._comm_uplink_bps) / float(max(len(candidates), 1))
+        bandwidth_ratio = float(self._comm_bandwidth_ratio)
         modalities = tuple(self._collaborator_modalities)
         return CommPolicy(
             policy_id=self._next_policy_id(),
@@ -382,7 +370,7 @@ class V2VCommMixin:
             duration_steps=int(self._comm_config.policy_duration_steps),
             selected_collaborators=tuple(int(c) for c in candidates),
             modalities_by_vehicle={int(c): modalities for c in candidates},
-            bandwidth_by_vehicle={int(c): share for c in candidates},
+            bandwidth_by_vehicle={int(c): bandwidth_ratio for c in candidates},
             reason="coop_request",
         )
 
@@ -453,7 +441,7 @@ class V2VCommMixin:
             if feat_dim is not None:
                 data["feat_dim"] = int(feat_dim)
 
-        overhead = int(getattr(self.latency_model, "overhead_bytes", 64))
+        overhead = int(getattr(self, "_comm_overhead_bytes", 64))
         payload_size = overhead
         for modality in modalities:
             if modality == "bev":
@@ -748,7 +736,7 @@ class V2VCommMixin:
         )
 
     def _wam_objlist_payload_bytes(self, n_objects: int) -> float:
-        overhead = int(getattr(self.latency_model, "overhead_bytes", 64))
+        overhead = int(getattr(self, "_comm_overhead_bytes", 64))
         return float(max(int(n_objects), 0) * OBJECT_STATE_DIM * 4 + overhead)
 
     def _wam_bev_payload_bytes(self) -> float:

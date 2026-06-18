@@ -73,7 +73,7 @@ CarDreamer task 中，使其具备与 `carla_group_right_turn_auto` 一致的协
   env.graph.star_graph: true
 ```
 
-> `env.communication.*`（时延模型参数：`comm_period`、`uplink_bps` 等）已在
+> `env.communication.*`（时延模型参数：`comm_period`、`policy_bandwidth_hz` 等）已在
 > [`common.yaml`](../car_dreamer/configs/common.yaml) 给了全局默认值，**通常不用写**，需要时再覆盖。
 
 ---

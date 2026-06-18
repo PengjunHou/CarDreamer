@@ -242,13 +242,13 @@ class InferenceModesTest(unittest.TestCase):
 class PolicyCodecTest(unittest.TestCase):
     def test_encode_layout(self):
         policy = WAMPolicy(selected_vehicle_ids=(20,), modality_by_vehicle={20: "bev"},
-                           bandwidth_by_vehicle={20: 3.5}, frequency_steps=4, reason="t")
+                           bandwidth_by_vehicle={20: 0.5}, frequency_steps=4, reason="t")
         vec = encode_policy(policy, candidate_ids=[20, 21], max_members=3, num_formats=2)
         self.assertEqual(vec.shape, (3, 5))  # P = sel(1)+fmt(2)+freq(1)+bw(1)
         self.assertEqual(float(vec[0, 0]), 1.0)
         self.assertEqual(float(vec[0, 1 + 1]), 1.0)
         self.assertEqual(float(vec[0, 3]), 4.0)
-        self.assertEqual(float(vec[0, 4]), 3.5)
+        self.assertEqual(float(vec[0, 4]), 0.5)
         self.assertTrue(bool((vec[2] == 0).all()))
 
     def test_encode_chunk_shape(self):

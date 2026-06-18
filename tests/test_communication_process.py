@@ -22,7 +22,7 @@ REQUEST_ID = 1
 COLLAB_ID = 2
 
 
-def _coop_policy(policy_id=0, start=0, duration=10, modalities=("objlist",), bandwidth=1e6):
+def _coop_policy(policy_id=0, start=0, duration=10, modalities=("objlist",), bandwidth_ratio=1.0):
     return CommPolicy(
         policy_id=policy_id,
         request_vehicle_id=REQUEST_ID,
@@ -30,7 +30,7 @@ def _coop_policy(policy_id=0, start=0, duration=10, modalities=("objlist",), ban
         duration_steps=duration,
         selected_collaborators=(COLLAB_ID,),
         modalities_by_vehicle={COLLAB_ID: tuple(modalities)},
-        bandwidth_by_vehicle={COLLAB_ID: float(bandwidth)},
+        bandwidth_by_vehicle={COLLAB_ID: float(bandwidth_ratio)},
         reason="test",
     )
 
@@ -46,7 +46,7 @@ def _snapshot(payload_size=1000, modalities=("objlist",), data=None):
 
 
 def _fixed_rate(rate_bps):
-    return lambda sender_id, distance_m, bandwidth_hz: float(rate_bps)
+    return lambda sender_id, distance_m, bandwidth_ratio: float(rate_bps)
 
 
 class CommPolicyLifetimeTest(unittest.TestCase):
@@ -101,6 +101,14 @@ class BundledMessageTest(unittest.TestCase):
         self.assertEqual(msg.created_step, msg.t_sense)
         self.assertEqual(msg.deliver_step, msg.t_recv)
         self.assertEqual(msg.payload_bytes, msg.payload_size)
+
+    def test_zero_bandwidth_ratio_emits_no_message(self):
+        cfg = CommConfig(dt=0.1, sensor_period_steps=1, proc_delay_s=0.0, policy_duration_steps=10)
+        proc = CommunicationProcess(cfg, REQUEST_ID)
+        proc.set_policy(_coop_policy(bandwidth_ratio=0.0), step=0)
+        emitted = proc.generate(0, {COLLAB_ID: _snapshot(payload_size=10)}, _fixed_rate(0.0))
+        self.assertEqual(emitted, [])
+        self.assertEqual(proc.in_flight, [])
 
 
 class SenderQueueingTest(unittest.TestCase):

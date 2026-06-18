@@ -59,7 +59,7 @@ class CoopRequest:
 class WAMPolicy:
     selected_vehicle_ids: Tuple[int, ...]
     modality_by_vehicle: Dict[int, str]
-    bandwidth_by_vehicle: Dict[int, float]
+    bandwidth_by_vehicle: Dict[int, float]  # per-vehicle bandwidth ratio in [0, 1]
     frequency_steps: int
     reason: str
 
@@ -179,7 +179,7 @@ def build_placeholder_policy(
     *,
     request: Optional[CoopRequest],
     candidate_vehicle_ids: Iterable[int],
-    uplink_bps: float,
+    bandwidth_ratio: float,
     frequency_steps: int,
     default_modality: str,
 ) -> WAMPolicy:
@@ -200,11 +200,11 @@ def build_placeholder_policy(
             frequency_steps=int(frequency_steps),
             reason="request_triggered_but_no_candidate_collaborators",
         )
-    share = float(uplink_bps) / float(len(selected))
+    ratio = min(max(float(bandwidth_ratio), 0.0), 1.0)
     return WAMPolicy(
         selected_vehicle_ids=selected,
         modality_by_vehicle={vehicle_id: str(default_modality) for vehicle_id in selected},
-        bandwidth_by_vehicle={vehicle_id: share for vehicle_id in selected},
+        bandwidth_by_vehicle={vehicle_id: ratio for vehicle_id in selected},
         frequency_steps=int(frequency_steps),
         reason="placeholder_all_candidates",
     )

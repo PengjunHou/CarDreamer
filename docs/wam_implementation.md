@@ -125,18 +125,18 @@ WAM 运行参数（默认值，可在 `env.wam.*` 覆盖）：`notable_distance_
 - **§5.3 observation node state**：modality id + 标量 `[payload_kb, latency_s, freshness, quality, sample_age_s]`（维度 5）。模态特征 `z^r` 在 embedding 模块里算（见 §5）。
 - **§6 三类 edge**（Edge Representation Update）：`(vehicle, veh_obs, observation)`（结构、无属性）、`(observation, obs_obj, object)`（`edge_attr=[det_confidence]`）、`(vehicle, veh_veh, vehicle)`（`edge_attr=[latency_s]`，policy-conditioned；仅协同时存在）。`COOP` 常量更名为 `VEH_VEH`，方向仍是 collaborator m → request/ego。`EDGE_ATTR_DIMS` 声明各关系的属性维度。
   - obs_obj `det_confidence` 来自 `ObservationNodeInput.det_confidence_by_object`（缺省 1.0，ground-truth 感知；真实 detector 后续填）。
-  - veh_veh `latency_s` 由 `_build_wam_graph` 复用 `SimpleWirelessLatency.compute_latency_s`（与 observation node `latency_s` 同一计算）汇成 `latency_by_vehicle` 传入。
+  - veh_veh `latency_s` 由 `_build_wam_graph` 使用接收队列中最近消息的 `message.total_latency` 汇成 `latency_by_vehicle` 传入。
 - **§7 policy-conditioned 装配规则**（`build_wam_hetero_graph`）：
   - ego 永远在图里，自带 `objlist` observation（`L=0, c_fresh=1`），并连到其可见 object；
   - 对每个 `m ∈ policy.selected_vehicle_ids`：加 vehicle 节点 + `coop` 边 `m→ego`；对其激活模态加 observation 节点 + `veh_obs` 边；`objlist` 再连 `m` 可见的 object（`obs_obj`）；
   - object 节点 = ego ∪ 选中协作车所见的并集（按到 ego 距离截断 `max_object_nodes`）；
   - 无协同时退化为合法的 **ego-only 图**。
-- 观测标量来源：`payload_bytes` 由物体数估算，`latency_s` 由 `SimpleWirelessLatency.compute_latency_s` 解析计算（ego 自身=0），`freshness = exp(-γ·L)`（§5.3 的 `c_fresh`）。
+- 观测标量来源：`payload_bytes` 由物体数估算，协作者 `latency_s` 来自新通信模型投递消息的 `message.total_latency`（ego 自身=0），`freshness = exp(-γ·L)`（§5.3 的 `c_fresh`）。
 
 **简化**：
 - 坐标统一转 **ego 帧**、yaw 用 **cos/sin**（设计写的是原始 `p`/`yaw`；这里为可学习性做了改进，是等价信息）。
 - `s_det=1.0`、`Δt=0`、observation `quality=1.0`（ground-truth 感知，无检测噪声）。
-- latency/freshness 是**按 policy 解析计算**，不是从真实投递的消息队列回填。
+- latency/freshness 从真实投递的消息队列回填；无可用消息时退化为 ego-only 图。
 - 空 object 类型 pad 到 ≥1 个带 `node_mask` 的 dummy（满足 HGTConv 对每类 ≥1 节点的要求）。
 
 **未实现**：

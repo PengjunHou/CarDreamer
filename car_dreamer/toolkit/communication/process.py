@@ -6,7 +6,7 @@ This module realizes the streaming cooperative-perception communication pipeline
            -> ReceiveQueue -> Window(Tw) -> Graph
 
 It is intentionally simulator-agnostic: it operates purely on integer simulation **steps**,
-vehicle ids, payload sizes and an injected ``link_rate_bps(sender_id, distance_m, bandwidth_hz)``
+vehicle ids, payload sizes and an injected ``link_rate_bps(sender_id, distance_m, bandwidth_ratio)``
 callable, so it is unit-testable without CARLA. :class:`V2VCommMixin` supplies the CARLA glue
 (actor poses for distance, per-collaborator observation snapshots, and the Base-Station policy).
 
@@ -33,7 +33,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .comm import V2VMessage
 
-# link_rate_bps(sender_id, distance_m, bandwidth_hz) -> bits/second
+# link_rate_bps(sender_id, distance_m, bandwidth_ratio) -> bits/second
 LinkRateFn = Callable[[int, float, float], float]
 
 
@@ -91,7 +91,9 @@ class CommPolicy:
     """A Base-Station cooperative-perception policy with an explicit lifetime (§2.1, §3).
 
     ``modalities_by_vehicle`` maps each selected collaborator to the **tuple** of modalities it
-    streams (bundled into a single message). A ``local-only`` policy has no collaborators (§2.1).
+    streams (bundled into a single message). ``bandwidth_by_vehicle`` stores per-collaborator
+    bandwidth ratios in ``[0, 1]``; the environment converts each ratio to actual Hz. A
+    ``local-only`` policy has no collaborators (§2.1).
     """
 
     policy_id: int
@@ -272,8 +274,11 @@ class CommunicationProcess:
             snap = snapshots.get(int(sender_id))
             if snap is None:
                 continue
-            bandwidth_hz = float(policy.bandwidth_by_vehicle.get(int(sender_id), 0.0))
-            rate_bps = max(float(link_rate_bps(int(sender_id), float(snap.distance_m), bandwidth_hz)), 1.0)
+            bandwidth_ratio = float(policy.bandwidth_by_vehicle.get(int(sender_id), 0.0))
+            raw_rate_bps = float(link_rate_bps(int(sender_id), float(snap.distance_m), bandwidth_ratio))
+            if raw_rate_bps <= 0.0:
+                continue
+            rate_bps = max(raw_rate_bps, 1.0)
             queue = self._sender_queues.setdefault(
                 int(sender_id), SenderQueue(int(sender_id), busy_until=int(step) * dt)
             )

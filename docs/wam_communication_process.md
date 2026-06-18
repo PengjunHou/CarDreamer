@@ -45,12 +45,13 @@ local-only 也是一种 policy `π_local=(∅,0,∅)`。
 ### 代码
 - [process.py](car_dreamer/toolkit/communication/process.py) `CommPolicy`：带 `policy_id / start_step /
   duration_steps / end_step / selected_collaborators / modalities_by_vehicle(打包多模态) /
-  bandwidth_by_vehicle`；`active_at(step)` = `start ≤ step < end`；`is_local_only` = 无协作者。
+  bandwidth_by_vehicle`（每协作者的带宽比例 `[0,1]`，不要求总和为 1）；`active_at(step)` = `start ≤ step < end`；
+  `is_local_only` = 无协作者。
   `make_local_policy(...)` 构造 local-only。
 - [v2v_comm_mixin.py](car_dreamer/v2v_comm_mixin.py) `_update_policy_lifecycle(step)`（每步、Ta 节流的感知之后）：
   - 协作 policy 在其 `Td` 内**整段保持**（不中途重算）；
   - 否则:有高不确定性请求且有候选 → `_build_coop_policy`(全候选协作、打包 `collaborator_modalities`、
-    `uplink_bps` 均分带宽)；
+    给每个候选设置 `bandwidth_ratio`)；
   - 当前是 local-only 且未过期且无请求 → 保持(避免抖动)；否则装新的 local-only。
   - 转换时 `CommunicationProcess.set_policy(policy, step)` 安装，并 `_sync_policy_views` 把它镜像成
     `WAMPolicy` 视图(供 info/图构建)。
@@ -92,8 +93,9 @@ local-only 也是一种 policy `π_local=(∅,0,∅)`。
   仅 `deliver_step = t_sense + round(total_latency/dt)` **取一次整**。`veh_veh` 边权用精确的
   `total_latency`,投递时刻用 `deliver_step`(=消息的 `t_recv` 整数步)。这样不会出现逐项把
   0.04s 处理 + 0.04s 传输各自取整成 0、却把真实的 0.08s 也丢掉的误差。
-- 速率 `R`：[comm.py](car_dreamer/toolkit/communication/comm.py) `shannon_rate_bps(d, B, ...)`（FSPL+SNR，
-  从原 `SimpleWirelessLatency` 抽出共享）。mixin 的 `_link_rate_bps` 用 policy 分配带宽 `B^π_{m,q}` 调它。
+- 速率 `R`：[comm.py](car_dreamer/toolkit/communication/comm.py) `shannon_rate_bps(d, B, ...)`（FSPL+SNR）。
+  mixin 的 `_link_rate_bps` 先把 policy 比例换算成实际带宽 `B^π_{m,q}=policy_bandwidth_hz·ratio`
+  再调它。
 
 ---
 
@@ -151,14 +153,15 @@ env [on_step](car_dreamer/carla_group_right_turn_auto_env.py) 顺序:
 4. **延迟先加和再取整**:proc/queue/tx 在秒里精确相加,`deliver_step` 只对总和取一次 `round`;
    `busy_until` 保留连续秒以精确建模排队。亚步总延迟可 round 到 0 步(即同 tick 送达),边权仍用精确秒值。
 5. **检测置信度/quality=1.0**:`det_confidence`、`quality` 用真值占位,留给真实感知器填。
-6. **带宽均分**:BS 把 `uplink_bps` 在被选协作者间均分,未做不确定性/距离加权的最优分配。
+6. **带宽比例占位**:BS 给每个被选协作者同一个 `bandwidth_ratio`；比例值可全为 1 或全为 0.5，
+   不要求求和为 1。实际 Shannon 带宽为 `policy_bandwidth_hz·ratio`。
 7. **`per_link` 队列、`local_only_as_policy=True`** 固定为 v1 设置(未做一个协作者服务多请求车辆的共享队列)。
 
 ---
 
 ## 8. 后续计划
 
-- BS policy 从「全候选 + 均分带宽 + 固定 modality」升级为**学习/优化**的协作者与带宽/modality 选择
+- BS policy 从「全候选 + 固定带宽比例 + 固定 modality」升级为**学习/优化**的协作者与带宽/modality 选择
   （接 UWM 的 policy evaluation）。
 - 消息 `feat`/objlist 的真实序列化字节数与压缩，纳入 `payload_size`；区分 uplink/downlink 与多请求车辆共享队列。
 - 真实检测器填 `det_confidence`/`quality`，让 `obs_obj` 边权与 `freshness` 反映感知质量。
