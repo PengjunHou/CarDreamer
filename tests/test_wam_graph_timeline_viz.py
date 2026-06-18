@@ -194,8 +194,8 @@ class RenderAndWriteTest(unittest.TestCase):
 
         fig = render_graph_matplotlib(rec)  # topology (left) + BEV (right)
         self.assertEqual(len(fig.axes), 2)
-        bev_titles = [ax.get_title() for ax in fig.axes if "BEV" in ax.get_title()]
-        self.assertTrue(bev_titles)
+        bev_ax = fig.axes[1]
+        self.assertFalse(bev_ax.get_title())
         matplotlib.pyplot.close(fig)
 
         fig2 = render_graph_matplotlib(rec, with_bev=False)  # topology only
@@ -248,14 +248,118 @@ class RenderAndWriteTest(unittest.TestCase):
             cv2.imwrite(str(vdir / "birdeye_000007.png"), np.zeros((H, W, 3), np.uint8))
             fig = render_graph_matplotlib(rec, bev=BevOptions(birdeye_dir=d))
             bev_ax = next(ax for ax in fig.axes if ax.images)
-            # vehicle-class objects are drawn as oriented boxes (Polygon), not circles
+            # vehicle-class objects plus ego/collaborator boxes are drawn as oriented Polygons
             polys = [p for p in bev_ax.patches if isinstance(p, Polygon)]
-            self.assertEqual(len(polys), n_vehicle_objs)
+            self.assertEqual(len(polys), n_vehicle_objs + len(rec["vehicles"]))
             self.assertGreaterEqual(n_vehicle_objs, 1)
             # FIXED limits == image bounds (identical every frame -> the BEV never grows/shrinks)
             self.assertEqual(bev_ax.get_xlim(), (0.0, float(W)))
             self.assertEqual(bev_ax.get_ylim(), (float(H), 0.0))  # image y points down
             matplotlib.pyplot.close(fig)
+
+    def test_generated_bev_uses_episode_fixed_bounds_and_moving_ego(self):
+        import matplotlib
+        from matplotlib.patches import Polygon
+
+        from car_dreamer.toolkit.wam import BevOptions
+        from car_dreamer.toolkit.wam.graph_timeline_viz import build_episode_bev_contexts
+
+        rec0 = hetero_graph_to_record(_graph(selected=()), step=0, policy_label="local")
+        rec1 = hetero_graph_to_record(_graph(selected=(2,)), step=1, policy_label="coop[2]")
+        rec0["extra"] = {
+            "episode": 0,
+            "ego_world": {"actor_id": 1, "x": 0.0, "y": 0.0, "yaw": 0.0, "length": 4.5, "width": 2.0},
+            "candidate_world": [
+                {"actor_id": 2, "x": 80.0, "y": 0.0, "yaw": 0.0, "length": 4.5, "width": 2.0},
+            ],
+            "graph_object_world": [],
+        }
+        rec1["extra"] = {
+            "episode": 0,
+            "ego_world": {"actor_id": 1, "x": 10.0, "y": 0.0, "yaw": 0.0, "length": 4.5, "width": 2.0},
+            "candidate_world": [
+                {"actor_id": 2, "x": 80.0, "y": 0.0, "yaw": 0.0, "length": 4.5, "width": 2.0},
+            ],
+            "graph_object_world": [
+                {"actor_id": 100, "object_class": "vehicle", "x": 12.0, "y": 1.0, "yaw": 0.0, "length": 4.0, "width": 2.0},
+            ],
+        }
+        opts = BevOptions(mode="generated", frame="episode_start", margin_m=5.0)
+        contexts = build_episode_bev_contexts([rec0, rec1], opts)
+        self.assertEqual(contexts[0]["xlim"] if "xlim" in contexts[0] else (contexts[0]["xmin"], contexts[0]["xmax"]),
+                         (contexts[0]["xmin"], contexts[0]["xmax"]))
+        self.assertGreaterEqual(contexts[0]["ymax"], 85.0)  # far candidate is inside episode-level range
+
+        opts.contexts = contexts
+        fig0 = render_graph_matplotlib(rec0, bev=opts)
+        fig1 = render_graph_matplotlib(rec1, bev=opts)
+        ax0, ax1 = fig0.axes[1], fig1.axes[1]
+        self.assertEqual(ax0.get_xlim(), ax1.get_xlim())
+        self.assertEqual(ax0.get_ylim(), ax1.get_ylim())
+        ego0 = next(t.get_position() for t in ax0.texts if t.get_text() == "EGO")
+        ego1 = next(t.get_position() for t in ax1.texts if t.get_text() == "EGO")
+        self.assertNotEqual(ego0, ego1)  # ego moves in the fixed episode-start frame
+        self.assertTrue(any(t.get_text().startswith("C2") for t in ax0.texts))  # non-selected candidate reference
+        self.assertTrue(any(isinstance(p, Polygon) for p in ax1.patches))
+        matplotlib.pyplot.close(fig0)
+        matplotlib.pyplot.close(fig1)
+
+    def test_generated_bev_fixed_map_background_with_moving_ego(self):
+        import matplotlib
+        import cv2
+        import numpy as np
+
+        from car_dreamer.toolkit.wam import BevOptions
+        from car_dreamer.toolkit.wam.graph_timeline_viz import build_episode_bev_contexts
+
+        map_bg = {
+            "path": None,  # filled below
+            "pixels_per_meter": 1.0,
+            "scale": 1.0,
+            "world_offset": [0.0, 0.0],
+            "width_px": 64,
+            "height_px": 64,
+        }
+        rec0 = hetero_graph_to_record(_graph(selected=(2,)), step=0, policy_label="coop[2]")
+        rec1 = hetero_graph_to_record(_graph(selected=(2,)), step=1, policy_label="coop[2]")
+        rec0["extra"] = {
+            "episode": 0,
+            "ego_world": {"actor_id": 1, "x": 10.0, "y": 12.0, "yaw": 0.0, "length": 4.5, "width": 2.0},
+            "candidate_world": [{"actor_id": 2, "x": 40.0, "y": 12.0, "yaw": 0.0, "length": 4.5, "width": 2.0}],
+            "graph_object_world": [],
+        }
+        rec1["extra"] = {
+            "episode": 0,
+            "ego_world": {"actor_id": 1, "x": 20.0, "y": 12.0, "yaw": 0.0, "length": 4.5, "width": 2.0},
+            "candidate_world": [{"actor_id": 2, "x": 40.0, "y": 12.0, "yaw": 0.0, "length": 4.5, "width": 2.0}],
+            "graph_object_world": [],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            bg = Path(d) / "map.png"
+            cv2.imwrite(str(bg), np.full((64, 64, 3), 64, dtype=np.uint8))
+            map_bg["path"] = str(bg)
+            rec0["extra"]["map_background"] = dict(map_bg)
+            rec1["extra"]["map_background"] = dict(map_bg)
+
+            opts = BevOptions(mode="generated", frame="map", margin_m=4.0)  # map is the default frame
+            opts.contexts = build_episode_bev_contexts([rec0, rec1], opts)
+            self.assertIn("crop", opts.contexts[0])  # one fixed per-episode crop
+
+            fig0 = render_graph_matplotlib(rec0, bev=opts)
+            fig1 = render_graph_matplotlib(rec1, bev=opts)
+            ax0, ax1 = fig0.axes[1], fig1.axes[1]
+            self.assertTrue(ax0.images and ax1.images)
+            # background does NOT move with the ego: identical crop -> identical image extent every frame
+            self.assertEqual(ax0.images[0].get_array().shape, ax1.images[0].get_array().shape)
+            self.assertEqual(ax0.get_xlim(), ax1.get_xlim())
+            self.assertEqual(ax0.get_ylim(), ax1.get_ylim())
+            # ego still moves inside the fixed window, forward = screen-up after birdeye rotation
+            ego0 = next(t.get_position() for t in ax0.texts if t.get_text() == "EGO")
+            ego1 = next(t.get_position() for t in ax1.texts if t.get_text() == "EGO")
+            self.assertNotEqual(ego0, ego1)
+            self.assertLess(ego1[1], ego0[1])  # +world x with yaw=0 -> up on screen (smaller y)
+            matplotlib.pyplot.close(fig0)
+            matplotlib.pyplot.close(fig1)
 
     def test_html_uses_independent_per_policy_images(self):
         recs = [

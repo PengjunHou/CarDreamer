@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -50,18 +51,18 @@ COLOR_OBJECT = "#E8A0A0"            # object notable to ego (red)
 COLOR_OBJECT_UNIMPORTANT = "#C9C9C9"  # non-notable object (gray)
 COLOR_EDGE = "#333333"
 
-# --- BEV overlay palette (drawn on top of the CARLA birdeye image) ---
-# Strong, unambiguous colours: black/white outlines were hard to tell apart, so notability is encoded
-# by a saturated outline colour and ego-vs-collaborator visibility by line *style* (solid vs dashed).
-BEV_EGO_COLOR = "#00E5FF"          # ego marker (bright cyan star) -- distinct from every birdeye colour
-BEV_COLLAB_COLOR = "#B14BFF"       # collaborator marker (purple diamond)
-BEV_OBJ_NOTABLE = "#FF2D2D"        # object notable to ego (vivid red outline)
-BEV_OBJ_PLAIN = "#3D9BFF"          # object not notable to ego (blue outline; clearly != red)
+# --- BEV overlay palette (matplotlib hex; matches BirdeyeRenderer Color.* fill colours) ---
+BEV_EGO_COLOR = "#F57900"          # Color.ORANGE_1
+BEV_VEHICLE_COLOR = "#00FF00"      # Color.GREEN
+BEV_NOTABLE_COLOR = "#EF2929"      # Color.SCARLET_RED_0 (notable object)
+BEV_PEDESTRIAN_COLOR = "#FCAF3E"   # Color.ORANGE_0
+BEV_BICYCLE_COLOR = "#AD7FA8"      # Color.PLUM_0
 BEV_VISIBLE_STYLE = "solid"        # ego can see the object
 BEV_COLLAB_ONLY_STYLE = (0, (4, 2))  # only a collaborator sees it (dashed)
-# a white halo makes any label legible on both the dark road and the bright vehicle boxes
-_LABEL_HALO = [patheffects.withStroke(linewidth=2.4, foreground="white")]
+# black halo keeps fill-coloured labels legible on both road and vehicle boxes
+_LABEL_HALO = [patheffects.withStroke(linewidth=2.2, foreground="black", alpha=0.9)]
 _DEFAULT_OBJ_BOX_M = (4.6, 2.0)    # fallback length, width (m) when an object carries no extent
+_MAP_CROP_HALF_SHRINK = 0.82       # tighten fixed-map BEV window (~18% smaller than bbox+margin)
 
 # --- fixed figure geometry (constant across frames so the slider doesn't jitter) ---
 FIG_HEIGHT = 5.6
@@ -85,6 +86,11 @@ class BevOptions:
     birdeye_dir: Optional[PathLike] = None
     obs_range: float = 64.0
     ego_offset: float = 12.0
+    mode: str = "auto"  # generated | auto | birdeye-dir | scatter
+    frame: str = "map"  # map | birdeye | world | episode_start
+    margin_m: float = 10.0
+    show_candidates: bool = True
+    contexts: Optional[Mapping[int, Mapping[str, Any]]] = None
 
 # --- layout constants (data coordinates) ---
 ROW_Y = {"vehicle": 2.0, "observation": 1.0, "object": 0.0}
@@ -428,7 +434,6 @@ def _draw_bev_scatter(ax, record: Mapping[str, Any]) -> None:
     if not (any("x" in v for v in vehicles) or any("x" in o for o in objects)):
         ax.text(0.5, 0.5, "no birdeye image and no positions\n(pass --birdeye-dir or re-record)",
                 transform=ax.transAxes, ha="center", va="center", fontsize=8, color="#999")
-        ax.set_title("BEV (no data)", fontsize=9)
         ax.axis("off")
         return
 
@@ -471,12 +476,674 @@ def _draw_bev_scatter(ax, record: Mapping[str, Any]) -> None:
     ax.set_xlabel("lateral (m) →right", fontsize=7)
     ax.set_ylabel("forward (m) ↑", fontsize=7)
     ax.tick_params(labelsize=6)
-    ax.set_title("BEV (ego-frame, forward ↑)", fontsize=9)
+
+
+def _world_pose(item: Mapping[str, Any]) -> Optional[Tuple[float, float, float]]:
+    try:
+        return float(item["x"]), float(item["y"]), float(item.get("yaw", 0.0))
+    except Exception:
+        return None
+
+
+def _record_extra(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    extra = record.get("extra", {})
+    return extra if isinstance(extra, Mapping) else {}
+
+
+def _episode_id(record: Mapping[str, Any]) -> int:
+    return int(_record_extra(record).get("episode", 0))
+
+
+def _iter_world_items(record: Mapping[str, Any], *, include_objects: bool = True):
+    extra = _record_extra(record)
+    ego = extra.get("ego_world")
+    if isinstance(ego, Mapping):
+        yield ego
+    for candidate in extra.get("candidate_world", ()) or ():
+        if isinstance(candidate, Mapping):
+            yield candidate
+    if include_objects:
+        for obj in extra.get("graph_object_world", ()) or ():
+            if isinstance(obj, Mapping):
+                yield obj
+
+
+def _frame_origin(record: Mapping[str, Any]) -> Tuple[float, float, float]:
+    ego = _record_extra(record).get("ego_world")
+    pose = _world_pose(ego) if isinstance(ego, Mapping) else None
+    return pose or (0.0, 0.0, 0.0)
+
+
+def _relative_to_pose(x: float, y: float, origin: Tuple[float, float, float]) -> Tuple[float, float]:
+    ox, oy, oyaw = origin
+    yaw = math.radians(float(oyaw))
+    dx, dy = float(x) - float(ox), float(y) - float(oy)
+    fwd = math.cos(yaw) * dx + math.sin(yaw) * dy
+    right = -math.sin(yaw) * dx + math.cos(yaw) * dy
+    return fwd, right
+
+
+def _to_bev_xy(x: float, y: float, ctx: Mapping[str, Any]) -> Tuple[float, float]:
+    frame = str(ctx.get("frame", "episode_start"))
+    if frame == "world":
+        return float(x), float(y)
+    ox, oy, oyaw = float(ctx.get("origin_x", 0.0)), float(ctx.get("origin_y", 0.0)), float(ctx.get("origin_yaw", 0.0))
+    yaw = math.radians(oyaw)
+    dx, dy = float(x) - ox, float(y) - oy
+    # episode-start frame: screen x = right, screen y = forward, fixed to the first ego pose.
+    fwd = math.cos(yaw) * dx + math.sin(yaw) * dy
+    right = -math.sin(yaw) * dx + math.cos(yaw) * dy
+    return right, fwd
+
+
+def _heading_in_context(yaw_deg: float, ctx: Mapping[str, Any]) -> float:
+    frame = str(ctx.get("frame", "episode_start"))
+    return float(yaw_deg) if frame == "world" else float(yaw_deg) - float(ctx.get("origin_yaw", 0.0))
+
+
+def _all_episode_points(records: Sequence[Mapping[str, Any]], ctx: Mapping[str, Any]) -> List[Tuple[float, float]]:
+    points: List[Tuple[float, float]] = []
+    for rec in records:
+        for item in _iter_world_items(rec, include_objects=True):
+            pose = _world_pose(item)
+            if pose is not None:
+                points.append(_to_bev_xy(pose[0], pose[1], ctx))
+    return points
+
+
+def _episode_birdeye_range(records: Sequence[Mapping[str, Any]], opts: BevOptions) -> Tuple[float, float]:
+    base_range = max(float(getattr(opts, "obs_range", 64.0)), 1.0)
+    base_offset = float(getattr(opts, "ego_offset", 12.0))
+    offset_ratio = min(max(base_offset / base_range, 0.05), 0.5)
+    margin = max(float(getattr(opts, "margin_m", 10.0)), 0.0)
+    required = base_range
+    for rec in records:
+        ego_pose = _frame_origin(rec)
+        for item in _iter_world_items(rec, include_objects=True):
+            pose = _world_pose(item)
+            if pose is None:
+                continue
+            fwd, right = _relative_to_pose(pose[0], pose[1], ego_pose)
+            required = max(required, 2.0 * (abs(right) + margin))
+            if fwd >= 0.0:
+                required = max(required, (fwd + margin) / max(1.0 - offset_ratio, 1e-6))
+            else:
+                required = max(required, (-fwd + margin) / max(offset_ratio, 1e-6))
+    return float(required), float(required * offset_ratio)
+
+
+def _episode_map_crop(records: Sequence[Mapping[str, Any]], bg: Mapping[str, Any], *, margin_m: float) -> Optional[Tuple[int, int, int, int]]:
+    """One fixed map-pixel window (x0, y0, x1, y1) covering every episode actor + margin.
+
+    Computed once per episode so the recorded CARLA map background stays put while the ego box moves
+    across it (background does NOT follow the ego).
+    """
+    eppm = float(bg.get("pixels_per_meter", 1.0)) * float(bg.get("scale", 1.0))
+    width = int(bg.get("width_px", 0))
+    height = int(bg.get("height_px", 0))
+    if eppm <= 0.0 or width <= 0 or height <= 0:
+        return None
+    xs: List[float] = []
+    ys: List[float] = []
+    for rec in records:
+        for item in _iter_world_items(rec, include_objects=True):
+            for corner in item.get("bbox") or ():
+                if len(corner) >= 2:
+                    px, py = _world_to_map_pixel(float(corner[0]), float(corner[1]), bg)
+                    xs.append(px)
+                    ys.append(py)
+            pose = _world_pose(item)
+            if pose is not None:
+                px, py = _world_to_map_pixel(pose[0], pose[1], bg)
+                xs.append(px)
+                ys.append(py)
+    if not xs:
+        return None
+    margin_px = max(float(margin_m), 0.0) * eppm
+    x0, x1 = min(xs) - margin_px, max(xs) + margin_px
+    y0, y1 = min(ys) - margin_px, max(ys) + margin_px
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    half = max((x1 - x0) / 2.0, (y1 - y0) / 2.0, 6.0 * eppm) * _MAP_CROP_HALF_SHRINK
+    x0, x1, y0, y1 = cx - half, cx + half, cy - half, cy + half
+    x0 = int(max(0, math.floor(x0)))
+    y0 = int(max(0, math.floor(y0)))
+    x1 = int(min(width, math.ceil(x1)))
+    y1 = int(min(height, math.ceil(y1)))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+    return x0, y0, x1, y1
+
+
+def build_episode_bev_contexts(records: Sequence[Mapping[str, Any]], bev: Optional[BevOptions] = None) -> Dict[int, Dict[str, Any]]:
+    """Compute one fixed generated-BEV extent per episode, never per step."""
+    opts = bev or BevOptions()
+    by_ep: Dict[int, List[Mapping[str, Any]]] = {}
+    for rec in records:
+        by_ep.setdefault(_episode_id(rec), []).append(rec)
+    contexts: Dict[int, Dict[str, Any]] = {}
+    for ep, recs in by_ep.items():
+        first = recs[0] if recs else {}
+        ox, oy, oyaw = _frame_origin(first)
+        ctx: Dict[str, Any] = {
+            "episode": int(ep),
+            "frame": str(getattr(opts, "frame", "episode_start")),
+            "origin_x": float(ox),
+            "origin_y": float(oy),
+            "origin_yaw": float(oyaw),
+        }
+        for rec in recs:
+            bg = _record_extra(rec).get("map_background")
+            if isinstance(bg, Mapping):
+                ctx["map_background"] = dict(bg)
+                break
+        if str(ctx["frame"]) == "birdeye":
+            obs_range, ego_offset = _episode_birdeye_range(recs, opts)
+            ctx.update({"obs_range": obs_range, "ego_offset": ego_offset, "image_size": 512})
+        if str(ctx["frame"]) == "map" and isinstance(ctx.get("map_background"), Mapping):
+            crop = _episode_map_crop(recs, ctx["map_background"], margin_m=float(getattr(opts, "margin_m", 10.0)))
+            if crop is not None:
+                ctx["crop"] = crop
+        pts = _all_episode_points(recs, ctx)
+        if not pts:
+            r = BEV_FALLBACK_RANGE_M
+            ctx.update({"xmin": -r, "xmax": r, "ymin": -r, "ymax": r})
+        else:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            margin = max(float(getattr(opts, "margin_m", 10.0)), 0.0)
+            xmin, xmax = min(xs) - margin, max(xs) + margin
+            ymin, ymax = min(ys) - margin, max(ys) + margin
+            span = max(xmax - xmin, ymax - ymin, 2.0 * BEV_FALLBACK_RANGE_M)
+            cx, cy = (xmin + xmax) / 2.0, (ymin + ymax) / 2.0
+            half = span / 2.0
+            ctx.update({"xmin": cx - half, "xmax": cx + half, "ymin": cy - half, "ymax": cy + half})
+        contexts[int(ep)] = ctx
+    return contexts
+
+
+def _bev_context_for_record(record: Mapping[str, Any], bev: Optional[BevOptions]) -> Mapping[str, Any]:
+    if bev is not None and bev.contexts:
+        ctx = bev.contexts.get(_episode_id(record))
+        if ctx is not None:
+            return ctx
+    return build_episode_bev_contexts([record], bev).get(_episode_id(record), {})
+
+
+def _item_bbox_xy(item: Mapping[str, Any], ctx: Mapping[str, Any], *, default_length: float = 4.6, default_width: float = 2.0):
+    bbox = item.get("bbox") or ()
+    pts = []
+    for p in bbox:
+        if len(p) >= 2:
+            pts.append(_to_bev_xy(float(p[0]), float(p[1]), ctx))
+    if len(pts) >= 3:
+        return pts
+    pose = _world_pose(item)
+    if pose is None:
+        return []
+    sx, sy = _to_bev_xy(pose[0], pose[1], ctx)
+    yaw = math.radians(_heading_in_context(pose[2], ctx))
+    length = float(item.get("length", default_length) or default_length)
+    width = float(item.get("width", default_width) or default_width)
+    hl, hw = length / 2.0, width / 2.0
+    fwd = (math.sin(yaw), math.cos(yaw))
+    right = (math.cos(yaw), -math.sin(yaw))
+    return [
+        (sx + a * hl * fwd[0] + b * hw * right[0], sy + a * hl * fwd[1] + b * hw * right[1])
+        for a, b in ((1, 1), (1, -1), (-1, -1), (-1, 1))
+    ]
+
+
+def _draw_world_box(ax, item: Mapping[str, Any], ctx: Mapping[str, Any], *, edge: str, face: str = "none", lw: float = 1.4,
+                    alpha: float = 1.0, linestyle="solid", zorder: int = 4) -> Optional[Tuple[float, float]]:
+    pts = _item_bbox_xy(item, ctx)
+    if pts:
+        ax.add_patch(Polygon(pts, closed=True, facecolor=face, edgecolor=edge, linewidth=lw,
+                             alpha=alpha, linestyle=linestyle, zorder=zorder, clip_on=True))
+        return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+    pose = _world_pose(item)
+    if pose is None:
+        return None
+    xy = _to_bev_xy(pose[0], pose[1], ctx)
+    ax.scatter([xy[0]], [xy[1]], s=45, facecolors=face, edgecolors=edge, linewidths=lw, zorder=zorder, clip_on=True)
+    return xy
+
+
+def _draw_generated_bev_on_ax(ax, record: Mapping[str, Any], *, bev: Optional[BevOptions] = None) -> None:
+    if not any(True for _ in _iter_world_items(record, include_objects=True)):
+        _draw_bev_scatter(ax, record)
+        return
+    ctx = _bev_context_for_record(record, bev)
+    if not ctx:
+        _draw_bev_scatter(ax, record)
+        return
+    frame = str(ctx.get("frame", "map"))
+    if frame == "map" and _draw_fixed_birdeye_on_ax(ax, record, ctx, bev=bev):
+        return
+    if frame == "birdeye" and _draw_generated_birdeye_on_ax(ax, record, ctx, bev=bev):
+        return
+    extra = _record_extra(record)
+    graph_vehicle_ids = {int(v["node_id"]) for v in record.get("vehicles", ())}
+    collab_label: Dict[int, str] = {}
+    for n, v in enumerate(sorted((v for v in record["vehicles"] if not v["is_ego"]), key=lambda v: v["slot"]), start=1):
+        collab_label[int(v["node_id"])] = f"V{n}"
+
+    ax.set_facecolor("#050505")
+    _draw_generated_map_background(ax, ctx)
+    ax.grid(True, color="#36424E", linestyle=":", linewidth=0.45, alpha=0.35)
+    ax.axhline(0, color="#65717D", lw=0.8, alpha=0.7, zorder=0)
+    ax.axvline(0, color="#65717D", lw=0.8, alpha=0.7, zorder=0)
+
+    if bev is None or bool(getattr(bev, "show_candidates", True)):
+        for cand in extra.get("candidate_world", ()) or ():
+            if not isinstance(cand, Mapping):
+                continue
+            vid = int(cand.get("actor_id", -1))
+            selected = vid in graph_vehicle_ids
+            if selected:
+                continue
+            center = _draw_world_box(ax, cand, ctx, edge=BEV_VEHICLE_COLOR, face=BEV_VEHICLE_COLOR, lw=1.0, alpha=0.55,
+                                     linestyle=(0, (3, 2)), zorder=2)
+            if center is not None:
+                _bev_label(ax, center[0], center[1], f"C{vid}", color=BEV_VEHICLE_COLOR, fontsize=5.5, zorder=3)
+
+    for obj in extra.get("graph_object_world", ()) or ():
+        if not isinstance(obj, Mapping):
+            continue
+        oid = int(obj.get("actor_id", -1))
+        graph_obj = next((o for o in record.get("objects", ()) if int(o.get("node_id", -2)) == oid), {})
+        notable = bool(graph_obj.get("notable", False))
+        visible = bool(graph_obj.get("visible", False))
+        obj_hex = _object_birdeye_hex(str(obj.get("object_class", "vehicle")), notable=notable)
+        style = BEV_VISIBLE_STYLE if visible else BEV_COLLAB_ONLY_STYLE
+        center = _draw_world_box(ax, obj, ctx, edge=obj_hex, face=obj_hex, lw=2.0, linestyle=style, zorder=5)
+        if center is not None:
+            _bev_label(ax, center[0], center[1], f"O{oid}", color=obj_hex, fontsize=6.0, zorder=6)
+
+    ego = extra.get("ego_world")
+    if isinstance(ego, Mapping):
+        center = _draw_world_box(ax, ego, ctx, edge=BEV_EGO_COLOR, face=BEV_EGO_COLOR, lw=2.3, zorder=7)
+        if center is not None:
+            _bev_label(ax, center[0], center[1], "EGO", color=BEV_EGO_COLOR, fontsize=8.0, weight="bold", va="bottom", zorder=9)
+
+    for cand in extra.get("candidate_world", ()) or ():
+        if not isinstance(cand, Mapping):
+            continue
+        vid = int(cand.get("actor_id", -1))
+        if vid not in graph_vehicle_ids:
+            continue
+        center = _draw_world_box(ax, cand, ctx, edge=BEV_VEHICLE_COLOR, face=BEV_VEHICLE_COLOR, lw=2.0, zorder=7)
+        if center is not None:
+            _bev_label(ax, center[0], center[1], collab_label.get(vid, f"V{vid}"),
+                       color=BEV_VEHICLE_COLOR, fontsize=8.0, weight="bold", va="bottom", zorder=9)
+
+    ax.set_xlim(float(ctx["xmin"]), float(ctx["xmax"]))
+    ax.set_ylim(float(ctx["ymin"]), float(ctx["ymax"]))
+    ax.set_aspect("equal")
+    ax.tick_params(labelsize=6, colors="#AAB4BE")
+    for spine in ax.spines.values():
+        spine.set_color("#6C7782")
+    ax.set_xlabel("right from episode start (m)" if str(ctx.get("frame")) != "world" else "world x (m)", fontsize=7)
+    ax.set_ylabel("forward from episode start (m)" if str(ctx.get("frame")) != "world" else "world y (m)", fontsize=7)
+
+
+def _birdeye_color_hex(color: Tuple[int, int, int]) -> str:
+    """``Color.*`` constants are RGB-named; matplotlib needs ``#RRGGBB``."""
+    r, g, b = (int(color[0]), int(color[1]), int(color[2]))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _object_birdeye_color(object_class: str, *, notable: bool = False) -> Tuple[int, int, int]:
+    from car_dreamer.toolkit.observer.handlers.renderer.constants import Color
+
+    if notable:
+        return Color.SCARLET_RED_0
+    return {
+        "vehicle": Color.GREEN,
+        "pedestrian": Color.ORANGE_0,
+        "bicycle": Color.PLUM_0,
+    }.get(str(object_class), Color.GREEN)
+
+
+def _object_birdeye_hex(object_class: str, *, notable: bool = False) -> str:
+    return _birdeye_color_hex(_object_birdeye_color(object_class, notable=notable))
+
+
+def _birdeye_display_rotation_deg(reference_yaw_deg: float) -> float:
+    """Match :func:`_ego_centric_warp` so CARLA forward points up on screen."""
+    return float(reference_yaw_deg) + 90.0
+
+
+def _rotate_points_2d(points: Sequence[Tuple[float, float]], matrix) -> List[Tuple[float, float]]:
+    return [_apply_affine((float(px), float(py)), matrix) for px, py in points]
+
+
+def _world_to_map_pixel(x: float, y: float, bg: Mapping[str, Any]) -> Tuple[float, float]:
+    ppm = float(bg.get("pixels_per_meter", 1.0)) * float(bg.get("scale", 1.0))
+    ox, oy = bg.get("world_offset", (0.0, 0.0))
+    return ppm * (float(x) - float(ox)), ppm * (float(y) - float(oy))
+
+
+def _draw_fixed_birdeye_on_ax(ax, record: Mapping[str, Any], ctx: Mapping[str, Any], *, bev: Optional[BevOptions] = None) -> bool:
+    """Fixed-window BEV that reuses the *exact* birdeye look (data/birdeye_frames).
+
+    The recorded CARLA map surface is cropped to one fixed per-episode window (background never
+    follows the ego). The crop is then rotated once per episode with the same ``yaw + 90°`` rule as
+    :class:`BirdeyeRenderer`, so ego forward points **up** and motion reads bottom→top like
+    ``data/birdeye_frames``. Vehicles/objects use cv2 ``fillPoly`` + white outline; ego is orange
+    (``Color.ORANGE_1``) so it does not blend with sky-blue lane centre lines.
+    """
+    bg = ctx.get("map_background")
+    crop = ctx.get("crop")
+    if not isinstance(bg, Mapping) or not crop:
+        return False
+    path = bg.get("path")
+    if not path:
+        return False
+    try:
+        import cv2
+        import numpy as np
+
+        from car_dreamer.toolkit.observer.handlers.renderer.constants import Color
+
+        img = cv2.imread(str(path))  # BGR-on-disk == renderer surface (RGB-named) space
+        if img is None:
+            return False
+        height, width = img.shape[:2]
+        x0, y0, x1, y1 = (int(crop[0]), int(crop[1]), int(crop[2]), int(crop[3]))
+        x0 = max(0, min(x0, width - 1))
+        y0 = max(0, min(y0, height - 1))
+        x1 = max(x0 + 1, min(x1, width))
+        y1 = max(y0 + 1, min(y1, height))
+        canvas = img[y0:y1, x0:x1].copy()
+        crop_h, crop_w = canvas.shape[:2]
+    except Exception:
+        return False
+
+    eppm = float(bg.get("pixels_per_meter", 1.0)) * float(bg.get("scale", 1.0))
+    ox, oy = bg.get("world_offset", (0.0, 0.0))
+
+    def w2l(x: float, y: float) -> Tuple[float, float]:
+        return eppm * (float(x) - float(ox)) - x0, eppm * (float(y) - float(oy)) - y0
+
+    def local_corners(item: Mapping[str, Any]) -> List[Tuple[float, float]]:
+        return [w2l(p[0], p[1]) for p in (item.get("bbox") or ()) if len(p) >= 2]
+
+    def fill_box(item: Mapping[str, Any], color, *, border_w: int = 1) -> Optional[Tuple[float, float]]:
+        pts = local_corners(item)
+        if len(pts) >= 3:
+            arr = np.array([[int(round(a)), int(round(b))] for a, b in pts], dtype=np.int32)
+            cv2.fillPoly(canvas, [arr], color)
+            cv2.polylines(canvas, [arr], True, color, int(border_w), cv2.LINE_AA)
+            return sum(a for a, _ in pts) / len(pts), sum(b for _, b in pts) / len(pts)
+        pose = _world_pose(item)
+        if pose is None:
+            return None
+        lx, ly = w2l(pose[0], pose[1])
+        cv2.circle(canvas, (int(round(lx)), int(round(ly))), 5, color, -1, cv2.LINE_AA)
+        return lx, ly
+
+    extra = _record_extra(record)
+    graph_vehicle_ids = {int(v["node_id"]) for v in record.get("vehicles", ())}
+    collab_label: Dict[int, str] = {}
+    for n, v in enumerate(sorted((v for v in record["vehicles"] if not v["is_ego"]), key=lambda v: v["slot"]), start=1):
+        collab_label[int(v["node_id"])] = f"V{n}"
+
+    vehicle_hex = _birdeye_color_hex(Color.GREEN)
+    ego_hex = _birdeye_color_hex(Color.ORANGE_1)
+
+    cand_colors: Dict[int, str] = {}
+    cand_centers: Dict[int, Optional[Tuple[float, float]]] = {}
+    for cand in extra.get("candidate_world", ()) or ():
+        if not isinstance(cand, Mapping):
+            continue
+        vid = int(cand.get("actor_id", -1))
+        cand_colors[vid] = vehicle_hex
+        cand_centers[vid] = fill_box(cand, Color.GREEN)
+
+    obj_colors: Dict[int, str] = {}
+    obj_centers: Dict[int, Optional[Tuple[float, float]]] = {}
+    for obj in extra.get("graph_object_world", ()) or ():
+        if not isinstance(obj, Mapping):
+            continue
+        oid = int(obj.get("actor_id", -1))
+        graph_obj = next((o for o in record.get("objects", ()) if int(o.get("node_id", -2)) == oid), {})
+        notable = bool(graph_obj.get("notable", False))
+        fill = _object_birdeye_color(str(obj.get("object_class", "vehicle")), notable=notable)
+        obj_colors[oid] = _birdeye_color_hex(fill)
+        border_w = 2 if notable else 1
+        obj_centers[oid] = fill_box(obj, fill, border_w=border_w)
+
+    ego = extra.get("ego_world")
+    ego_center = fill_box(ego, Color.ORANGE_1, border_w=2) if isinstance(ego, Mapping) else None
+
+    # One fixed rotation per episode: align episode-start ego heading to screen-up (birdeye convention).
+    rot_center = (crop_w / 2.0, crop_h / 2.0)
+    rot_deg = _birdeye_display_rotation_deg(float(ctx.get("origin_yaw", 0.0)))
+    rot_m = cv2.getRotationMatrix2D(rot_center, rot_deg, 1.0)
+    canvas = cv2.warpAffine(
+        canvas,
+        rot_m,
+        (crop_w, crop_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+
+    def to_display(px: float, py: float) -> Tuple[float, float]:
+        return _apply_affine((px, py), rot_m)
+
+    ax.imshow(canvas[:, :, ::-1], zorder=0)
+
+    show_candidates = bev is None or bool(getattr(bev, "show_candidates", True))
+    for vid, center in cand_centers.items():
+        if center is None:
+            continue
+        center = to_display(*center)
+        label = collab_label.get(vid, f"V{vid}") if vid in graph_vehicle_ids else f"C{vid}"
+        if vid in graph_vehicle_ids or show_candidates:
+            _bev_label(ax, center[0], center[1], label, color=cand_colors[vid],
+                       fontsize=7.5 if vid in graph_vehicle_ids else 5.0,
+                       weight="bold" if vid in graph_vehicle_ids else "normal",
+                       va="bottom" if vid in graph_vehicle_ids else "center", zorder=8)
+
+    for oid, center in obj_centers.items():
+        if center is None:
+            continue
+        center = to_display(*center)
+        _bev_label(ax, center[0], center[1], f"O{oid}", color=obj_colors[oid], fontsize=6.0, zorder=7)
+
+    if ego_center is not None:
+        ego_center = to_display(*ego_center)
+        _bev_label(ax, ego_center[0], ego_center[1], "EGO", color=ego_hex, fontsize=8.0, weight="bold",
+                   va="bottom", zorder=9)
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    return True
+
+
+def _birdeye_affine(record: Mapping[str, Any], ctx: Mapping[str, Any], bg: Mapping[str, Any]):
+    import cv2
+    import numpy as np
+
+    ego = _record_extra(record).get("ego_world")
+    pose = _world_pose(ego) if isinstance(ego, Mapping) else None
+    if pose is None:
+        return None
+    ego_px = _world_to_map_pixel(pose[0], pose[1], bg)
+    source_ppm = float(bg.get("pixels_per_meter", 1.0)) * float(bg.get("scale", 1.0))
+    image_size = int(ctx.get("image_size", 512))
+    obs_range = float(ctx.get("obs_range", 64.0))
+    ego_offset = float(ctx.get("ego_offset", 12.0))
+    output_ppm = float(image_size) / max(obs_range, 1e-6)
+    scale = output_ppm / max(source_ppm, 1e-6)
+    pixels_ahead_vehicle = (obs_range / 2.0 - ego_offset) * output_ppm
+    matrix = cv2.getRotationMatrix2D(ego_px, float(pose[2]) + 90.0, scale)
+    matrix[0][2] -= ego_px[0] - float(image_size) / 2.0
+    matrix[1][2] -= ego_px[1] - float(image_size) / 2.0 - pixels_ahead_vehicle
+    return np.asarray(matrix, dtype=float)
+
+
+def _apply_affine(point: Tuple[float, float], matrix) -> Tuple[float, float]:
+    return (
+        float(matrix[0][0] * point[0] + matrix[0][1] * point[1] + matrix[0][2]),
+        float(matrix[1][0] * point[0] + matrix[1][1] * point[1] + matrix[1][2]),
+    )
+
+
+def _item_bbox_pixels(item: Mapping[str, Any], bg: Mapping[str, Any], matrix) -> List[Tuple[float, float]]:
+    bbox = item.get("bbox") or ()
+    pts = []
+    for p in bbox:
+        if len(p) >= 2:
+            pts.append(_apply_affine(_world_to_map_pixel(float(p[0]), float(p[1]), bg), matrix))
+    if len(pts) >= 3:
+        return pts
+    pose = _world_pose(item)
+    if pose is None:
+        return []
+    center = _world_to_map_pixel(pose[0], pose[1], bg)
+    ppm = float(bg.get("pixels_per_meter", 1.0)) * float(bg.get("scale", 1.0))
+    yaw = math.radians(float(pose[2]))
+    length = float(item.get("length", _DEFAULT_OBJ_BOX_M[0]) or _DEFAULT_OBJ_BOX_M[0])
+    width = float(item.get("width", _DEFAULT_OBJ_BOX_M[1]) or _DEFAULT_OBJ_BOX_M[1])
+    hl, hw = length * ppm / 2.0, width * ppm / 2.0
+    fwd = (math.cos(yaw), math.sin(yaw))
+    right = (-math.sin(yaw), math.cos(yaw))
+    raw = [
+        (center[0] + a * hl * fwd[0] + b * hw * right[0], center[1] + a * hl * fwd[1] + b * hw * right[1])
+        for a, b in ((1, 1), (1, -1), (-1, -1), (-1, 1))
+    ]
+    return [_apply_affine(p, matrix) for p in raw]
+
+
+def _draw_pixel_box(ax, item: Mapping[str, Any], bg: Mapping[str, Any], matrix, *, edge: str, face: str = "none",
+                    lw: float = 1.4, alpha: float = 1.0, linestyle="solid", zorder: int = 4) -> Optional[Tuple[float, float]]:
+    pts = _item_bbox_pixels(item, bg, matrix)
+    if pts:
+        ax.add_patch(Polygon(pts, closed=True, facecolor=face, edgecolor=edge, linewidth=lw,
+                             alpha=alpha, linestyle=linestyle, zorder=zorder, clip_on=True))
+        return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+    pose = _world_pose(item)
+    if pose is None:
+        return None
+    xy = _apply_affine(_world_to_map_pixel(pose[0], pose[1], bg), matrix)
+    ax.scatter([xy[0]], [xy[1]], s=45, facecolors=face, edgecolors=edge, linewidths=lw, zorder=zorder, clip_on=True)
+    return xy
+
+
+def _draw_generated_birdeye_on_ax(ax, record: Mapping[str, Any], ctx: Mapping[str, Any], *, bev: Optional[BevOptions] = None) -> bool:
+    bg = ctx.get("map_background")
+    if not isinstance(bg, Mapping):
+        return False
+    matrix = _birdeye_affine(record, ctx, bg)
+    if matrix is None:
+        return False
+    path = bg.get("path")
+    if not path:
+        return False
+    try:
+        import cv2
+
+        img = cv2.imread(str(path))
+        if img is None:
+            return False
+        image_size = int(ctx.get("image_size", 512))
+        warped = cv2.warpAffine(
+            img,
+            matrix,
+            (image_size, image_size),
+            flags=cv2.INTER_AREA,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+        ax.imshow(warped[:, :, ::-1], extent=[0, image_size, image_size, 0], zorder=0)
+    except Exception:
+        return False
+
+    extra = _record_extra(record)
+    graph_vehicle_ids = {int(v["node_id"]) for v in record.get("vehicles", ())}
+    collab_label = {
+        int(v["node_id"]): f"V{n}"
+        for n, v in enumerate(sorted((v for v in record["vehicles"] if not v["is_ego"]), key=lambda v: v["slot"]), start=1)
+    }
+    if bev is None or bool(getattr(bev, "show_candidates", True)):
+        for cand in extra.get("candidate_world", ()) or ():
+            if not isinstance(cand, Mapping):
+                continue
+            vid = int(cand.get("actor_id", -1))
+            if vid in graph_vehicle_ids:
+                continue
+            center = _draw_pixel_box(ax, cand, bg, matrix, edge=BEV_VEHICLE_COLOR, face=BEV_VEHICLE_COLOR, lw=1.0, alpha=0.65,
+                                     linestyle=(0, (3, 2)), zorder=2)
+            if center is not None:
+                _bev_label(ax, center[0], center[1], f"C{vid}", color=BEV_VEHICLE_COLOR, fontsize=5.5, zorder=3)
+
+    for obj in extra.get("graph_object_world", ()) or ():
+        if not isinstance(obj, Mapping):
+            continue
+        oid = int(obj.get("actor_id", -1))
+        graph_obj = next((o for o in record.get("objects", ()) if int(o.get("node_id", -2)) == oid), {})
+        obj_hex = _object_birdeye_hex(str(obj.get("object_class", "vehicle")),
+                                      notable=bool(graph_obj.get("notable", False)))
+        style = BEV_VISIBLE_STYLE if bool(graph_obj.get("visible", False)) else BEV_COLLAB_ONLY_STYLE
+        center = _draw_pixel_box(ax, obj, bg, matrix, edge=obj_hex, face=obj_hex, lw=2.0, linestyle=style, zorder=5)
+        if center is not None:
+            _bev_label(ax, center[0], center[1], f"O{oid}", color=obj_hex, fontsize=6.0, zorder=6)
+
+    ego = extra.get("ego_world")
+    if isinstance(ego, Mapping):
+        center = _draw_pixel_box(ax, ego, bg, matrix, edge=BEV_EGO_COLOR, face=BEV_EGO_COLOR, lw=2.2, zorder=7)
+        if center is not None:
+            _bev_label(ax, center[0], center[1], "EGO", color=BEV_EGO_COLOR, fontsize=8.0, weight="bold", va="bottom", zorder=9)
+
+    for cand in extra.get("candidate_world", ()) or ():
+        if not isinstance(cand, Mapping):
+            continue
+        vid = int(cand.get("actor_id", -1))
+        if vid not in graph_vehicle_ids:
+            continue
+        center = _draw_pixel_box(ax, cand, bg, matrix, edge=BEV_VEHICLE_COLOR, face=BEV_VEHICLE_COLOR, lw=2.0, zorder=7)
+        if center is not None:
+            _bev_label(ax, center[0], center[1], collab_label.get(vid, f"V{vid}"),
+                       color=BEV_VEHICLE_COLOR, fontsize=8.0, weight="bold", va="bottom", zorder=9)
+    ax.set_xlim(0, image_size)
+    ax.set_ylim(image_size, 0)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    return True
+
+
+def _draw_generated_map_background(ax, ctx: Mapping[str, Any]) -> bool:
+    bg = ctx.get("map_background")
+    if not isinstance(bg, Mapping) or str(ctx.get("frame", "world")) != "world":
+        return False
+    path = bg.get("path")
+    if not path:
+        return False
+    try:
+        import cv2
+
+        img = cv2.imread(str(path))
+        if img is None:
+            return False
+        rgb = img[:, :, ::-1]
+        ppm = float(bg.get("pixels_per_meter", 1.0)) * float(bg.get("scale", 1.0))
+        ox, oy = bg.get("world_offset", (0.0, 0.0))
+        h, w = rgb.shape[:2]
+        xmin = float(ox)
+        xmax = xmin + float(w) / max(ppm, 1e-6)
+        ymin = float(oy)
+        ymax = ymin + float(h) / max(ppm, 1e-6)
+        ax.imshow(rgb, extent=[xmin, xmax, ymin, ymax], origin="lower", zorder=0)
+        return True
+    except Exception:
+        return False
 
 
 def _bev_label(ax, x: float, y: float, text: str, *, color: str, fontsize: float, weight: str = "normal",
                va: str = "center", ha: str = "center", zorder: int = 9) -> None:
-    """A BEV label that is legible on any background: coloured text with a white halo (no offset)."""
+    """A BEV label legible on birdeye backgrounds: fill-coloured text with a black halo."""
     txt = ax.text(x, y, text, fontsize=fontsize, weight=weight, ha=ha, va=va, color=color,
                   zorder=zorder, clip_on=True)  # clip with the axes so off-view labels vanish too
     txt.set_path_effects(_LABEL_HALO)
@@ -530,38 +1197,40 @@ def _overlay_graph_nodes(ax, record: Mapping[str, Any], *, cx: float, cy: float,
         pts.append((px, py))
         notable = bool(o.get("notable", False))
         ego_seen = bool(o.get("visible", False))
-        edge = BEV_OBJ_NOTABLE if notable else BEV_OBJ_PLAIN
+        obj_hex = _object_birdeye_hex(str(o.get("object_class", "vehicle")), notable=notable)
         style = BEV_VISIBLE_STYLE if ego_seen else BEV_COLLAB_ONLY_STYLE
         if o.get("object_class", "vehicle") == "vehicle":
             corners = _oriented_box_pixels(o, proj)
-            ax.add_patch(Polygon(corners, closed=True, facecolor="none", edgecolor=edge,
-                                 linewidth=2.0, linestyle=style, zorder=5, clip_on=True))
-        else:  # pedestrian / bicycle / other -> a small triangle so it never looks like a car box
-            ax.scatter([px], [py], s=70, marker="^", facecolors="none", edgecolors=edge,
-                       linewidths=2.0, linestyle=style, zorder=5, clip_on=True)
-        _bev_label(ax, px, py, f"O{o['node_id']}", color=edge, fontsize=6.0, zorder=6)
+            ax.add_patch(Polygon(corners, closed=True, facecolor=obj_hex, edgecolor=obj_hex,
+                                 linewidth=2.0, linestyle=style, zorder=5, clip_on=True, alpha=0.85))
+        else:
+            ax.scatter([px], [py], s=70, marker="^", facecolors=obj_hex, edgecolors=obj_hex,
+                       linewidths=2.0, linestyle=style, zorder=5, clip_on=True, alpha=0.85)
+        _bev_label(ax, px, py, f"O{o['node_id']}", color=obj_hex, fontsize=6.0, zorder=6)
 
     for v in vehicles:
         px, py = proj(float(v.get("x", 0.0)), float(v.get("y", 0.0)))
         pts.append((px, py))
         is_ego = bool(v["is_ego"])
-        if is_ego:
-            ax.scatter([px], [py], s=320, marker="*", c=BEV_EGO_COLOR, edgecolors="black",
-                       linewidths=1.2, zorder=7, clip_on=True)
-            _bev_label(ax, px, py + 12, "EGO", color="#0091A8", fontsize=8.0, weight="bold",
-                       va="bottom", zorder=8)
-        else:
-            ax.scatter([px], [py], s=150, marker="D", c=BEV_COLLAB_COLOR, edgecolors="black",
-                       linewidths=1.2, zorder=7, clip_on=True)
-            _bev_label(ax, px, py + 11, collab_label.get(v["idx"], f"V{v['node_id']}"),
-                       color="#7A1FB5", fontsize=8.0, weight="bold", va="bottom", zorder=8)
+        veh_hex = BEV_EGO_COLOR if is_ego else BEV_VEHICLE_COLOR
+        label = "EGO" if is_ego else collab_label.get(v["idx"], f"V{v['node_id']}")
+        corners = _oriented_box_pixels(v, proj)
+        if len(corners) >= 3:
+            ax.add_patch(Polygon(corners, closed=True, facecolor=veh_hex, edgecolor=veh_hex,
+                                 linewidth=2.0, zorder=7, clip_on=True, alpha=0.85))
+        _bev_label(ax, px, py + (12 if is_ego else 11), label, color=veh_hex, fontsize=8.0, weight="bold",
+                   va="bottom", zorder=8)
     return pts
 
 
 def _draw_bev_on_ax(ax, record: Mapping[str, Any], *, bev: Optional[BevOptions] = None) -> None:
     """BEV panel: the real CARLA birdeye with the policy graph overlaid; scatter fallback otherwise."""
+    mode = str(getattr(bev, "mode", "generated") if bev is not None else "generated").lower()
+    if mode == "scatter":
+        _draw_bev_scatter(ax, record)
+        return
     bpath = _resolve_birdeye_path(record, bev.birdeye_dir if bev else None)
-    if bpath is not None:
+    if bpath is not None and mode in {"auto", "birdeye-dir"}:
         import cv2
 
         img = cv2.imread(str(bpath))  # BGR
@@ -580,10 +1249,11 @@ def _draw_bev_on_ax(ax, record: Mapping[str, Any], *, bev: Optional[BevOptions] 
             ax.set_ylim(h, 0)  # image y points down
             ax.set_aspect("equal")
             ax.axis("off")
-            ax.set_title("BEV: ★EGO  ◆collab(V)  □=car(red notable/blue not, dashed=collab-only)",
-                         fontsize=7.0)
             return
-    _draw_bev_scatter(ax, record)
+    if mode == "birdeye-dir":
+        _draw_bev_scatter(ax, record)
+        return
+    _draw_generated_bev_on_ax(ax, record, bev=bev)
 
 
 def render_graph_matplotlib(
@@ -681,10 +1351,27 @@ def _frame_png_bytes(frame: Mapping[str, Any], *, dpi: int = 110, bev: Optional[
     return buf.getvalue()
 
 
+def _bev_with_context(records: Sequence[Mapping[str, Any]], bev: Optional[BevOptions]) -> BevOptions:
+    opts = bev or BevOptions()
+    if opts.contexts is not None or str(getattr(opts, "mode", "generated")).lower() in {"scatter", "birdeye-dir"}:
+        return opts
+    return BevOptions(
+        birdeye_dir=opts.birdeye_dir,
+        obs_range=opts.obs_range,
+        ego_offset=opts.ego_offset,
+        mode=opts.mode,
+        frame=opts.frame,
+        margin_m=opts.margin_m,
+        show_candidates=opts.show_candidates,
+        contexts=build_episode_bev_contexts(records, opts),
+    )
+
+
 def write_graph_frames_png(
     records: Sequence[Mapping[str, Any]], out_dir: PathLike, *, dpi: int = 110, bev: Optional[BevOptions] = None
 ) -> List[Path]:
     """Write one PNG per time-step frame; returns the written paths."""
+    bev = _bev_with_context(records, bev)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: List[Path] = []
@@ -702,6 +1389,7 @@ def write_graph_timeline_gif(
     """Render frames and assemble an animated GIF (via PIL)."""
     from PIL import Image
 
+    bev = _bev_with_context(records, bev)
     frames = group_records_to_frames(records)
     images: List["Image.Image"] = []
     for frame in frames:
@@ -784,6 +1472,7 @@ def write_graph_timeline_html(
     Each frame embeds its policies as **independent images** (one per policy, stacked one per row),
     not a single composite image, so policy panels stay separate and fixed-size.
     """
+    bev = _bev_with_context(records, bev)
     frames = group_records_to_frames(records)
     if not frames:
         raise ValueError("no records to render into HTML")

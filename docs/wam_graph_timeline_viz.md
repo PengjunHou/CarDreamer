@@ -53,10 +53,18 @@ step, policy_label, policy_id=None, extra=None)`:从 [graph.py](car_dreamer/tool
   notable→红、不重要→灰**。`veh_obs/obs_obj` 直箭头、`veh_veh` 用 `FancyArrowPatch(connectionstyle=
   "arc3")` 弧线并标注 `L=<L_M>s`。标题写 `step / policy_label / V2V|local / 计数`。
 - **拓扑图右边并排一张 BEV**(`_draw_bev_on_ax`):`render_graph_matplotlib` 每个 policy 渲成
-  **左拓扑 + 右 BEV** 两栏。BEV **以真实 CARLA birdeye 图为底 + 叠加 policy 图节点**:
-  `--birdeye-dir data/birdeye_frames` 时按 **ego id + step** 找 `vehicle_<egoid>/birdeye_<step>.png`
-  (`BirdeyeHandler` dump 的那批,带道路/车道/route/ego蓝盒/他车绿盒)`imshow` 做背景,再把**该 policy
-  图里的车辆/对象投影叠加上去**(`_overlay_graph_nodes`):
+  **左拓扑 + 右 BEV** 两栏。默认 `--bev-mode generated`，不读取 `data/birdeye_frames`，而是用录制时生成的
+  单张 CARLA map background（道路/车道线/路肩等，来自 `MapRenderer`，颜色/通道约定与 `data/birdeye_frames`
+  完全一致）。默认 `--bev-frame map`：把这张地图按 **episode 固定窗口**裁剪一次，**背景不随 ego 移动**，
+  ego 框在固定窗口里移动；车辆/对象用与 `BirdeyeRenderer` 相同的 cv2 `fillPoly`+白描边画法叠加（ego
+  橙色 ``Color.ORANGE_1``，与浅蓝车道中心线区分明显）。整张裁剪图按 episode 起始 ego yaw 做固定
+  ``yaw+90°`` 旋转，前进方向朝上（与 ``data/birdeye_frames`` 一致），背景不随 ego 平移/旋转。
+  固定窗口在离线渲染前扫描整个 episode 的 ego / cooperative candidates / graph objects，加 `--bev-margin-m`
+  得到同一 episode 共用的裁剪框，所以不会随 timestep 抖动。`--bev-frame birdeye` 改为 ego-centric warp、
+  `--bev-frame world/episode_start` 为 matplotlib 调试视图。
+- 可选 `--bev-mode auto --birdeye-dir data/birdeye_frames` 或 `--bev-mode birdeye-dir` 时，按 **ego id + step**
+  找 `vehicle_<egoid>/birdeye_<step>.png` (`BirdeyeHandler` dump 的那批,带道路/车道/route/ego蓝盒/他车绿盒)
+  `imshow` 做背景,再把**该 policy 图里的车辆/对象投影叠加上去**(`_overlay_graph_nodes`):
   - 投影:ego-frame (x=forward, y=right) → birdeye 像素,`ppm=W/obs_range`,
     ego 在 `(W/2, H/2+(obs_range/2-ego_offset)*ppm)`,forward↑、right→+x(`BevOptions(obs_range=64,
     ego_offset=12)`,与 `birdeye_wpt` 标定一致;`--bev-obs-range/--bev-ego-offset` 可调)。
@@ -71,10 +79,9 @@ step, policy_label, policy_id=None, extra=None)`:从 [graph.py](car_dreamer/tool
     - **线型编码可见性**:实线=ego 看得到,虚线=只有协作者看得到(区分 ego 视角 vs 协作视角)。
     - **标签 = 带白色描边的彩色文字**(`patheffects.withStroke`),直接落在图形上(无像素偏移,不会和
       图形错位),在深色路面和亮色车盒上都清楚;白字看不清的问题解决。
-  - **固定视野不抖动(关键修复)**:BEV 坐标轴**恒等于 birdeye 图像边界**(`set_xlim(0,w)/set_ylim(h,0)`),
-    每帧完全一致,**不再按 object 位置动态扩边**(那正是「图一会大一会小」的根因);视野外的节点
-    `clip_on=True` 裁掉(框、标签一起裁)。
-  - 找不到 birdeye 图才回退到带标签的 ego-centric 散点 BEV(range 调大到 `BEV_FALLBACK_RANGE_M=50`)。
+  - **固定视野不抖动(关键修复)**:birdeye-dir 模式下 BEV 坐标轴**恒等于 birdeye 图像边界**
+    (`set_xlim(0,w)/set_ylim(h,0)`);generated+birdeye 模式下同一 episode 复用同一个自动 `obs_range`。
+  - `--bev-mode scatter` 才使用旧的带标签 ego-centric 散点 BEV；这是 debug fallback，ego 会固定在原点。
   - **可选:想让远处 object 也进图** → 录制时加 `--wide-bev` dump 一张 100m、ego 居中的 `birdeye_wam100`
     (`common.yaml` 定义,obs_range=100/ego_offset=50,**不是模型输入**),渲染时配 `--bev-obs-range 100
     --bev-ego-offset 50`。这是**可选的更大底图**,不是抖动的修复手段;默认 64m `birdeye_wpt` 已经稳定,
@@ -107,9 +114,13 @@ step, policy_label, policy_id=None, extra=None)`:从 [graph.py](car_dreamer/tool
   仿 run_env 逐步跑 env,每步把 `sim._wam_graph` + 当前激活 policy(`sim._comm_process.policy`:local /
   coop[ids])抽成 record 追加进 JSONL。**只录单个 episode**:episode 结束(terminated/truncated)即停止,
   不再 reset 续录(避免不同 episode 步号撞车串帧)。policy 随 Td 切换体现为一个 episode 内的变化。
+  record 的 `extra` 同时保存 `ego_world`、`candidate_world`、`graph_object_world`，用于 generated BEV
+  按 `BirdeyeRenderer` 同款坐标/warp 叠加当前 policy graph；默认还会写一张 `<jsonl_stem>_map.png`
+  全局地图背景并记录 world→pixel 标定。旧 JSONL 没有这些字段时会退回简化 scatter。
 
 离线渲染 [scripts/visualize_wam_graph_timeline.py](scripts/visualize_wam_graph_timeline.py)
-`--jsonl IN --html/--gif/--png-dir [--policies a,b] [--fps]`(CARLA-free)。
+`--jsonl IN --html/--gif/--png-dir [--policies a,b] [--fps] [--bev-mode generated|auto|birdeye-dir|scatter]`
+(CARLA-free)。
 
 ---
 
