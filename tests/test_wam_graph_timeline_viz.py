@@ -223,10 +223,39 @@ class RenderAndWriteTest(unittest.TestCase):
             # the policy graph nodes are overlaid (V/O labels) on top of the birdeye
             bev_ax = next(ax for ax in fig.axes if ax.images)
             texts = {t.get_text() for t in bev_ax.texts}
-            self.assertIn("ego", texts)
+            self.assertIn("EGO", texts)  # ego overlay uses a distinct cyan star + bold "EGO" label
             self.assertTrue(any(t.startswith("O") for t in texts))
             matplotlib.pyplot.close(fig)
         self.assertIsNone(_resolve_birdeye_path(rec, None))  # no dir -> scatter fallback
+
+    def test_bev_overlay_boxes_and_fixed_bounds(self):
+        import matplotlib
+        import cv2
+        import numpy as np
+        from matplotlib.patches import Polygon
+
+        from car_dreamer.toolkit.wam import BevOptions
+
+        # ego sees vehicle 100 + pedestrian 102; collaborator 2 contributes vehicle 101 (collab-only)
+        rec = hetero_graph_to_record(_graph(selected=(2,)), step=7, policy_label="p")
+        n_vehicle_objs = sum(1 for o in rec["objects"] if o.get("valid") and o.get("object_class") == "vehicle")
+        ego_id = next(v["node_id"] for v in rec["vehicles"] if v["is_ego"])
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            vdir = d / f"vehicle_{ego_id}"
+            vdir.mkdir(parents=True)
+            W, H = 200, 160
+            cv2.imwrite(str(vdir / "birdeye_000007.png"), np.zeros((H, W, 3), np.uint8))
+            fig = render_graph_matplotlib(rec, bev=BevOptions(birdeye_dir=d))
+            bev_ax = next(ax for ax in fig.axes if ax.images)
+            # vehicle-class objects are drawn as oriented boxes (Polygon), not circles
+            polys = [p for p in bev_ax.patches if isinstance(p, Polygon)]
+            self.assertEqual(len(polys), n_vehicle_objs)
+            self.assertGreaterEqual(n_vehicle_objs, 1)
+            # FIXED limits == image bounds (identical every frame -> the BEV never grows/shrinks)
+            self.assertEqual(bev_ax.get_xlim(), (0.0, float(W)))
+            self.assertEqual(bev_ax.get_ylim(), (float(H), 0.0))  # image y points down
+            matplotlib.pyplot.close(fig)
 
     def test_html_uses_independent_per_policy_images(self):
         recs = [

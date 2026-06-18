@@ -32,7 +32,17 @@ def _setup_carla_pythonapi() -> None:
             sys.path.append(path)
 
 
-def build_env(task: str, env_args: List[str]):
+def _enable_wide_bev(config) -> None:
+    """Append the wide ego-centered birdeye (birdeye_wam100) for the BEV panel (record-only)."""
+    try:
+        enabled = list(config.env.observation.enabled)
+        if "birdeye_wam100" not in enabled:
+            config.env.observation.enabled = enabled + ["birdeye_wam100"]
+    except Exception as exc:  # pragma: no cover - config shape varies
+        print(f"warning: could not enable wide BEV (birdeye_wam100): {exc}", flush=True)
+
+
+def build_env(task: str, env_args: List[str], wide_bev: bool = False):
     import gymnasium as gym
 
     import car_dreamer
@@ -40,6 +50,8 @@ def build_env(task: str, env_args: List[str]):
 
     config = car_dreamer.load_task_configs(task)
     config, _ = toolkit.Flags(config).parse_known(env_args)
+    if wide_bev:
+        _enable_wide_bev(config)
     env = gym.make(config.env.name, config=config.env)
     return env, config
 
@@ -56,6 +68,9 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
                              "(mode-B counterfactual) for scripts/visualize_wam_graph_timeline.py. "
                              "When set, recording stops after a SINGLE episode (one consistent "
                              "candidate set, no cross-episode frames).")
+    parser.add_argument("--wide-bev", action="store_true", default=False,
+                        help="dump a wide 100m ego-centered birdeye (birdeye_wam100) for the BEV panel; "
+                             "render with visualize ... --bev-obs-range 100 --bev-ego-offset 50.")
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--display", dest="display", action="store_true", default=True)
@@ -270,7 +285,7 @@ def main() -> int:
         "--env.wam.build_graph=True",
         *passthrough,
     ]
-    env, config = build_env(known.task, env_args)
+    env, config = build_env(known.task, env_args, wide_bev=known.wide_bev)
     sim = env.unwrapped
     perc_cfg, stage1_cfg = wam_stage1_configs_from_env(config)
 

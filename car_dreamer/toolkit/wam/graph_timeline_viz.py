@@ -32,10 +32,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import matplotlib
 
 matplotlib.use("Agg")  # headless: render to files, never to a display
+import matplotlib.patheffects as patheffects  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.patches import Circle, FancyArrowPatch, FancyBboxPatch  # noqa: E402
+from matplotlib.patches import Circle, FancyArrowPatch, FancyBboxPatch, Polygon  # noqa: E402
 
-from .graph import MODALITIES, OBJECT, OBS_OBJ, OBSERVATION, VEH_OBS, VEH_VEH, VEHICLE
+from .graph import MODALITIES, OBJECT, OBJECT_CLASSES, OBS_OBJ, OBSERVATION, VEH_OBS, VEH_VEH, VEHICLE
 
 PathLike = Union[str, Path]
 
@@ -48,6 +49,19 @@ COLOR_OBS_COLLAB = "#F5E6A0"        # collaborator observation (buff/yellow)
 COLOR_OBJECT = "#E8A0A0"            # object notable to ego (red)
 COLOR_OBJECT_UNIMPORTANT = "#C9C9C9"  # non-notable object (gray)
 COLOR_EDGE = "#333333"
+
+# --- BEV overlay palette (drawn on top of the CARLA birdeye image) ---
+# Strong, unambiguous colours: black/white outlines were hard to tell apart, so notability is encoded
+# by a saturated outline colour and ego-vs-collaborator visibility by line *style* (solid vs dashed).
+BEV_EGO_COLOR = "#00E5FF"          # ego marker (bright cyan star) -- distinct from every birdeye colour
+BEV_COLLAB_COLOR = "#B14BFF"       # collaborator marker (purple diamond)
+BEV_OBJ_NOTABLE = "#FF2D2D"        # object notable to ego (vivid red outline)
+BEV_OBJ_PLAIN = "#3D9BFF"          # object not notable to ego (blue outline; clearly != red)
+BEV_VISIBLE_STYLE = "solid"        # ego can see the object
+BEV_COLLAB_ONLY_STYLE = (0, (4, 2))  # only a collaborator sees it (dashed)
+# a white halo makes any label legible on both the dark road and the bright vehicle boxes
+_LABEL_HALO = [patheffects.withStroke(linewidth=2.4, foreground="white")]
+_DEFAULT_OBJ_BOX_M = (4.6, 2.0)    # fallback length, width (m) when an object carries no extent
 
 # --- fixed figure geometry (constant across frames so the slider doesn't jitter) ---
 FIG_HEIGHT = 5.6
@@ -171,10 +185,12 @@ def hetero_graph_to_record(
     obj_notable = _as_list(graph[OBJECT], "notable") or [0.0] * len(obj_node_id)
     obj_visible = _as_list(graph[OBJECT], "visible") or [0.0] * len(obj_node_id)
     obj_invisible = _as_list(graph[OBJECT], "invisible") or [0.0] * len(obj_node_id)
-    obj_feat = _as_list(graph[OBJECT], "x")  # ego-frame state: [x, y, z, ...]
+    obj_class = _as_list(graph[OBJECT], "class_id") or [0] * len(obj_node_id)
+    obj_feat = _as_list(graph[OBJECT], "x")  # ego-frame state: [x, y, z, vx, vy, cos, sin, len, wid, hgt, 0]
     objects = []
     for i in range(len(obj_node_id)):
         feat = obj_feat[i] if i < len(obj_feat) else []
+        cid = int(obj_class[i]) if i < len(obj_class) else 0
         objects.append(
             {
                 "idx": i,
@@ -183,8 +199,14 @@ def hetero_graph_to_record(
                 "notable": bool(obj_notable[i] >= 0.5),
                 "visible": bool(obj_visible[i] >= 0.5),
                 "invisible": bool(obj_invisible[i] >= 0.5),
+                "class_id": cid,
+                "object_class": OBJECT_CLASSES[cid] if 0 <= cid < len(OBJECT_CLASSES) else "other",
                 "x": float(feat[0]) if len(feat) > 1 else 0.0,  # ego-frame forward
                 "y": float(feat[1]) if len(feat) > 1 else 0.0,  # ego-frame right
+                "heading_cos": float(feat[5]) if len(feat) > 6 else 1.0,
+                "heading_sin": float(feat[6]) if len(feat) > 6 else 0.0,
+                "length": float(feat[7]) if len(feat) > 7 else 0.0,
+                "width": float(feat[8]) if len(feat) > 8 else 0.0,
             }
         )
 
@@ -452,13 +474,46 @@ def _draw_bev_scatter(ax, record: Mapping[str, Any]) -> None:
     ax.set_title("BEV (ego-frame, forward ↑)", fontsize=9)
 
 
+def _bev_label(ax, x: float, y: float, text: str, *, color: str, fontsize: float, weight: str = "normal",
+               va: str = "center", ha: str = "center", zorder: int = 9) -> None:
+    """A BEV label that is legible on any background: coloured text with a white halo (no offset)."""
+    txt = ax.text(x, y, text, fontsize=fontsize, weight=weight, ha=ha, va=va, color=color,
+                  zorder=zorder, clip_on=True)  # clip with the axes so off-view labels vanish too
+    txt.set_path_effects(_LABEL_HALO)
+
+
+def _oriented_box_pixels(o: Mapping[str, Any], proj) -> List[Tuple[float, float]]:
+    """Corner pixels of an object's footprint box (ego-frame length/width/heading -> birdeye pixels)."""
+    fwd0, right0 = float(o.get("x", 0.0)), float(o.get("y", 0.0))
+    cyaw, syaw = float(o.get("heading_cos", 1.0)), float(o.get("heading_sin", 0.0))
+    length = float(o.get("length", 0.0)) or _DEFAULT_OBJ_BOX_M[0]
+    width = float(o.get("width", 0.0)) or _DEFAULT_OBJ_BOX_M[1]
+    hl, hw = length / 2.0, width / 2.0
+    fwd_unit = (cyaw, syaw)        # heading forward in (forward, right)
+    right_unit = (-syaw, cyaw)     # perpendicular (left/right) in (forward, right)
+    corners = []
+    for a, b in ((1, 1), (1, -1), (-1, -1), (-1, 1)):
+        cf = fwd0 + a * hl * fwd_unit[0] + b * hw * right_unit[0]
+        cr = right0 + a * hl * fwd_unit[1] + b * hw * right_unit[1]
+        corners.append(proj(cf, cr))
+    return corners
+
+
 def _overlay_graph_nodes(ax, record: Mapping[str, Any], *, cx: float, cy: float, ppm: float) -> List[Tuple[float, float]]:
     """Overlay this policy graph's vehicles/objects onto a birdeye image (pixel coords).
 
     Only the graph's nodes are drawn, so the overlay is exactly the policy-conditioned, visibility-
     filtered set: ego-visible objects + objects seen by the *cooperating* (selected) collaborators.
-    Objects only a non-cooperating vehicle sees are not in the graph, so they are not drawn. Object
-    fill = red(notable)/gray; **black edge = ego sees it, white edge = only a collaborator sees it**.
+    Objects only a non-cooperating vehicle sees are not in the graph, so they are not drawn.
+
+    Encoding (chosen so it reads clearly on the colourful birdeye):
+      * vehicle-class objects -> an oriented **rectangle** matching the birdeye car box (no extra circle);
+        other classes (pedestrian/bicycle) -> a small triangle marker.
+      * outline colour = ego-notability (red = notable, blue = not); line style = visibility
+        (solid = ego can see it, dashed = only a collaborator sees it).
+      * ego = bright cyan ``*`` star; collaborators = purple diamonds (``V1/V2``).
+      * every label is coloured text with a white halo, drawn at the node (no pixel offset, so it can't
+        drift off its shape).
     """
     vehicles = list(record["vehicles"])
     objects = [o for o in record["objects"] if o.get("valid", True)]
@@ -473,23 +528,33 @@ def _overlay_graph_nodes(ax, record: Mapping[str, Any], *, cx: float, cy: float,
     for o in objects:
         px, py = proj(float(o.get("x", 0.0)), float(o.get("y", 0.0)))
         pts.append((px, py))
-        fill = COLOR_OBJECT if o["notable"] else COLOR_OBJECT_UNIMPORTANT
+        notable = bool(o.get("notable", False))
         ego_seen = bool(o.get("visible", False))
-        edge = "black" if ego_seen else "white"  # white edge = collaborator-only (ego can't see it)
-        ax.scatter([px], [py], s=80, c=fill, edgecolors=edge, linewidths=1.6, zorder=5)
-        ax.text(px, py - 7, f"O{o['node_id']}", fontsize=5.5, ha="center", va="top", color="white",
-                zorder=6, bbox=dict(boxstyle="round,pad=0.1", fc="black", ec="none", alpha=0.5))
+        edge = BEV_OBJ_NOTABLE if notable else BEV_OBJ_PLAIN
+        style = BEV_VISIBLE_STYLE if ego_seen else BEV_COLLAB_ONLY_STYLE
+        if o.get("object_class", "vehicle") == "vehicle":
+            corners = _oriented_box_pixels(o, proj)
+            ax.add_patch(Polygon(corners, closed=True, facecolor="none", edgecolor=edge,
+                                 linewidth=2.0, linestyle=style, zorder=5, clip_on=True))
+        else:  # pedestrian / bicycle / other -> a small triangle so it never looks like a car box
+            ax.scatter([px], [py], s=70, marker="^", facecolors="none", edgecolors=edge,
+                       linewidths=2.0, linestyle=style, zorder=5, clip_on=True)
+        _bev_label(ax, px, py, f"O{o['node_id']}", color=edge, fontsize=6.0, zorder=6)
 
     for v in vehicles:
         px, py = proj(float(v.get("x", 0.0)), float(v.get("y", 0.0)))
         pts.append((px, py))
         is_ego = bool(v["is_ego"])
-        label = "ego" if is_ego else collab_label.get(v["idx"], f"V{v['node_id']}")
-        ax.scatter([px], [py], s=120, marker="s", facecolors="none",
-                   edgecolors=COLOR_EGO if is_ego else COLOR_COLLAB, linewidths=2.2, zorder=7)
-        ax.text(px, py + 8, label, fontsize=7, weight="bold", ha="center", va="bottom",
-                color=COLOR_EGO if is_ego else "#6A0DAD", zorder=8,
-                bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.7))
+        if is_ego:
+            ax.scatter([px], [py], s=320, marker="*", c=BEV_EGO_COLOR, edgecolors="black",
+                       linewidths=1.2, zorder=7, clip_on=True)
+            _bev_label(ax, px, py + 12, "EGO", color="#0091A8", fontsize=8.0, weight="bold",
+                       va="bottom", zorder=8)
+        else:
+            ax.scatter([px], [py], s=150, marker="D", c=BEV_COLLAB_COLOR, edgecolors="black",
+                       linewidths=1.2, zorder=7, clip_on=True)
+            _bev_label(ax, px, py + 11, collab_label.get(v["idx"], f"V{v['node_id']}"),
+                       color="#7A1FB5", fontsize=8.0, weight="bold", va="bottom", zorder=8)
     return pts
 
 
@@ -508,16 +573,14 @@ def _draw_bev_on_ax(ax, record: Mapping[str, Any], *, bev: Optional[BevOptions] 
             ppm = float(w) / max(obs_range, 1e-6)
             cx, cy = w / 2.0, h / 2.0 + (obs_range / 2.0 - ego_offset) * ppm
             ax.imshow(rgb, extent=[0, w, h, 0], zorder=0)
-            pts = _overlay_graph_nodes(ax, record, cx=cx, cy=cy, ppm=ppm)
-            # expand limits so objects beyond the birdeye view are still shown (issue: clipped objects)
-            xs = [0, w] + [p[0] for p in pts]
-            ys = [0, h] + [p[1] for p in pts]
-            m = 12.0
-            ax.set_xlim(min(xs) - m, max(xs) + m)
-            ax.set_ylim(max(ys) + m, min(ys) - m)  # image y points down
+            _overlay_graph_nodes(ax, record, cx=cx, cy=cy, ppm=ppm)
+            # FIXED limits = the birdeye image bounds, identical every frame, so the BEV never grows
+            # or shrinks with the object positions. Nodes outside the view are clipped (clip_on=True).
+            ax.set_xlim(0, w)
+            ax.set_ylim(h, 0)  # image y points down
             ax.set_aspect("equal")
             ax.axis("off")
-            ax.set_title("BEV (birdeye + policy overlay; ◻ego/collab, ●obj red=notable, white-edge=collab-only)",
+            ax.set_title("BEV: ★EGO  ◆collab(V)  □=car(red notable/blue not, dashed=collab-only)",
                          fontsize=7.0)
             return
     _draw_bev_scatter(ax, record)

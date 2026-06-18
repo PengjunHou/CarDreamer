@@ -37,7 +37,22 @@ def _setup_carla_pythonapi() -> None:
             sys.path.append(path)
 
 
-def build_env(task: str, env_args: List[str]):
+def _enable_wide_bev(config) -> None:
+    """Append the wide ego-centered birdeye (birdeye_wam100) to the ego observation (record-only).
+
+    Enabled last so its dump wins (data/birdeye_frames/vehicle_<id>/birdeye_<step>.png becomes the
+    100 m view). Does not touch the model's birdeye_wpt input. Render with the viz flags
+    ``--bev-obs-range 100 --bev-ego-offset 50``.
+    """
+    try:
+        enabled = list(config.env.observation.enabled)
+        if "birdeye_wam100" not in enabled:
+            config.env.observation.enabled = enabled + ["birdeye_wam100"]
+    except Exception as exc:  # pragma: no cover - config shape varies
+        print(f"warning: could not enable wide BEV (birdeye_wam100): {exc}", flush=True)
+
+
+def build_env(task: str, env_args: List[str], wide_bev: bool = False):
     import gymnasium as gym
 
     import car_dreamer
@@ -45,6 +60,8 @@ def build_env(task: str, env_args: List[str]):
 
     config = car_dreamer.load_task_configs(task)
     config, _ = toolkit.Flags(config).parse_known(env_args)
+    if wide_bev:
+        _enable_wide_bev(config)
     env = gym.make(config.env.name, config=config.env)
     return env, config
 
@@ -89,6 +106,9 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--print-every", type=int, default=50)
     parser.add_argument("--sleep", type=float, default=0.0)
+    parser.add_argument("--wide-bev", action="store_true", default=False,
+                        help="dump a wide 100m ego-centered birdeye (birdeye_wam100) for the BEV panel; "
+                             "render with visualize ... --bev-obs-range 100 --bev-ego-offset 50.")
     parser.add_argument("--no-display", dest="display", action="store_false", default=False)
     known, passthrough = parser.parse_known_args()
     passthrough = [arg for arg in passthrough if arg != "--"]
@@ -108,7 +128,7 @@ def main() -> int:
         f"--env.display.enable={bool(known.display)}",
         *passthrough,
     ]
-    env, _ = build_env(known.task, env_args)
+    env, _ = build_env(known.task, env_args, wide_bev=known.wide_bev)
     sim = env.unwrapped
 
     env.reset(seed=known.seed)

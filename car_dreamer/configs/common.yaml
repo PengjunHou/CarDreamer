@@ -93,6 +93,29 @@ env:
           background_vehicles,
         ]
 
+    # Wide ego-centered BEV for the WAM graph-timeline visualization (NOT a model input).
+    # obs_range=100 + ego_offset=50 => ego at the center, ~50 m in every direction, so all
+    # nearby objects fit. Enable it only during recording (scripts' --wide-bev), then render with
+    # `visualize_wam_graph_timeline.py --bev-obs-range 100 --bev-ego-offset 50`.
+    birdeye_wam100:
+      handler: birdeye
+      key: birdeye_wam100
+      shape: [256, 256, 3]
+      obs_range: 100
+      ego_offset: 50          # = obs_range/2 => ego centered (not bottom-anchored)
+      sight_fov: 64
+      sight_range: 128
+      observability: full
+      color_by_obs: False
+      waypoint_obs: visible
+      extend_wpt: False
+      entities:
+        [
+          roadmap,
+          ego_vehicle,
+          background_vehicles,
+        ]
+
     # Render all information on BEV
     birdeye_gt:
       handler: birdeye
@@ -175,7 +198,7 @@ env:
   communication: # V2V streaming communication model (Communication Model Specification)
     # --- timing parameters (seconds; converted to steps via world.fixed_delta_seconds) ---
     policy_duration_s: 2.0          # Td  -- cooperative policy lifetime (§2.1)
-    sensor_period_s: 0.2            # Ts  -- collaborator sensor sampling / streaming period (§2.2)
+    sensor_period_s: 0.2            # Ts  -- collaborator sensor sampling / streaming period (§2.2) # TODO：这里需要是fixed_delta_seconds的倍数
     prediction_window_s: 2.0        # Tw  -- receive-queue window on sensor time (§2.3)
     action_period_s: 1.0            # Ta  -- notable-motion prediction cadence (§2.4)
     proc_delay_s: 0.05              # T_proc -- per-message processing delay (§2.2; summed then rounded)
