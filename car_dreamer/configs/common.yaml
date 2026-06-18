@@ -204,7 +204,7 @@ env:
     proc_delay_s: 0.05              # T_proc -- per-message processing delay (§2.2; summed then rounded)
     flush_old_policy_queue: False   # §9  -- keep (True) vs drop (False) old-policy queued messages
     allow_cross_policy_messages: False  # §11 -- use only the active policy's messages
-    collaborator_modalities: [objlist]  # bundled modalities each collaborator streams per message
+    collaborator_modalities: [objlist, bev]  # bundled modalities each collaborator streams per message
     # --- transmission rate model (policy-allocated bandwidth + FSPL/SNR, §8) ---
     policy_bandwidth_hz: 6000000.0  # base bandwidth (Hz); actual B = policy_bandwidth_hz * ratio
     bandwidth_ratio: 1.0       # per-collaborator bandwidth ratio in [0, 1]; ratios need not sum to 1
@@ -225,8 +225,23 @@ env:
     uncertainty_threshold: 1.0
     visible_uncertainty: 0.2
     invisible_uncertainty: 2.0
-    default_modality: objlist
+    default_modality: bev
     base_station_policy: placeholder_all
+    predictor_mode: rule       # rule | checkpoint
+    predictor_checkpoint: null # Stage-1 checkpoint path when predictor_mode=checkpoint
+    predictor_device: auto     # auto | cpu | cuda
+    predictor_uncertainty_source: notable_weighted_trace
+    predictor_history_window: 4
+    policy_sampler_mode: request_all  # request_all | random_duration
+    random_policy:
+      local_prob: 0.2
+      collaborator_counts: ["1", all]
+      modalities:
+        - [objlist]
+        - [bev]
+        - [objlist, bev]
+      bandwidth_ratios: [0.5, 1.0]
+      respect_request: False
 
 runtime_logging:
   enabled: True

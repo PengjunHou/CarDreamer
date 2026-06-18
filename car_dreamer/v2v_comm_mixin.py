@@ -23,8 +23,9 @@ A host task opts in by:
   3. ``on_reset``: ``self._reset_group_runtime_state(); self._destroy_group_observers();
      super().on_reset(); self.groups.setdefault(GROUP_ID, set()).add(int(self.ego.id))``.
      (Candidate vehicles are registered automatically by the base-env scenario hook.)
-  4. ``on_step``: ``self._update_group_observations(); self._update_wam_runtime_state();
-     self._update_policy_lifecycle(step); self._run_comm_step(step)``.
+  4. ``on_step``: ``self._update_group_observations(); self._deliver_comm_messages(step);
+     self._update_wam_runtime_state(); self._update_policy_lifecycle(step);
+     self._stream_comm_messages(step)``.
   5. ``step`` / ``reset``: merge ``self._merge_step_info(info, action)`` /
      ``self._build_reset_info()`` into the returned info dict.
 
@@ -37,8 +38,11 @@ and (for graph reset info) ``self.get_wpt_dist``. The task config must provide a
 
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import is_dataclass
+from pathlib import Path
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 import carla
 import numpy as np
@@ -211,8 +215,57 @@ class V2VCommMixin:
         self._wam_bev_spec = BevSpec(size=self._wam_graph_bev_size, range_m=self._wam_graph_bev_range_m)
         self._wam_graph_net = None
         self._wam_graph_embeddings = None
+        stage1_cfg = getattr(wam_cfg, "stage1", None)
+        self._wam_predictor_mode = str(getattr(wam_cfg, "predictor_mode", "rule")).lower()
+        self._wam_predictor_checkpoint = getattr(wam_cfg, "predictor_checkpoint", None)
+        self._wam_predictor_device = str(getattr(wam_cfg, "predictor_device", "auto"))
+        self._wam_predictor_uncertainty_source = str(
+            getattr(wam_cfg, "predictor_uncertainty_source", "notable_weighted_trace")
+        )
+        self._wam_predictor_history_window = int(
+            getattr(wam_cfg, "predictor_history_window", getattr(stage1_cfg, "history_window", 4))
+        )
+        self._wam_predictor_model = None
+        self._wam_predictor_loaded_path = None
+        self._wam_predictor_device_resolved = None
+        random_policy_cfg = getattr(wam_cfg, "random_policy", None)
+        self._wam_policy_sampler_mode = str(getattr(wam_cfg, "policy_sampler_mode", "request_all")).lower()
+        self._wam_random_policy_local_prob = float(getattr(random_policy_cfg, "local_prob", 0.2))
+        self._wam_random_policy_counts = self._as_config_list(
+            getattr(random_policy_cfg, "collaborator_counts", (1, "all")),
+            default=(1, "all"),
+        )
+        self._wam_random_policy_modalities = self._normalize_modality_options(
+            getattr(random_policy_cfg, "modalities", None)
+        )
+        self._wam_random_policy_bandwidth_ratios = tuple(
+            float(np.clip(float(v), 0.0, 1.0))
+            for v in self._as_config_list(getattr(random_policy_cfg, "bandwidth_ratios", (1.0,)), default=(1.0,))
+        ) or (1.0,)
+        self._wam_random_policy_respect_request = bool(getattr(random_policy_cfg, "respect_request", False))
+        seed = getattr(random_policy_cfg, "seed", None)
+        self._wam_policy_rng = np.random.default_rng(None if seed is None else int(seed))
 
         self._reset_wam_runtime_state()
+
+    def _as_config_list(self, value, *, default=()):
+        if value is None:
+            return list(default)
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
+    def _normalize_modality_options(self, raw_options) -> tuple:
+        options = []
+        for raw in self._as_config_list(raw_options, default=(self._collaborator_modalities,)):
+            if isinstance(raw, str):
+                parts = [p.strip() for p in raw.replace("+", ",").split(",") if p.strip()]
+                modalities = tuple(parts) or (raw,)
+            else:
+                modalities = tuple(str(m) for m in raw)
+            if modalities:
+                options.append(modalities)
+        return tuple(options) or (tuple(self._collaborator_modalities),)
 
     def _get_config_value(self, path, default):
         value = self._config
@@ -275,6 +328,10 @@ class V2VCommMixin:
         self._wam_motion_predictions = {}
         self._wam_coop_request = None
         self._wam_graph = None
+        self._wam_graph_step = -1
+        graph_window_len = max(int(getattr(self, "_wam_predictor_history_window", 4)), 0) + 1
+        self._wam_graph_window: Deque[Any] = deque(maxlen=graph_window_len)
+        self._wam_graph_window_last_step = -1
         self._wam_graph_embeddings = None
         self._wam_policy = WAMPolicy(
             selected_vehicle_ids=(),
@@ -374,6 +431,66 @@ class V2VCommMixin:
             reason="coop_request",
         )
 
+    def _random_policy_collaborator_count(self, n_candidates: int) -> int:
+        options = tuple(getattr(self, "_wam_random_policy_counts", (1, "all"))) or (1, "all")
+        choice = options[int(self._wam_policy_rng.integers(0, len(options)))]
+        if isinstance(choice, str):
+            text = choice.strip().lower()
+            if text == "all":
+                return int(n_candidates)
+            try:
+                return int(text)
+            except ValueError:
+                return int(n_candidates)
+        return int(choice)
+
+    def _sample_random_comm_policy(self, step: int, candidates: List[int]) -> CommPolicy:
+        """Sample one real policy for the next Td during data collection.
+
+        This is not counterfactual enumeration: the sampled policy is installed into
+        ``CommunicationProcess`` and the queues evolve under it until the policy expires.
+        """
+        candidates = sorted(int(c) for c in candidates)
+        local_prob = float(np.clip(float(getattr(self, "_wam_random_policy_local_prob", 0.2)), 0.0, 1.0))
+        if not candidates or float(self._wam_policy_rng.random()) < local_prob:
+            return make_local_policy(
+                policy_id=self._next_policy_id(),
+                request_vehicle_id=int(self.ego.id),
+                start_step=int(step),
+                duration_steps=int(self._comm_config.policy_duration_steps),
+            )
+
+        k = self._random_policy_collaborator_count(len(candidates))
+        k = min(max(int(k), 0), len(candidates))
+        if k <= 0:
+            return make_local_policy(
+                policy_id=self._next_policy_id(),
+                request_vehicle_id=int(self.ego.id),
+                start_step=int(step),
+                duration_steps=int(self._comm_config.policy_duration_steps),
+            )
+
+        selected = tuple(sorted(int(v) for v in self._wam_policy_rng.choice(candidates, size=k, replace=False)))
+        modality_options = getattr(self, "_wam_random_policy_modalities", None)
+        if not modality_options:
+            modality_options = (tuple(getattr(self, "_collaborator_modalities", ("objlist",))),)
+        modality_options = tuple(modality_options)
+        modalities = tuple(modality_options[int(self._wam_policy_rng.integers(0, len(modality_options)))])
+        ratios = tuple(getattr(self, "_wam_random_policy_bandwidth_ratios", (1.0,))) or (1.0,)
+        bandwidth_ratio = float(ratios[int(self._wam_policy_rng.integers(0, len(ratios)))])
+        bandwidth_ratio = float(np.clip(bandwidth_ratio, 0.0, 1.0))
+
+        return CommPolicy(
+            policy_id=self._next_policy_id(),
+            request_vehicle_id=int(self.ego.id),
+            start_step=int(step),
+            duration_steps=int(self._comm_config.policy_duration_steps),
+            selected_collaborators=selected,
+            modalities_by_vehicle={int(c): modalities for c in selected},
+            bandwidth_by_vehicle={int(c): bandwidth_ratio for c in selected},
+            reason="random_duration",
+        )
+
     def _sync_policy_views(self, policy: CommPolicy) -> None:
         """Mirror the active :class:`CommPolicy` into the WAMPolicy view used for info/graph."""
         self.selected_collaborators = set(int(c) for c in policy.selected_collaborators)
@@ -395,11 +512,28 @@ class V2VCommMixin:
             return
         proc = self._ensure_comm_process()
         active = proc.policy
+        request = getattr(self, "_wam_coop_request", None)
+        candidates = sorted(int(v) for v in getattr(self, "coop_participant_ids", set()))
+        sampler_mode = str(getattr(self, "_wam_policy_sampler_mode", "request_all")).lower()
+        if sampler_mode == "random_duration":
+            if active is not None and active.active_at(step):
+                return  # sampled policies, including local-only, persist for the full Td
+            if bool(getattr(self, "_wam_random_policy_respect_request", False)) and request is None:
+                policy = make_local_policy(
+                    policy_id=self._next_policy_id(),
+                    request_vehicle_id=int(self.ego.id),
+                    start_step=int(step),
+                    duration_steps=int(self._comm_config.policy_duration_steps),
+                )
+            else:
+                policy = self._sample_random_comm_policy(step, candidates)
+            proc.set_policy(policy, int(step))
+            self._sync_policy_views(policy)
+            return
+
         if active is not None and not active.is_local_only and active.active_at(step):
             return  # an active cooperative policy runs for its full duration
 
-        request = getattr(self, "_wam_coop_request", None)
-        candidates = sorted(int(v) for v in getattr(self, "coop_participant_ids", set()))
         if request is not None and candidates:
             policy = self._build_coop_policy(step, candidates)
         elif active is not None and active.is_local_only and active.active_at(step):
@@ -459,10 +593,14 @@ class V2VCommMixin:
             data=data,
         )
 
-    def _run_comm_step(self, step: int) -> None:
-        """One simulation step of the streaming comm process: deliver, then stream at sensor ticks."""
+    def _deliver_comm_messages(self, step: int) -> None:
+        """Deliver messages whose transmission completed by this simulation step."""
         proc = self._ensure_comm_process()
         proc.deliver(int(step))
+
+    def _stream_comm_messages(self, step: int) -> None:
+        """Generate collaborator messages at sensor ticks under the active policy."""
+        proc = self._ensure_comm_process()
         if not proc.is_sensor_tick(int(step)):
             return
         self._refresh_object_states(int(step))  # collaborator snapshots use current visibility (Ts)
@@ -490,6 +628,11 @@ class V2VCommMixin:
                 len(proc.in_flight),
                 len(proc.receive_queue),
             )
+
+    def _run_comm_step(self, step: int) -> None:
+        """One simulation step of the streaming comm process: deliver, then stream at sensor ticks."""
+        self._deliver_comm_messages(step)
+        self._stream_comm_messages(step)
 
     def _build_group_actor_map(self) -> Dict[int, carla.Actor]:
         actor_map: Dict[int, carla.Actor] = {}
@@ -654,23 +797,7 @@ class V2VCommMixin:
         self._wam_object_states = self._wam_build_object_states()
         self._wam_object_states_step = int(step)
 
-    def _update_wam_runtime_state(self, *, force: bool = False) -> None:
-        """Refresh perception every step; recompute motion uncertainty + request every ``Ta`` (§2.4).
-
-        This is the ego's own *local sensing -> notable-object motion prediction -> request* chain.
-        It no longer decides the policy (see :meth:`_update_policy_lifecycle`) nor builds the graph
-        (see :meth:`_build_wam_graph`), both of which are driven by the receive queue.
-        """
-        if not bool(getattr(self, "_wam_enabled", True)):
-            return
-        step = int(getattr(self, "_time_step", 0))
-        self._refresh_object_states(step)  # perception: every step (deduped)
-
-        last = int(getattr(self, "_wam_last_predict_step", -1))
-        action_period = max(int(self._comm_config.action_period_steps), 1)
-        if not force and last >= 0 and (step - last) < action_period:
-            return  # notable-motion prediction / request runs only every Ta
-
+    def _update_wam_notable_records(self) -> None:
         route_points = self._wam_reference_route_points()
         self._wam_notable_records = select_notable_objects(
             self._wam_object_states,
@@ -678,6 +805,40 @@ class V2VCommMixin:
             notable_distance_m=float(self._wam_notable_distance_m),
             max_notable_objects=int(self._wam_max_notable_objects),
         )
+
+    def _update_wam_runtime_state(self, *, force: bool = False) -> None:
+        """Refresh perception/graph every step; recompute request every ``Ta`` (§2.4)."""
+        if not bool(getattr(self, "_wam_enabled", True)):
+            return
+        step = int(getattr(self, "_time_step", 0))
+        self._refresh_object_states(step)  # perception: every step (deduped)
+        self._update_wam_notable_records()
+        if bool(getattr(self, "_wam_build_graph", True)):
+            self._update_wam_graph(step)
+            self._update_wam_graph_window(step)
+
+        last = int(getattr(self, "_wam_last_predict_step", -1))
+        action_period = max(int(self._comm_config.action_period_steps), 1)
+        if not force and last >= 0 and (step - last) < action_period:
+            return  # notable-motion prediction / request runs only every Ta
+
+        mode = str(getattr(self, "_wam_predictor_mode", "rule")).lower()
+        if mode == "checkpoint":
+            self._predict_wam_with_checkpoint(step)
+        else:
+            self._predict_wam_with_rule(step)
+        self._wam_last_predict_step = step
+        if should_log_periodic(step, int(get_runtime_logging_config()["step_debug_interval"]), logger=V2V_LOGGER):
+            V2V_LOGGER.debug(
+                "WAM step=%d predictor=%s notable=%s max_uncertainty=%.3f triggered=%s",
+                step,
+                mode,
+                [record.object_state.actor_id for record in self._wam_notable_records],
+                self._wam_max_uncertainty(),
+                self._wam_coop_request is not None,
+            )
+
+    def _predict_wam_with_rule(self, step: int) -> None:
         dt = float(getattr(getattr(self._config, "world", None), "fixed_delta_seconds", 0.1))
         self._wam_motion_predictions = predict_notable_motion(
             self._wam_notable_records,
@@ -692,15 +853,98 @@ class V2VCommMixin:
             predictions=self._wam_motion_predictions,
             uncertainty_threshold=float(self._wam_uncertainty_threshold),
         )
-        self._wam_last_predict_step = step
-        if should_log_periodic(step, int(get_runtime_logging_config()["step_debug_interval"]), logger=V2V_LOGGER):
-            V2V_LOGGER.debug(
-                "WAM step=%d notable=%s max_uncertainty=%.3f triggered=%s",
-                step,
-                [record.object_state.actor_id for record in self._wam_notable_records],
-                self._wam_max_uncertainty(),
-                self._wam_coop_request is not None,
+
+    def _resolve_wam_predictor_device(self) -> torch.device:
+        requested = str(getattr(self, "_wam_predictor_device", "auto")).lower()
+        if requested == "auto":
+            requested = "cuda" if torch.cuda.is_available() else "cpu"
+        return torch.device(requested)
+
+    def _load_wam_predictor(self):
+        checkpoint = getattr(self, "_wam_predictor_checkpoint", None)
+        if checkpoint in (None, "", "null"):
+            raise RuntimeError("wam.predictor_mode=checkpoint requires wam.predictor_checkpoint")
+        checkpoint_path = Path(str(checkpoint)).expanduser()
+        if self._wam_predictor_model is not None and self._wam_predictor_loaded_path == str(checkpoint_path):
+            return self._wam_predictor_model
+
+        from .toolkit.wam import WAMPerceptionConfig, WAMPerceptionModel
+
+        device = self._resolve_wam_predictor_device()
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        cfg = ckpt.get("perception_config") if isinstance(ckpt, dict) else None
+        if cfg is None:
+            cfg = WAMPerceptionConfig(
+                route_waypoints=int(self._wam_graph_route_waypoints),
+                hidden_dim=int(self._wam_graph_hidden_dim),
+                num_layers=int(self._wam_graph_num_layers),
+                num_heads=int(self._wam_graph_num_heads),
+                bev_channels=int(self._wam_graph_bev_channels),
+                bev_size=int(self._wam_graph_bev_size),
             )
+        elif isinstance(cfg, dict):
+            cfg = WAMPerceptionConfig(**cfg)
+        elif is_dataclass(cfg):
+            # Saved checkpoints store the dataclass directly.
+            pass
+        else:
+            raise TypeError(f"Unsupported perception_config type: {type(cfg)!r}")
+
+        model = WAMPerceptionModel(cfg).to(device)
+        state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+        model.load_state_dict(state)
+        model.eval()
+        self._wam_predictor_model = model
+        self._wam_predictor_loaded_path = str(checkpoint_path)
+        self._wam_predictor_device_resolved = device
+        return model
+
+    def _graph_window_ready(self) -> bool:
+        required = max(int(getattr(self, "_wam_predictor_history_window", 4)), 0) + 1
+        return len(getattr(self, "_wam_graph_window", ())) >= required
+
+    def _predict_wam_with_checkpoint(self, step: int) -> None:
+        self._wam_motion_predictions = {}
+        self._wam_coop_request = None
+        if not self._graph_window_ready():
+            return
+        model = self._load_wam_predictor()
+        device = self._wam_predictor_device_resolved or self._resolve_wam_predictor_device()
+        required = max(int(getattr(self, "_wam_predictor_history_window", 4)), 0) + 1
+        window = [graph.clone().to(device) for graph in list(self._wam_graph_window)[-required:]]
+        with torch.no_grad():
+            out = model(window)
+        object_ids = [int(v) for v in out["object_node_ids"].detach().cpu().tolist()]
+        if not object_ids:
+            return
+        notable_prob = out["notable_prob"].detach()
+        trace = torch.exp(out["traj_log_var"].detach()).sum(dim=-1)  # [Q, H]
+        uncertainty = trace.mean(dim=-1)
+        source = str(getattr(self, "_wam_predictor_uncertainty_source", "notable_weighted_trace"))
+        score = notable_prob * uncertainty if source == "notable_weighted_trace" else uncertainty
+        mu = out["traj_mu"].detach().cpu()
+        score_cpu = score.detach().cpu()
+        uncertainty_cpu = uncertainty.detach().cpu()
+        from .toolkit.wam import MotionPredictionRecord
+
+        self._wam_motion_predictions = {}
+        for idx, actor_id in enumerate(object_ids):
+            future_xy = tuple((float(x), float(y)) for x, y in mu[idx].tolist())
+            u = float(score_cpu[idx])
+            raw_u = float(uncertainty_cpu[idx])
+            cov = tuple((raw_u, raw_u) for _ in future_xy)
+            self._wam_motion_predictions[int(actor_id)] = MotionPredictionRecord(
+                actor_id=int(actor_id),
+                future_xy=future_xy,
+                covariance_diag=cov,
+                uncertainty_score=u,
+            )
+        self._wam_coop_request = build_coop_request(
+            ego_id=int(self.ego.id),
+            step=step,
+            predictions=self._wam_motion_predictions,
+            uncertainty_threshold=float(self._wam_uncertainty_threshold),
+        )
 
     def _wam_max_uncertainty(self) -> float:
         if not getattr(self, "_wam_motion_predictions", None):
@@ -760,6 +1004,24 @@ class V2VCommMixin:
             q_comp=1.0,
             route_xy=(),
         )
+
+    def _update_wam_graph(self, step: Optional[int] = None) -> None:
+        if step is None:
+            step = int(getattr(self, "_time_step", 0))
+        if int(getattr(self, "_wam_graph_step", -1)) == int(step) and self._wam_graph is not None:
+            return
+        self._build_wam_graph(int(step))
+        self._wam_graph_step = int(step)
+
+    def _update_wam_graph_window(self, step: Optional[int] = None) -> None:
+        if step is None:
+            step = int(getattr(self, "_time_step", 0))
+        if self._wam_graph is None:
+            return
+        if int(getattr(self, "_wam_graph_window_last_step", -1)) == int(step):
+            return
+        self._wam_graph_window.append(self._wam_graph)
+        self._wam_graph_window_last_step = int(step)
 
     def _build_wam_graph(self, step: Optional[int] = None) -> None:
         """Assemble the cooperative graph from the **receive queue** (§12-§14).
@@ -892,9 +1154,11 @@ class V2VCommMixin:
             self._wam_graph_embeddings = self._wam_graph_net(self._wam_graph)
 
     def _wam_info(self) -> Dict[str, Any]:
-        self._update_wam_runtime_state()
+        step = int(getattr(self, "_time_step", 0))
+        self._refresh_object_states(step)
+        self._update_wam_notable_records()
         if self._wam_build_graph:
-            self._build_wam_graph(int(getattr(self, "_time_step", 0)))
+            self._update_wam_graph(step)
         notable = list(getattr(self, "_wam_notable_records", []))
         policy = getattr(self, "_wam_policy", None)
         info = {

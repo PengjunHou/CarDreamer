@@ -1,5 +1,11 @@
 import unittest
+from collections import deque
+from types import SimpleNamespace
 
+import numpy as np
+import torch
+
+from car_dreamer.v2v_comm_mixin import V2VCommMixin
 from car_dreamer.toolkit.wam import (
     ObjectState,
     build_coop_request,
@@ -141,6 +147,103 @@ class WAMRuntimeTest(unittest.TestCase):
 
         self.assertEqual(policy.selected_vehicle_ids, ())
         self.assertEqual(policy.modality_by_vehicle, {})
+
+    def test_checkpoint_predictor_uses_graph_window_to_request_coop(self):
+        class DummyGraph:
+            def clone(self):
+                return self
+
+            def to(self, device):
+                del device
+                return self
+
+        class DummyModel:
+            def __call__(self, window):
+                self.window_len = len(window)
+                return {
+                    "object_node_ids": torch.tensor([7, 8], dtype=torch.long),
+                    "notable_prob": torch.tensor([1.0, 0.1], dtype=torch.float32),
+                    "traj_mu": torch.zeros((2, 3, 2), dtype=torch.float32),
+                    "traj_log_var": torch.zeros((2, 3, 2), dtype=torch.float32),
+                }
+
+        mixin = object.__new__(V2VCommMixin)
+        model = DummyModel()
+        mixin._wam_predictor_history_window = 1
+        mixin._wam_graph_window = deque([DummyGraph(), DummyGraph()], maxlen=2)
+        mixin._wam_predictor_device_resolved = torch.device("cpu")
+        mixin._wam_predictor_uncertainty_source = "notable_weighted_trace"
+        mixin._wam_uncertainty_threshold = 0.5
+        mixin.ego = SimpleNamespace(id=100)
+        mixin._load_wam_predictor = lambda: model
+
+        mixin._predict_wam_with_checkpoint(step=12)
+
+        self.assertEqual(model.window_len, 2)
+        self.assertIsNotNone(mixin._wam_coop_request)
+        self.assertEqual(mixin._wam_coop_request.high_uncertainty_object_ids, (7,))
+        self.assertIn(7, mixin._wam_motion_predictions)
+        self.assertNotIn(8, mixin._wam_coop_request.high_uncertainty_object_ids)
+
+    def test_random_duration_sampler_builds_valid_comm_policy(self):
+        mixin = object.__new__(V2VCommMixin)
+        mixin._wam_policy_rng = np.random.default_rng(0)
+        mixin._wam_random_policy_local_prob = 0.0
+        mixin._wam_random_policy_counts = ("all",)
+        mixin._wam_random_policy_modalities = (("bev",),)
+        mixin._wam_random_policy_bandwidth_ratios = (0.5,)
+        mixin._comm_config = SimpleNamespace(policy_duration_steps=5)
+        mixin._comm_policy_counter = 0
+        mixin.ego = SimpleNamespace(id=100)
+
+        policy = mixin._sample_random_comm_policy(step=10, candidates=[3, 1, 2])
+
+        self.assertEqual(policy.start_step, 10)
+        self.assertEqual(policy.duration_steps, 5)
+        self.assertEqual(policy.selected_collaborators, (1, 2, 3))
+        self.assertEqual(policy.modalities_by_vehicle, {1: ("bev",), 2: ("bev",), 3: ("bev",)})
+        self.assertEqual(policy.bandwidth_by_vehicle, {1: 0.5, 2: 0.5, 3: 0.5})
+        self.assertEqual(policy.reason, "random_duration")
+
+    def test_random_duration_policy_lifecycle_respects_td(self):
+        class DummyProc:
+            def __init__(self):
+                self.policy = None
+                self.set_count = 0
+
+            def set_policy(self, policy, step):
+                del step
+                self.policy = policy
+                self.set_count += 1
+
+        mixin = object.__new__(V2VCommMixin)
+        proc = DummyProc()
+        mixin._ensure_comm_process = lambda: proc
+        mixin._wam_enabled = True
+        mixin._wam_policy_sampler_mode = "random_duration"
+        mixin._wam_random_policy_respect_request = False
+        mixin._wam_policy_rng = np.random.default_rng(0)
+        mixin._wam_random_policy_local_prob = 1.0
+        mixin._wam_random_policy_counts = ("all",)
+        mixin._wam_random_policy_modalities = (("objlist",),)
+        mixin._wam_random_policy_bandwidth_ratios = (1.0,)
+        mixin._comm_config = SimpleNamespace(policy_duration_steps=5, sensor_period_steps=1)
+        mixin._comm_policy_counter = 0
+        mixin._wam_coop_request = None
+        mixin.coop_participant_ids = {1, 2}
+        mixin.selected_collaborators = set()
+        mixin.ego = SimpleNamespace(id=100)
+
+        mixin._update_policy_lifecycle(step=0)
+        first_policy_id = proc.policy.policy_id
+        mixin._update_policy_lifecycle(step=1)
+        mixin._update_policy_lifecycle(step=4)
+        self.assertEqual(proc.set_count, 1)
+        self.assertEqual(proc.policy.policy_id, first_policy_id)
+
+        mixin._update_policy_lifecycle(step=5)
+        self.assertEqual(proc.set_count, 2)
+        self.assertNotEqual(proc.policy.policy_id, first_policy_id)
 
 
 if __name__ == "__main__":

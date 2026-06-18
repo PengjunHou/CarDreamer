@@ -49,15 +49,26 @@ local-only 也是一种 policy `π_local=(∅,0,∅)`。
   `is_local_only` = 无协作者。
   `make_local_policy(...)` 构造 local-only。
 - [v2v_comm_mixin.py](car_dreamer/v2v_comm_mixin.py) `_update_policy_lifecycle(step)`（每步、Ta 节流的感知之后）：
-  - 协作 policy 在其 `Td` 内**整段保持**（不中途重算）；
-  - 否则:有高不确定性请求且有候选 → `_build_coop_policy`(全候选协作、打包 `collaborator_modalities`、
+  - `env.wam.policy_sampler_mode=request_all`（默认）：协作 policy 在其 `Td` 内**整段保持**（不中途重算）；
+    否则有高不确定性请求且有候选 → `_build_coop_policy`(全候选协作、打包 `collaborator_modalities`、
     给每个候选设置 `bandwidth_ratio`)；
-  - 当前是 local-only 且未过期且无请求 → 保持(避免抖动)；否则装新的 local-only。
+    当前是 local-only 且未过期且无请求 → 保持(避免抖动)；否则装新的 local-only。
+  - `env.wam.policy_sampler_mode=random_duration`：任意 active policy（含 local-only）在 `Td` 内保持；
+    到期后从 `env.wam.random_policy.*` 真实采样一个 local-only 或 cooperative `CommPolicy`，用于多 policy
+    Stage-1 数据收集。
   - 转换时 `CommunicationProcess.set_policy(policy, step)` 安装，并 `_sync_policy_views` 把它镜像成
     `WAMPolicy` 视图(供 info/图构建)。
 
-请求由 ego 自己的 *local sensing → notable motion 预测 → 不确定性* 链路触发：
-`_update_wam_runtime_state` 每 `Ta` 重算一次 `build_coop_request`（§2.4）。
+在线 step 顺序是：先 `_deliver_comm_messages(step)` 把已经完成传输的消息放入 receive queue，再
+`_update_wam_runtime_state()` 用当前可用消息构建 `G_t` 并滑入 graph window，随后每 `Ta` 选择
+`rule` 或 Stage-1 `checkpoint` predictor 重算一次 `build_coop_request`（§2.4）。最后
+`_update_policy_lifecycle(step)` 根据 request 安装/保持 policy，并在 sensor tick 通过
+`_stream_comm_messages(step)` 发送新消息。
+
+默认 `env.wam.predictor_mode: rule`，用于 bootstrap 数据收集；设置为 `checkpoint` 时，在线 request
+触发会加载 `env.wam.predictor_checkpoint` 指向的 Stage-1 `WAMPerceptionModel`，输入最近
+`predictor_history_window + 1` 张图组成的 graph window，用 `notable_prob × traj_log_var` 的轨迹不确定性
+生成 `CoopRequest`。
 
 ---
 

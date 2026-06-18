@@ -130,13 +130,31 @@ dataset/collate、trainer 单 batch 有限 + **过拟合下降** + checkpoint �
 
 **在线（录制需 CARLA；训练不需）**
 ```bash
+# 默认 bootstrap：rule request 触发后 all-collaborators，否则 local-only。
 python scripts/record_wam_stage1_data.py --task carla_group_right_turn_auto --carla-port 2000 --steps 400 --out-dir data/wam_stage1
+
+# 多 policy 数据：每个 Td 真实采样一个 policy，并让通信队列按该 policy 演化。
+python scripts/record_wam_stage1_data.py --task carla_group_right_turn_auto --carla-port 2000 \
+  --steps 4000 --out-dir data/wam_stage1_random_policy --policy-sampler random_duration
+
 python scripts/train_wam_stage1.py --data-dir data/wam_stage1 --task carla_group_right_turn_auto --steps 2000
+# 在线使用训练好的 Stage-1 预测模型触发 request：
+python scripts/run_env.py --task carla_group_right_turn_auto \
+  --env.wam.predictor_mode=checkpoint \
+  --env.wam.predictor_checkpoint=outputs/wam_stage1/stage1_step2000.pt
 # 用 Stage-1 encoder warm-start Stage 2：
 python scripts/train_wam_stage2.py --data-dir data/wam_flow --task carla_group_right_turn_auto \
   --init-from-stage1 outputs/wam_stage1/stage1_step2000.pt --freeze-encoder
 ```
-期望：`data/wam_stage1/sample_*.pt` 出现；训练日志 `L` 随 step 下降、`val_*` 指标可读；`outputs/wam_stage1/stage1_step*.pt` 写出且可被 `load_checkpoint` / `init_encoder_from_stage1` 复用。
+录制脚本显式使用 `env.wam.predictor_mode=rule`，因此 bootstrap 数据收集不依赖已经训练好的 checkpoint。
+当 `--policy-sampler random_duration` 时，policy 不是同一步 counterfactual 枚举，而是在真实 rollout 中每个
+`policy_duration_s = Td` 到期后采样一次；候选空间来自 `env.wam.random_policy.*`，默认覆盖 local-only、
+单协作者/全协作者、`objlist`/`bev`/`objlist+bev` 和不同 `bandwidth_ratio`。
+在线切到 `checkpoint` 后，env 每步构建当前 `G_t` 并维护最近 `predictor_history_window + 1` 张图的
+graph window；每 `Ta` 把这个窗口送入 `WAMPerceptionModel`，再用 `notable_prob` 与 Gaussian trajectory
+`traj_log_var` 派生的不确定性生成 `CoopRequest`。
+
+期望：`data/wam_stage1/sample_*.pt` 出现；训练日志 `L` 随 step 下降、`val_*` 指标可读；`outputs/wam_stage1/stage1_step*.pt` 写出且可被在线 checkpoint predictor、`load_checkpoint` / `init_encoder_from_stage1` 复用。
 
 ---
 

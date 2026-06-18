@@ -53,6 +53,12 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
     parser.add_argument("--future-horizon-s", type=float, default=3.0)
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--policy-sampler",
+        choices=("request_all", "random_duration"),
+        default="request_all",
+        help="communication policy sampler used during recording",
+    )
     parser.add_argument("--display", dest="display", action="store_true", default=True)
     parser.add_argument("--no-display", dest="display", action="store_false")
     known, passthrough = parser.parse_known_args()
@@ -116,6 +122,8 @@ def main() -> int:
         f"--env.world.carla_port={known.carla_port}",
         f"--env.display.enable={bool(known.display)}",
         "--env.wam.build_graph=True",
+        "--env.wam.predictor_mode=rule",
+        f"--env.wam.policy_sampler_mode={known.policy_sampler}",
         *passthrough,
     ]
     env, config = build_env(known.task, env_args)
@@ -136,7 +144,8 @@ def main() -> int:
         print(
             f"Recording {known.steps} steps to {known.out_dir} "
             f"(horizon={known.future_horizon_s:.1f}s/{perc_cfg.traj_samples} samples, "
-            f"window={stage1_cfg.history_window + 1}, extra_steps={recorder.horizon_steps})",
+            f"window={stage1_cfg.history_window + 1}, extra_steps={recorder.horizon_steps}, "
+            f"policy_sampler={known.policy_sampler})",
             flush=True,
         )
 

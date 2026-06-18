@@ -59,12 +59,13 @@ class CarlaGroupRightTurnAutoEnv(RightTurnAutoRuntimeMixin, CarlaWptFixedEnv):
 
     def on_step(self) -> None:
         step = int(self._time_step)
-        # Streaming V2V communication: refresh observations + local perception, decide the
-        # Base-Station policy (lifetime Td), then advance the comm process (deliver + sensor stream).
+        # Streaming V2V communication: deliver completed messages, build the current graph for
+        # prediction/request, update the BS policy, then stream new sensor messages if due.
         self._update_group_observations()
+        self._deliver_comm_messages(step)
         self._update_wam_runtime_state()
         self._update_policy_lifecycle(step)
-        self._run_comm_step(step)
+        self._stream_comm_messages(step)
         self._cleanup_actor_flow()
         runtime_cfg = get_runtime_logging_config()
         if should_log_periodic(step, int(runtime_cfg["step_debug_interval"]), logger=AUTO_ENV_LOGGER):
