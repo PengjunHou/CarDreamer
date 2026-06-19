@@ -122,7 +122,15 @@ def objlist_payload_bytes(n_objects: int, *, overhead_bytes: int = 64) -> float:
     return float(max(int(n_objects), 0) * OBJECT_STATE_DIM * 4 + int(overhead_bytes))
 
 
-def bev_payload_bytes(spec: BevSpec) -> float:
+def bev_payload_bytes(
+    spec: BevSpec,
+    *,
+    mode: str = "feature",
+    feature_dim: int = 256,
+    feature_dtype_bytes: int = 4,
+) -> float:
+    if str(mode).lower() == "feature":
+        return float(max(int(feature_dim), 0) * max(int(feature_dtype_bytes), 1))
     return float(int(spec.channels) * int(spec.size) ** 2)
 
 
@@ -136,6 +144,9 @@ def build_stage1_policy_graph(
     notable_ids: Iterable[int] = (),
     latency_by_vehicle: Optional[Mapping[int, float]] = None,
     bev_spec: BevSpec = BevSpec(),
+    bev_payload_mode: str = "feature",
+    bev_feature_dim: int = 256,
+    bev_feature_dtype_bytes: int = 4,
     gamma_freshness: float = 5.0,
     overhead_bytes: int = 64,
 ) -> object:
@@ -146,6 +157,7 @@ def build_stage1_policy_graph(
     collaborator_by_id = {int(v.actor_id): v for v in collaborators}
 
     ego_visible = [s for s in objects if bool(s.visible_to_ego)]
+    ego_pose = (float(ego.x), float(ego.y), float(ego.yaw))
     observations: List[ObservationNodeInput] = [
         ObservationNodeInput(
             vehicle_id=int(ego.actor_id),
@@ -156,7 +168,23 @@ def build_stage1_policy_graph(
             freshness=1.0,
             quality=1.0,
             sample_age_s=0.0,
-        )
+        ),
+        ObservationNodeInput(
+            vehicle_id=int(ego.actor_id),
+            modality="bev",
+            observed_object_ids=tuple(int(s.actor_id) for s in ego_visible),
+            payload_bytes=bev_payload_bytes(
+                bev_spec,
+                mode=bev_payload_mode,
+                feature_dim=bev_feature_dim,
+                feature_dtype_bytes=bev_feature_dtype_bytes,
+            ),
+            latency_s=0.0,
+            freshness=1.0,
+            quality=1.0,
+            sample_age_s=0.0,
+            bev_raster=rasterize_bev(ego_pose, ego_visible, route_xy=ego.route_xy, spec=bev_spec),
+        ),
     ]
 
     included_collaborators = [collaborator_by_id[vid] for vid in selected if vid in collaborator_by_id]
@@ -170,8 +198,13 @@ def build_stage1_policy_graph(
         if modality == "bev":
             vis_objs = [s for s in objects if int(vid) in s.visible_to_collaborators]
             veh_pose = (float(collab.x), float(collab.y), float(collab.yaw))
-            observed_ids: Tuple[int, ...] = ()
-            payload = bev_payload_bytes(bev_spec)
+            observed_ids = tuple(int(s.actor_id) for s in vis_objs)
+            payload = bev_payload_bytes(
+                bev_spec,
+                mode=bev_payload_mode,
+                feature_dim=bev_feature_dim,
+                feature_dtype_bytes=bev_feature_dtype_bytes,
+            )
             bev_raster = rasterize_bev(veh_pose, vis_objs, route_xy=(), spec=bev_spec)
         else:
             observed_ids = tuple(int(s.actor_id) for s in objects if int(vid) in s.visible_to_collaborators)

@@ -209,7 +209,7 @@ def build_wam_hetero_graph(
 ) -> HeteroData:
     """Assemble the policy-conditioned heterogeneous graph ``G_t^{e,π}`` (§7).
 
-    The ego vehicle node and its own ``objlist`` observation are always present.
+    The ego vehicle node and its own local observations are always present.
     Only collaborators in ``policy.selected_vehicle_ids`` (and the modalities in
     ``policy.modality_by_vehicle``) are added, so an empty/no-coop policy yields a valid
     ego-only graph.

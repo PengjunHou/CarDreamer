@@ -7,7 +7,7 @@ import numpy as np
 from gymnasium import spaces
 from runtime_logging import get_runtime_logger, get_runtime_logging_config, should_log_periodic, summarize_keys
 
-from .toolkit import EnvMonitorOpenCV, Observer, ScenarioActorManager, WorldManager
+from .toolkit import EnvMonitorOpenCV, Observer, PedestrianSafetySupervisor, ScenarioActorManager, WorldManager
 
 
 ENV_LOGGER = get_runtime_logger("car_dreamer.env")
@@ -19,6 +19,10 @@ class CarlaBaseEnv(gym.Env):
 
         self._monitor = EnvMonitorOpenCV(self._config)
         self._world = WorldManager(self._config)
+        self._pedestrian_safety = PedestrianSafetySupervisor(
+            self._world,
+            getattr(self._config, "pedestrian_safety", None),
+        )
         # Config-driven background actors (vehicles + pedestrians); no-op without config.
         # V2V-enabled envs expose `_register_cooperative_candidate` so that scenario vehicles with a
         # `start` point become cooperative candidates; other envs just place them (hook is None).
@@ -122,7 +126,13 @@ class CarlaBaseEnv(gym.Env):
 
         # Keep behavior unchanged: seed is accepted but not applied here.
         self._ego_observer.destroy()
+        self._pedestrian_safety.reset()
         self._world.reset()
+        reset_warmup_ticks = int(getattr(self._config, "reset_warmup_ticks", 0))
+        if reset_warmup_ticks > 0:
+            ENV_LOGGER.info("Reset warmup start ticks=%d", reset_warmup_ticks)
+            self._world.warmup(reset_warmup_ticks)
+            ENV_LOGGER.info("Reset warmup complete ticks=%d", reset_warmup_ticks)
         self._ego_observer.reset(self.get_ego_vehicle())
 
         self._time_step = 0
@@ -188,6 +198,7 @@ class CarlaBaseEnv(gym.Env):
         if should_log_periodic(int(self._time_step), int(runtime_cfg["step_debug_interval"]), logger=ENV_LOGGER):
             ENV_LOGGER.debug("Env step start step=%d action=%s", self._time_step, action)
         self.apply_control(action)
+        self._pedestrian_safety.step(int(self._time_step))
         self._world.step()
         self._time_step += 1
 

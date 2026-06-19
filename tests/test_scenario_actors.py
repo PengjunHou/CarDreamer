@@ -26,8 +26,35 @@ class ParseScenarioSpecsTest(unittest.TestCase):
         self.assertEqual(group["count"], 1)
         self.assertTrue(group["is_candidate"])
         self.assertTrue(group["stationary"])  # no destination -> stationary
+        self.assertFalse(group["autopilot_roam"])
         self.assertIsNone(group["destination"])
         self.assertEqual(group["target_speed"], 25.0)  # default
+
+    def test_start_without_destination_can_roam_on_autopilot(self):
+        specs = parse_scenario_specs({"vehicles": [{"start": [1.0, 2.0, 0.1, 0.0], "autopilot_roam": True}]})
+        group = specs["vehicles"][0]
+        self.assertTrue(group["is_candidate"])
+        self.assertFalse(group["stationary"])
+        self.assertTrue(group["autopilot_roam"])
+        self.assertIsNone(group["destination"])
+
+    def test_vehicle_can_override_start_mode(self):
+        specs = parse_scenario_specs(
+            {
+                "vehicle_spawn_z_offset": 0.5,
+                "vehicles": [{"start": [1.0, 2.0, 0.1, 0.0], "vehicle_start_mode": "exact"}],
+            }
+        )
+        group = specs["vehicles"][0]
+        self.assertEqual(group["vehicle_start_mode"], "exact")
+        self.assertAlmostEqual(specs["vehicle_spawn_z_offset"], 0.5)
+
+    def test_vehicle_can_override_spawn_z_offset(self):
+        specs = parse_scenario_specs(
+            {"vehicles": [{"start": [1.0, 2.0, 0.1, 0.0], "vehicle_spawn_z_offset": 0.25}]}
+        )
+        group = specs["vehicles"][0]
+        self.assertAlmostEqual(group["vehicle_spawn_z_offset"], 0.25)
 
     def test_start_with_destination_is_moving_candidate(self):
         specs = parse_scenario_specs(
@@ -91,6 +118,7 @@ class ScenarioActorManagerTest(unittest.TestCase):
                 {"count": 3},                                   # background (no hook)
                 {"start": [1.0, 2.0, 0.1, 0.0]},                # candidate, stationary
                 {"start": [4.0, 5.0, 0.1, 90.0], "destination": [9.0, 9.0, 0.1]},  # candidate, moving
+                {"start": [6.0, 7.0, 0.1, 90.0], "autopilot_roam": True},  # candidate, TM roam
             ]
         }
         world = _FakeWorld()
@@ -98,13 +126,15 @@ class ScenarioActorManagerTest(unittest.TestCase):
         manager = ScenarioActorManager(world, cfg, cooperative_hook=registered.append)
         manager.reset_spawn()
 
-        # 3 background + 2 candidates = 5 vehicle spawns
-        self.assertEqual(len(world.vehicle_calls), 5)
-        # hook fired exactly for the 2 candidate (start) vehicles
-        self.assertEqual(len(registered), 2)
+        # 3 background + 3 candidates = 6 vehicle spawns
+        self.assertEqual(len(world.vehicle_calls), 6)
+        # explicit-start candidates spawn before random background traffic
+        self.assertEqual([c["start"] is not None for c in world.vehicle_calls], [True, True, True, False, False, False])
+        # hook fired exactly for the 3 candidate (start) vehicles
+        self.assertEqual(len(registered), 3)
         # stationary flags among the start-vehicle spawns: one stationary, one moving
         candidate_calls = [c for c in world.vehicle_calls if c["start"] is not None]
-        self.assertEqual(sorted(c["stationary"] for c in candidate_calls), [False, True])
+        self.assertEqual(sorted(c["stationary"] for c in candidate_calls), [False, False, True])
         # background spawns are never stationary and never candidates
         background_calls = [c for c in world.vehicle_calls if c["start"] is None]
         self.assertEqual(len(background_calls), 3)

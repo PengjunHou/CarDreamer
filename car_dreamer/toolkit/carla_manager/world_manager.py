@@ -59,6 +59,7 @@ class WorldManager:
         self._apply_control = None
         self._on_step = None
         self.actor_dict = {}
+        self._autopilot_actor_ids = set()
         # Pedestrians (walker bodies + their AI controllers) are tracked separately
         # from actor_dict so they never enter the vehicle-oriented BEV / visibility
         # pipeline (which assumes vehicle bounding boxes), but are still destroyed on reset.
@@ -84,9 +85,11 @@ class WorldManager:
     def reset(self) -> None:
         # destroy all actors
         self._time_step = 0
+        self._cache = {"step": self._time_step}
         self._destroy_walkers()
         self._client.apply_batch_sync([carla.command.DestroyActor(id) for id in self.actor_dict])
         self.actor_dict = {}
+        self._autopilot_actor_ids = set()
 
         self._set_synchronous_mode(False)
 
@@ -102,6 +105,21 @@ class WorldManager:
         self._world.tick()
         if self._on_step is not None:
             self._on_step()
+
+    def warmup(self, ticks: int) -> None:
+        """
+        Advance the CARLA world without env-level callbacks or logical step accounting.
+
+        This lets Traffic Manager/autopilot actors settle after reset while keeping the
+        first Gym step, WAM/V2V process, rewards, observations, and frame numbering at zero.
+        """
+        ticks = max(int(ticks), 0)
+        if ticks <= 0:
+            return
+        WORLD_LOGGER.info("Warmup CARLA world ticks=%d without env callbacks", ticks)
+        for _ in range(ticks):
+            self._world.tick()
+        self._cache = {"step": self._time_step}
 
     def get_time_step(self) -> int:
         """
@@ -239,6 +257,7 @@ class WorldManager:
                 actor = self._world.get_actor(response.actor_id)
                 actor_list.append(actor)
                 self.actor_dict[actor.id] = actor
+                self._autopilot_actor_ids.add(actor.id)
                 self._vehicle_manager.set_auto_lane_change(actor, self._config.auto_lane_change)
                 self._vehicle_manager.set_lane_change_percent(actor, left=100.0, right=100.0)
                 if "background_speed" in self._config:
@@ -388,6 +407,7 @@ class WorldManager:
         if stationary:
             return vehicle  # parked observer: no autopilot, no route
         vehicle.set_autopilot(True, self._tm_port)
+        self._autopilot_actor_ids.add(vehicle.id)
         tm = self._vehicle_manager._tm
         self._vehicle_manager.set_auto_lane_change(vehicle, self._config.auto_lane_change)
         if target_speed is not None:
@@ -520,11 +540,12 @@ class WorldManager:
         if vehicle is None:
             return None
         vehicle.set_autopilot(True, self._tm_port)
+        self._autopilot_actor_ids.add(vehicle.id)
         self._vehicle_manager.set_auto_lane_change(vehicle, True)
         if "background_speed" in self._config:
             self._vehicle_manager.set_desired_speed(vehicle, self._config.background_speed)
         self._vehicle_manager._tm.ignore_lights_percentage(vehicle, 100)
-        self._vehicle_manager._tm.ignore_vehicles_percentage(vehicle, 100)
+        self._vehicle_manager._tm.ignore_vehicles_percentage(vehicle, 0)
         return vehicle
 
     def destroy_actor(self, actor_id: int) -> None:
@@ -536,7 +557,31 @@ class WorldManager:
            Directly call :py:meth:`carla.Actor.destroy` instead.
         """
         actor = self.actor_dict.pop(actor_id)
+        self._autopilot_actor_ids.discard(actor_id)
         actor.destroy()
+
+    @property
+    def traffic_manager_port(self) -> int:
+        """
+        Get the Traffic Manager port used for autopilot vehicles.
+        """
+        return self._tm_port
+
+    def is_autopilot_actor(self, actor_id: int) -> bool:
+        """
+        Return whether this manager enabled Traffic Manager autopilot for the actor.
+        """
+        return int(actor_id) in self._autopilot_actor_ids
+
+    def set_actor_autopilot(self, actor: carla.Actor, enabled: bool) -> None:
+        """
+        Toggle Traffic Manager autopilot and keep local bookkeeping in sync.
+        """
+        actor.set_autopilot(bool(enabled), self._tm_port)
+        if enabled:
+            self._autopilot_actor_ids.add(actor.id)
+        else:
+            self._autopilot_actor_ids.discard(actor.id)
 
     @property
     def actor_ids(self) -> List[int]:

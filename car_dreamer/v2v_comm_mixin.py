@@ -41,13 +41,14 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import is_dataclass
 from pathlib import Path
+import logging
 import math
 from typing import Any, Deque, Dict, List, Optional
 
 import carla
 import numpy as np
 import torch
-from runtime_logging import get_runtime_logger, get_runtime_logging_config, should_log_periodic
+from runtime_logging import get_runtime_logger, get_runtime_logging_config, log_key_event, should_log_periodic
 
 from .toolkit import (
     CommConfig,
@@ -105,6 +106,8 @@ class V2VCommMixin:
         self.group_obs: Dict[int, Dict[str, Any]] = {}
         self._prev_action = None
         self._actor_cache: Dict[int, carla.Actor] = {}
+        self._last_logged_policy_id: Optional[int] = None
+        self._last_logged_request_signature = None
         # Per-episode probability that each camera vehicle joins cooperative perception.
         self.coop_participation_prob = float(getattr(self._config, "coop_participation_prob", 0.5))
 
@@ -179,6 +182,9 @@ class V2VCommMixin:
         self._wam_visible_uncertainty = float(getattr(wam_cfg, "visible_uncertainty", 0.2))
         self._wam_invisible_uncertainty = float(getattr(wam_cfg, "invisible_uncertainty", 2.0))
         self._wam_default_modality = str(getattr(wam_cfg, "default_modality", "objlist"))
+        self._wam_bev_payload_mode = str(getattr(wam_cfg, "bev_payload_mode", "feature")).lower()
+        self._wam_bev_feature_dim = int(getattr(wam_cfg, "bev_feature_dim", 256))
+        self._wam_bev_feature_dtype_bytes = int(getattr(wam_cfg, "bev_feature_dtype_bytes", 4))
         self._wam_base_station_policy = str(getattr(wam_cfg, "base_station_policy", "placeholder_all"))
         self._wam_local_sight_fov = getattr(
             wam_cfg,
@@ -318,8 +324,21 @@ class V2VCommMixin:
         self._actor_cache = {}
         self._comm_process = None  # lazily (re)created per episode once the ego exists
         self._comm_policy_counter = 0
+        self._last_logged_policy_id = None
+        self._last_logged_request_signature = None
         self._reset_wam_runtime_state()
-        V2V_LOGGER.debug("V2V runtime state reset.")
+        log_key_event(
+            V2V_LOGGER,
+            logging.INFO,
+            "V2V runtime reset coop_participation_prob=%.3f Td=%d Ts=%d Tw=%d Ta=%d bev_payload_mode=%s bev_payload_bytes=%.0f",
+            float(getattr(self, "coop_participation_prob", 0.5)),
+            int(self._comm_config.policy_duration_steps),
+            int(self._comm_config.sensor_period_steps),
+            int(self._comm_config.prediction_window_steps),
+            int(self._comm_config.action_period_steps),
+            str(getattr(self, "_wam_bev_payload_mode", "feature")),
+            float(self._wam_bev_payload_bytes()),
+        )
 
     def _reset_wam_runtime_state(self) -> None:
         self._wam_notable_records = []
@@ -388,7 +407,9 @@ class V2VCommMixin:
         if np.random.random() < float(getattr(self, "coop_participation_prob", 0.5)):
             self.coop_participant_ids.add(int(vehicle.id))
             self.groups[GROUP_ID].add(int(vehicle.id))
-        V2V_LOGGER.debug(
+        log_key_event(
+            V2V_LOGGER,
+            logging.INFO,
             "Registered cooperative candidate id=%s participant=%s total_candidates=%d",
             int(vehicle.id),
             int(vehicle.id) in self.coop_participant_ids,
@@ -403,6 +424,17 @@ class V2VCommMixin:
         """Lazily create the per-episode communication process (needs the ego id)."""
         if self._comm_process is None:
             self._comm_process = CommunicationProcess(self._comm_config, int(self.ego.id))
+            log_key_event(
+                V2V_LOGGER,
+                logging.INFO,
+                "Communication process initialized ego_id=%s dt=%.3f Td=%d Ts=%d Tw=%d Ta=%d",
+                int(self.ego.id),
+                float(self._comm_config.dt),
+                int(self._comm_config.policy_duration_steps),
+                int(self._comm_config.sensor_period_steps),
+                int(self._comm_config.prediction_window_steps),
+                int(self._comm_config.action_period_steps),
+            )
         return self._comm_process
 
     def _next_policy_id(self) -> int:
@@ -501,6 +533,21 @@ class V2VCommMixin:
             frequency_steps=int(self._comm_config.sensor_period_steps),
             reason=str(policy.reason),
         )
+        if int(policy.policy_id) != int(getattr(self, "_last_logged_policy_id", -1) or -1):
+            self._last_logged_policy_id = int(policy.policy_id)
+            log_key_event(
+                V2V_LOGGER,
+                logging.INFO,
+                "WAM policy installed id=%d step=%d end=%d reason=%s local_only=%s selected=%s modalities=%s bandwidth=%s",
+                int(policy.policy_id),
+                int(policy.start_step),
+                int(policy.end_step),
+                str(policy.reason),
+                bool(policy.is_local_only),
+                list(int(v) for v in policy.selected_collaborators),
+                {int(k): tuple(v) for k, v in policy.modalities_by_vehicle.items()},
+                {int(k): float(v) for k, v in policy.bandwidth_by_vehicle.items()},
+            )
 
     def _update_policy_lifecycle(self, step: int) -> None:
         """Install / expire the Base-Station policy with lifetime Td (§3, §9).
@@ -616,6 +663,18 @@ class V2VCommMixin:
             if snapshot is not None:
                 snapshots[int(sender_id)] = snapshot
         emitted = proc.generate(int(step), snapshots, self._link_rate_bps)
+        if emitted:
+            log_key_event(
+                V2V_LOGGER,
+                logging.INFO,
+                "Communication emitted step=%d policy=%s messages=%d senders=%s payload_bytes=%s recv_steps=%s",
+                int(step),
+                int(policy.policy_id),
+                len(emitted),
+                [int(m.sender_id) for m in emitted],
+                [int(m.payload_size) for m in emitted],
+                [int(m.t_recv) for m in emitted],
+            )
         runtime_cfg = get_runtime_logging_config()
         if should_log_periodic(int(step), int(runtime_cfg["step_debug_interval"]), logger=V2V_LOGGER):
             V2V_LOGGER.debug(
@@ -828,6 +887,26 @@ class V2VCommMixin:
         else:
             self._predict_wam_with_rule(step)
         self._wam_last_predict_step = step
+        request = getattr(self, "_wam_coop_request", None)
+        high_ids = tuple() if request is None else tuple(int(v) for v in request.high_uncertainty_object_ids)
+        request_signature = (bool(request is not None), high_ids)
+        if request_signature != getattr(self, "_last_logged_request_signature", None):
+            self._last_logged_request_signature = request_signature
+            log_key_event(
+                V2V_LOGGER,
+                logging.INFO,
+                "WAM request state step=%d predictor=%s triggered=%s high_uncertainty_ids=%s max_uncertainty=%.3f threshold=%.3f notable=%s visible=%s invisible=%s candidates=%s",
+                int(step),
+                mode,
+                bool(request is not None),
+                list(high_ids),
+                float(self._wam_max_uncertainty()),
+                float(self._wam_uncertainty_threshold),
+                [int(record.object_state.actor_id) for record in self._wam_notable_records],
+                [int(record.object_state.actor_id) for record in self._wam_notable_records if bool(record.visible)],
+                [int(record.object_state.actor_id) for record in self._wam_notable_records if bool(record.invisible)],
+                sorted(int(v) for v in getattr(self, "coop_participant_ids", set())),
+            )
         if should_log_periodic(step, int(get_runtime_logging_config()["step_debug_interval"]), logger=V2V_LOGGER):
             V2V_LOGGER.debug(
                 "WAM step=%d predictor=%s notable=%s max_uncertainty=%.3f triggered=%s",
@@ -984,6 +1063,8 @@ class V2VCommMixin:
         return float(max(int(n_objects), 0) * OBJECT_STATE_DIM * 4 + overhead)
 
     def _wam_bev_payload_bytes(self) -> float:
+        if str(getattr(self, "_wam_bev_payload_mode", "feature")).lower() == "feature":
+            return float(max(int(self._wam_bev_feature_dim), 0) * max(int(self._wam_bev_feature_dtype_bytes), 1))
         return float(int(self._wam_graph_bev_channels) * int(self._wam_graph_bev_size) ** 2)
 
     def _wam_collaborator_node_from_message(self, message, *, agent_slot: int) -> VehicleNodeInput:
@@ -1039,8 +1120,15 @@ class V2VCommMixin:
         dt = float(self._comm_config.dt)
         live_states = list(getattr(self, "_wam_object_states", []))
 
-        ego = self._wam_vehicle_node_input(self.ego, is_ego=True, agent_slot=0, route_xy=self._wam_route_xy())
+        ego_route_xy = self._wam_route_xy()
+        ego = self._wam_vehicle_node_input(self.ego, is_ego=True, agent_slot=0, route_xy=ego_route_xy)
         ego_visible = [s for s in live_states if bool(s.visible_to_ego)]
+        ego_tf = self.ego.get_transform()
+        ego_pose = (
+            float(ego_tf.location.x),
+            float(ego_tf.location.y),
+            float(ego_tf.rotation.yaw),
+        )
         observations = [
             ObservationNodeInput(
                 vehicle_id=int(self.ego.id),
@@ -1051,7 +1139,23 @@ class V2VCommMixin:
                 freshness=1.0,
                 quality=1.0,
                 sample_age_s=0.0,
-            )
+            ),
+            ObservationNodeInput(
+                vehicle_id=int(self.ego.id),
+                modality="bev",
+                observed_object_ids=tuple(int(s.actor_id) for s in ego_visible),
+                payload_bytes=self._wam_bev_payload_bytes(),
+                latency_s=0.0,
+                freshness=1.0,
+                quality=1.0,
+                sample_age_s=0.0,
+                bev_raster=rasterize_bev(
+                    ego_pose,
+                    ego_visible,
+                    route_xy=ego_route_xy,
+                    spec=self._wam_bev_spec,
+                ),
+            ),
         ]
 
         # Most-recent message per collaborator (§13.2): its latency drives the veh_veh edge.
@@ -1075,11 +1179,12 @@ class V2VCommMixin:
             sample_age = float(int(step) - int(message.t_sense)) * dt
             modalities = tuple(message.modalities)
             modality_by_vehicle[int(sender_id)] = modalities
-            for snap_state in message.data.get("object_states", ()):  # snapshot @ t_sense
+            snap_states = tuple(message.data.get("object_states", ()))  # snapshot @ t_sense
+            for snap_state in snap_states:
                 objects_by_id.setdefault(int(snap_state.actor_id), snap_state)
             for modality in modalities:
                 if modality == "bev":
-                    observed_ids: tuple = ()
+                    observed_ids = tuple(int(s.actor_id) for s in snap_states)
                     bev_raster = message.data.get("bev")
                     payload = self._wam_bev_payload_bytes()
                 else:
@@ -1127,6 +1232,34 @@ class V2VCommMixin:
             notable_ids=notable_ids,
             latency_by_vehicle=latency_by_vehicle,
         )
+        runtime_cfg = get_runtime_logging_config()
+        if should_log_periodic(
+            int(step),
+            int(runtime_cfg["step_debug_interval"]),
+            logger=V2V_LOGGER,
+            level=logging.INFO,
+        ):
+            modality_counts: Dict[str, int] = {}
+            for obs in observations:
+                modality_counts[str(obs.modality)] = modality_counts.get(str(obs.modality), 0) + 1
+            stats = hetero_graph_stats(self._wam_graph)
+            log_key_event(
+                V2V_LOGGER,
+                logging.INFO,
+                "WAM graph built step=%d vehicles=%d objects=%d observations=%d veh_obs_edges=%d obs_obj_edges=%d veh_veh_edges=%d ego_visible=%d messages=%d collaborators=%s modalities=%s ego_bev=%s",
+                int(step),
+                int(stats["wam_graph_num_vehicle_nodes"]),
+                int(stats["wam_graph_num_object_nodes"]),
+                int(stats["wam_graph_num_observation_nodes"]),
+                int(stats["wam_graph_num_veh_obs_edges"]),
+                int(stats["wam_graph_num_obs_obj_edges"]),
+                int(stats["wam_graph_num_veh_veh_edges"]),
+                len(ego_visible),
+                len(messages),
+                sorted(int(v) for v in latest_by_sender.keys()),
+                modality_counts,
+                any(int(obs.vehicle_id) == int(self.ego.id) and str(obs.modality) == "bev" for obs in observations),
+            )
         if self._wam_graph_embed:
             self._run_wam_graph_embedding()
 

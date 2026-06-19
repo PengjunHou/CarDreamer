@@ -7,6 +7,7 @@
 #     - start: [x, y, z(, yaw)]     # one V2V cooperative CANDIDATE (camera-equipped, policy-selectable)
 #                                    #   no `destination`  -> stays stationary (parked observer)
 #       destination: [x, y, z]      #   with `destination` -> drives there (TM); target_speed default 25
+#       autopilot_roam: true        #   no `destination` -> TM autopilot follows the road instead of parking
 #       target_speed: 25            # optional (km/h)
 #   pedestrians:
 #     - count: N                    # random nav-mesh walkers
@@ -19,32 +20,61 @@
 env:
   # --- car flow (background traffic stream); overrides the carla_right_turn_simple anchor default ---
   flow_spawn_point: [-3.4, -151.2, 0.1, 90.0]
-  min_flow_dist: 6
-  max_flow_dist: 8
+  min_flow_dist: 12
+  max_flow_dist: 18
+  reset_warmup_ticks: 20
 
   # --- shared V2V cooperative settings (apply to every scenario vehicle that has a `start`) ---
-  coop_participation_prob: 0.5
+  coop_participation_prob: 1
   group_observation:
     enabled: [camera, collision]
     camera:
       fov: 180
 
+  pedestrian_safety:
+    enabled: true
+    max_distance_m: 12.0
+    front_angle_deg: 50.0
+    ttc_threshold_s: 2.0
+    brake_distance_m: 5.0
+    restore_autopilot: true
+
   scenario_actors:
     cross_factor: 0.1
+    # Explicit vehicle start/destination coordinates are design points, not necessarily exact CARLA
+    # map spawn points. Project them to the nearest drivable lane waypoint before spawning/routing so
+    # CARLA/TM uses a predictable legal location. Use `spawn_point` instead to snap to the nearest
+    # CARLA map spawn point, or `exact` to keep raw coordinates.
+    vehicle_start_mode: road   # exact | road | spawn_point
+    vehicle_destination_mode: road    # exact | road | spawn_point
+    preserve_vehicle_start_yaw: false
+    vehicle_spawn_z_offset: 0.1
+    pedestrian_start_mode: exact
+    pedestrian_destination_mode: exact
+    pedestrian_navmesh_samples: 200
+    snap_warn_distance_m: 0.5
     vehicles:
       - count: 8                            # background traffic (no camera, not a candidate)
       # --- cooperative candidates (start point => camera-equipped, selectable by the policy) ---
-      - start: [15.4, -139.2, 0.1, 180.0]   # stationary observer (no destination)
-      - start: [6.5, -120.2, 0.1, 270.0]    # stationary observer (no destination)
-      # # candidates that also drive toward a destination (target_speed omitted -> 25):
-      - start: [9.0, -124.2, 0.1, 270]
-        destination: [9.0, -164.2, 0.1]
+      - start: [14.88, -139.41, 0.1, 180]
+        autopilot_roam: false
+        vehicle_start_mode: exact
+      - start: [4.10, -56.12, 0.28]
+        autopilot_roam: true
+      - start: [5.78, -113.23, 0.1]
+        autopilot_roam: true
+      # # candidates that also drive via Traffic Manager autopilot (target_speed omitted -> 25):
+      # - start: [9.0, -124.2, 0.1, 270]
+      #   # destination: [9.0, -164.2, 0.1]
+      #   autopilot_roam: true
       # - start: [14.4, -139.2, 0.1, 180.0]
       #   destination: [-35.0, -139.2, 0.1]
-      # - start: [-15.8, -135.1, 0.1, 0.0]
-      #   destination: [35.0, -135.1, 0.1]
-      - start: [0.5, -188.2, 0.1, 90.0]
-        destination: [0.5, -112.0, 0.1]
+      # - start: [-39.8, -135.1, 0.1]
+      #   autopilot_roam: true
+      # ego [-33.8, -135.1, 0.1, 0.0]
+      - start: [0.70, -189.73, 0.1]
+        # destination: [0.5, -112.0, 0.1]
+        autopilot_roam: true
         target_speed: 25
     pedestrians:
       - count: 15                           # random pedestrians on the nav mesh

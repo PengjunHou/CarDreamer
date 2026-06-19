@@ -226,6 +226,12 @@ env:
     visible_uncertainty: 0.2
     invisible_uncertainty: 2.0
     default_modality: bev
+    # Transport approximation for BEV messages:
+    #   raster  -> charge raw semantic raster bytes (C*H*W)
+    #   feature -> still carry BEV raster in the graph, but charge a compressed/encoded feature vector.
+    bev_payload_mode: feature
+    bev_feature_dim: 256
+    bev_feature_dtype_bytes: 4
     base_station_policy: placeholder_all
     predictor_mode: rule       # rule | checkpoint
     predictor_checkpoint: null # Stage-1 checkpoint path when predictor_mode=checkpoint
