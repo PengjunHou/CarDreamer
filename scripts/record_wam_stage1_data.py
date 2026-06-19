@@ -50,7 +50,12 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
     parser.add_argument("--carla-port", type=int, default=2000)
     parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--out-dir", type=Path, default=Path("data/wam_stage1"))
-    parser.add_argument("--future-horizon-s", type=float, default=3.0)
+    parser.add_argument(
+        "--future-horizon-s",
+        type=float,
+        default=None,
+        help="future trajectory horizon in seconds; defaults to env.wam.stage1.traj_horizon_s",
+    )
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
@@ -94,15 +99,19 @@ def _actor_snapshots(sim) -> Dict[int, object]:
     return snapshots
 
 
-def _register_current_graph(sim, recorder, step: int) -> bool:
-    """Slide the current request graph into the window with the ego pose."""
-    graph = getattr(sim, "_wam_graph", None)
-    ego = getattr(sim, "ego", None)
-    if graph is None or ego is None:
+def _comm_snapshot(sim):
+    proc = getattr(sim, "_comm_process", None)
+    if proc is None:
+        return (), None
+    return tuple(getattr(proc.receive_queue, "messages", ())), proc.active_policy_id
+
+
+def _register_current_slot(sim, recorder, step: int) -> bool:
+    """Slide the current slot's local graph source state into the Stage-1 window."""
+    state_fn = getattr(sim, "_wam_stage1_slot_state", None)
+    if state_fn is None:
         return False
-    transform = ego.get_transform()
-    ego_pose = (float(transform.location.x), float(transform.location.y), float(transform.rotation.yaw))
-    recorder.register(step, graph=graph, ego_pose=ego_pose)
+    recorder.register_slot(step, state=state_fn(step))
     return True
 
 
@@ -110,7 +119,7 @@ def main() -> int:
     known, passthrough = parse_args()
     if known.steps <= 0:
         raise ValueError("--steps must be positive")
-    if known.future_horizon_s <= 0:
+    if known.future_horizon_s is not None and known.future_horizon_s <= 0:
         raise ValueError("--future-horizon-s must be positive")
 
     _setup_carla_pythonapi()
@@ -129,6 +138,7 @@ def main() -> int:
     env, config = build_env(known.task, env_args)
     sim = env.unwrapped
     perc_cfg, stage1_cfg = wam_stage1_configs_from_env(config)
+    future_horizon_s = float(known.future_horizon_s if known.future_horizon_s is not None else perc_cfg.traj_horizon_s)
     known.out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -137,14 +147,19 @@ def main() -> int:
         recorder = WAMStage1DataRecorder(
             known.out_dir,
             fixed_dt=fixed_dt,
-            horizon_s=known.future_horizon_s,
+            horizon_s=future_horizon_s,
             samples=int(perc_cfg.traj_samples),
             history_window=int(stage1_cfg.history_window),
+            sample_period_s=float(stage1_cfg.sample_period_s),
+            graph_builder=sim._build_wam_graph_for_stage1_slot,
+            receive_window_steps=int(sim._comm_config.prediction_window_steps),
+            allow_cross_policy_messages=bool(sim._comm_config.allow_cross_policy_messages),
         )
         print(
             f"Recording {known.steps} steps to {known.out_dir} "
-            f"(horizon={known.future_horizon_s:.1f}s/{perc_cfg.traj_samples} samples, "
-            f"window={stage1_cfg.history_window + 1}, extra_steps={recorder.horizon_steps}, "
+            f"(horizon={future_horizon_s:.1f}s/{perc_cfg.traj_samples} samples, "
+            f"window={stage1_cfg.history_window + 1}@{stage1_cfg.sample_period_s:.3f}s, "
+            f"sample_period_steps={recorder.sample_period_steps}, extra_steps={recorder.horizon_steps}, "
             f"policy_sampler={known.policy_sampler})",
             flush=True,
         )
@@ -155,8 +170,10 @@ def main() -> int:
         while int(getattr(sim, "_time_step", 0)) <= last_observe_step:
             current_step = int(getattr(sim, "_time_step", 0))
             recorder.observe(current_step, _actor_snapshots(sim))
-            if current_step <= last_record_step:
-                _register_current_graph(sim, recorder, current_step)
+            messages, active_policy_id = _comm_snapshot(sim)
+            recorder.observe_messages(current_step, messages, active_policy_id=active_policy_id)
+            if current_step <= last_record_step and recorder.should_register_step(current_step):
+                _register_current_slot(sim, recorder, current_step)
             recorder.flush_ready(current_step)
 
             if current_step % known.print_every == 0:

@@ -122,6 +122,7 @@ class WAMStage1Config:
     ckpt_interval: int = 500
     ckpt_dir: str = "outputs/wam_stage1"
     history_window: int = 4
+    sample_period_s: float = 0.1
     val_fraction: float = 0.0
     device: str = "cpu"
     seed: int = 0
@@ -383,5 +384,6 @@ def wam_stage1_configs_from_env(config) -> Tuple[WAMPerceptionConfig, WAMStage1C
         log_interval=int(_cfg_get(stage1, "log_interval", 50)),
         ckpt_interval=int(_cfg_get(stage1, "ckpt_interval", 500)),
         history_window=int(_cfg_get(stage1, "history_window", 4)),
+        sample_period_s=float(_cfg_get(stage1, "sample_period_s", _cfg_get(stage1, "fixed_dt", 0.1))),
     )
     return perc_cfg, stage1_cfg

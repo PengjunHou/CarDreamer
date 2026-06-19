@@ -202,11 +202,12 @@ carla_group_right_turn_auto:
   env.wam.stage1.grad_clip: 1.0
   env.wam.stage1.log_interval: 50
   env.wam.stage1.ckpt_interval: 500
-  env.wam.stage1.history_window: 4
+  env.wam.stage1.history_window: 10
+  env.wam.stage1.sample_period_s: 0.2
   env.wam.stage1.temporal_hidden_dim: 256
   env.wam.stage1.head_hidden_dim: 256
-  env.wam.stage1.traj_horizon_s: 3.0
-  env.wam.stage1.traj_samples: 6
+  env.wam.stage1.traj_horizon_s: 1.0
+  env.wam.stage1.traj_samples: 5
   env.wam.stage1.fixed_dt: 0.1
   # WAM Stage-2 training (Design §16.2): offline diffusion-UWM trainer hyper-parameters.
   env.wam.stage2.lr: 0.0003

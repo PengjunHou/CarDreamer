@@ -241,12 +241,12 @@ env:
     policy_sampler_mode: request_all  # request_all | random_duration
     random_policy:
       local_prob: 0.2
-      collaborator_counts: ["1", all]
+      collaborator_counts: ["1", "2", all]
       modalities:
         - [objlist]
         - [bev]
         - [objlist, bev]
-      bandwidth_ratios: [0.5, 1.0]
+      bandwidth_ratios: [0.2,0.5, 0.8, 1.0]
       respect_request: False
 
 runtime_logging:

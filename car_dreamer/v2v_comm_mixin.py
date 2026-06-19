@@ -1086,52 +1086,22 @@ class V2VCommMixin:
             route_xy=(),
         )
 
-    def _update_wam_graph(self, step: Optional[int] = None) -> None:
-        if step is None:
-            step = int(getattr(self, "_time_step", 0))
-        if int(getattr(self, "_wam_graph_step", -1)) == int(step) and self._wam_graph is not None:
-            return
-        self._build_wam_graph(int(step))
-        self._wam_graph_step = int(step)
-
-    def _update_wam_graph_window(self, step: Optional[int] = None) -> None:
-        if step is None:
-            step = int(getattr(self, "_time_step", 0))
-        if self._wam_graph is None:
-            return
-        if int(getattr(self, "_wam_graph_window_last_step", -1)) == int(step):
-            return
-        self._wam_graph_window.append(self._wam_graph)
-        self._wam_graph_window_last_step = int(step)
-
-    def _build_wam_graph(self, step: Optional[int] = None) -> None:
-        """Assemble the cooperative graph from the **receive queue** (§12-§14).
-
-        The graph at time ``t`` is decided by the messages actually available (Tw / policy
-        filtered), not by the policy directly: no available messages -> ego-only *local* graph;
-        otherwise a V2V graph whose ``veh_veh`` edges carry the **measured** latency ``L_M``.
-        Collaborator observations come from each message's ``t_sense`` snapshot; ego's own
-        observation uses its live local sensing at ``t``.
-        """
-        if step is None:
-            step = int(getattr(self, "_time_step", 0))
-        proc = self._ensure_comm_process()
-        messages = proc.available_messages(int(step)) if proc.policy is not None else []
+    def _assemble_wam_graph_from_inputs(
+        self,
+        *,
+        ego: VehicleNodeInput,
+        ego_pose,
+        live_states: List[ObjectState],
+        route_xy,
+        messages,
+        step: int,
+        notable_ids,
+    ):
         dt = float(self._comm_config.dt)
-        live_states = list(getattr(self, "_wam_object_states", []))
-
-        ego_route_xy = self._wam_route_xy()
-        ego = self._wam_vehicle_node_input(self.ego, is_ego=True, agent_slot=0, route_xy=ego_route_xy)
         ego_visible = [s for s in live_states if bool(s.visible_to_ego)]
-        ego_tf = self.ego.get_transform()
-        ego_pose = (
-            float(ego_tf.location.x),
-            float(ego_tf.location.y),
-            float(ego_tf.rotation.yaw),
-        )
         observations = [
             ObservationNodeInput(
-                vehicle_id=int(self.ego.id),
+                vehicle_id=int(ego.actor_id),
                 modality="objlist",
                 observed_object_ids=tuple(int(s.actor_id) for s in ego_visible),
                 payload_bytes=self._wam_objlist_payload_bytes(len(ego_visible)),
@@ -1141,7 +1111,7 @@ class V2VCommMixin:
                 sample_age_s=0.0,
             ),
             ObservationNodeInput(
-                vehicle_id=int(self.ego.id),
+                vehicle_id=int(ego.actor_id),
                 modality="bev",
                 observed_object_ids=tuple(int(s.actor_id) for s in ego_visible),
                 payload_bytes=self._wam_bev_payload_bytes(),
@@ -1152,7 +1122,7 @@ class V2VCommMixin:
                 bev_raster=rasterize_bev(
                     ego_pose,
                     ego_visible,
-                    route_xy=ego_route_xy,
+                    route_xy=route_xy,
                     spec=self._wam_bev_spec,
                 ),
             ),
@@ -1221,16 +1191,103 @@ class V2VCommMixin:
             route_waypoints=int(self._wam_graph_route_waypoints),
             max_object_nodes=int(self._wam_graph_max_object_nodes),
         )
-        notable_ids = {int(record.object_state.actor_id) for record in self._wam_notable_records}
-        self._wam_graph = build_wam_hetero_graph(
+        graph = build_wam_hetero_graph(
             ego=ego,
             collaborators=collaborators,
             objects=objects,
             observations=observations,
             policy=policy_view,
             spec=spec,
-            notable_ids=notable_ids,
+            notable_ids={int(v) for v in notable_ids},
             latency_by_vehicle=latency_by_vehicle,
+        )
+        return graph, latest_by_sender, observations, ego_visible
+
+    def _wam_stage1_slot_state(self, step: int):
+        """Capture the slot-local graph inputs used later by Stage-1 recording."""
+        self._refresh_object_states(int(step))
+        self._update_wam_notable_records()
+        route_xy = self._wam_route_xy()
+        ego = self._wam_vehicle_node_input(self.ego, is_ego=True, agent_slot=0, route_xy=route_xy)
+        ego_tf = self.ego.get_transform()
+        ego_pose = (
+            float(ego_tf.location.x),
+            float(ego_tf.location.y),
+            float(ego_tf.rotation.yaw),
+        )
+        return {
+            "step": int(step),
+            "ego": ego,
+            "ego_pose": ego_pose,
+            "live_states": tuple(getattr(self, "_wam_object_states", ())),
+            "route_xy": tuple(route_xy),
+            "notable_ids": tuple(int(record.object_state.actor_id) for record in getattr(self, "_wam_notable_records", ())),
+        }
+
+    def _build_wam_graph_for_stage1_slot(self, state, messages, prediction_step: int):
+        """Rebuild one Stage-1 history slot using only messages selected by the recorder."""
+        slot_step = int(state.get("step", prediction_step))
+        graph, _, _, _ = self._assemble_wam_graph_from_inputs(
+            ego=state["ego"],
+            ego_pose=state["ego_pose"],
+            live_states=list(state.get("live_states", ())),
+            route_xy=tuple(state.get("route_xy", ())),
+            messages=list(messages),
+            step=slot_step,
+            notable_ids=state.get("notable_ids", ()),
+        )
+        return graph
+
+    def _update_wam_graph(self, step: Optional[int] = None) -> None:
+        if step is None:
+            step = int(getattr(self, "_time_step", 0))
+        if int(getattr(self, "_wam_graph_step", -1)) == int(step) and self._wam_graph is not None:
+            return
+        self._build_wam_graph(int(step))
+        self._wam_graph_step = int(step)
+
+    def _update_wam_graph_window(self, step: Optional[int] = None) -> None:
+        if step is None:
+            step = int(getattr(self, "_time_step", 0))
+        if self._wam_graph is None:
+            return
+        if int(getattr(self, "_wam_graph_window_last_step", -1)) == int(step):
+            return
+        self._wam_graph_window.append(self._wam_graph)
+        self._wam_graph_window_last_step = int(step)
+
+    def _build_wam_graph(self, step: Optional[int] = None) -> None:
+        """Assemble the cooperative graph from the **receive queue** (§12-§14).
+
+        The graph at time ``t`` is decided by the messages actually available (Tw / policy
+        filtered), not by the policy directly: no available messages -> ego-only *local* graph;
+        otherwise a V2V graph whose ``veh_veh`` edges carry the **measured** latency ``L_M``.
+        Collaborator observations come from each message's ``t_sense`` snapshot; ego's own
+        observation uses its live local sensing at ``t``.
+        """
+        if step is None:
+            step = int(getattr(self, "_time_step", 0))
+        proc = self._ensure_comm_process()
+        messages = proc.available_messages(int(step)) if proc.policy is not None else []
+        live_states = list(getattr(self, "_wam_object_states", []))
+
+        ego_route_xy = self._wam_route_xy()
+        ego = self._wam_vehicle_node_input(self.ego, is_ego=True, agent_slot=0, route_xy=ego_route_xy)
+        ego_tf = self.ego.get_transform()
+        ego_pose = (
+            float(ego_tf.location.x),
+            float(ego_tf.location.y),
+            float(ego_tf.rotation.yaw),
+        )
+        notable_ids = {int(record.object_state.actor_id) for record in self._wam_notable_records}
+        self._wam_graph, latest_by_sender, observations, ego_visible = self._assemble_wam_graph_from_inputs(
+            ego=ego,
+            ego_pose=ego_pose,
+            live_states=live_states,
+            route_xy=ego_route_xy,
+            messages=messages,
+            step=int(step),
+            notable_ids=notable_ids,
         )
         runtime_cfg = get_runtime_logging_config()
         if should_log_periodic(

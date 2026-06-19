@@ -76,7 +76,8 @@ def main() -> int:
     print(
         f"[wam-stage1] samples={len(dataset)} device={stage1_cfg.device} hidden={perc_cfg.hidden_dim} "
         f"steps={stage1_cfg.max_steps} bs={stage1_cfg.batch_size} lr={stage1_cfg.lr} "
-        f"history_window={stage1_cfg.history_window} ckpt_dir={stage1_cfg.ckpt_dir}",
+        f"history_window={stage1_cfg.history_window} sample_period_s={stage1_cfg.sample_period_s} "
+        f"ckpt_dir={stage1_cfg.ckpt_dir}",
         flush=True,
     )
     result = trainer.train(train_set, val_set)

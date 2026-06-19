@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -152,6 +153,94 @@ class RecorderTest(unittest.TestCase):
             rec.flush_all()
             sample = torch.load(sorted(Path(tmp).glob("*.pt"))[0], weights_only=False)
             self.assertEqual(float(sample["valid"].sum()), 0.0)  # no future positions available
+
+    def test_sample_period_aligns_history_and_future_offsets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = WAMStage1DataRecorder(
+                tmp,
+                fixed_dt=0.1,
+                horizon_s=1.0,
+                samples=5,
+                history_window=10,
+                sample_period_s=0.2,
+            )
+            self.assertEqual(rec.sample_period_steps, 2)
+            self.assertEqual(rec.step_offsets, (2, 4, 6, 8, 10))
+            registered_steps = []
+            last_record_step = 24
+            for step in range(0, last_record_step + rec.horizon_steps + 1):
+                rec.observe(step, {100: (8.0 + 0.1 * step, 1.0)})
+                if step <= last_record_step and rec.should_register_step(step):
+                    registered_steps.append(step)
+                    rec.register(
+                        step,
+                        graph=graph_with_objects([(100, 8.0 + 0.1 * step, 1.0)]),
+                        ego_pose=(0.0, 0.0, 0.0),
+                    )
+                rec.flush_ready(step)
+            rec.flush_all()
+
+            self.assertTrue(registered_steps)
+            self.assertTrue(all(step % 2 == 0 for step in registered_steps))
+            sample = torch.load(sorted(Path(tmp).glob("*.pt"))[-1], weights_only=False)
+            self.assertEqual(len(sample["window"]), 11)
+            self.assertEqual(sample["metadata"]["sample_period_steps"], 2)
+            window_steps = sample["metadata"]["window_steps"]
+            self.assertEqual(len(window_steps), 11)
+            self.assertTrue(all((b - a) == 2 for a, b in zip(window_steps, window_steps[1:])))
+            self.assertEqual(tuple(sample["target_xy"].shape[1:]), (5, 2))
+
+    def test_slot_rebuild_uses_only_received_matching_sense_time_messages(self):
+        def msg(msg_id, *, sender_id, t_sense, t_recv, policy_id=1):
+            return SimpleNamespace(
+                msg_id=msg_id,
+                policy_id=policy_id,
+                sender_id=sender_id,
+                receiver_id=1,
+                modalities=("objlist",),
+                payload_size=1,
+                data={},
+                t_sense=t_sense,
+                t_recv=t_recv,
+                total_latency=0.0,
+            )
+
+        def graph_builder(state, messages, prediction_step):
+            del messages, prediction_step
+            step = int(state["step"])
+            return graph_with_objects([(100, float(step), 1.0)])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = WAMStage1DataRecorder(
+                tmp,
+                fixed_dt=0.1,
+                horizon_s=0.2,
+                samples=1,
+                history_window=4,
+                sample_period_s=0.2,
+                graph_builder=graph_builder,
+                receive_window_steps=20,
+                allow_cross_policy_messages=False,
+            )
+            for step in (12, 14, 16, 18, 20):
+                rec.observe(step, {100: (float(step), 1.0)})
+                rec.register_slot(step, state={"step": step, "ego_pose": (0.0, 0.0, 0.0)})
+            rec.observe_messages(
+                20,
+                (
+                    msg(1, sender_id=2, t_sense=12, t_recv=18),  # included for slot 12
+                    msg(2, sender_id=3, t_sense=14, t_recv=22),  # not received by prediction step 20
+                    msg(3, sender_id=4, t_sense=12, t_recv=19),  # must not be reused for slot 16
+                    msg(4, sender_id=5, t_sense=-2, t_recv=0),   # outside receive window
+                ),
+                active_policy_id=1,
+            )
+            rec.observe(22, {100: (22.0, 1.0)})
+            rec.flush_ready(22)
+            sample = torch.load(sorted(Path(tmp).glob("*.pt"))[-1], weights_only=False)
+            self.assertEqual(sample["metadata"]["window_steps"], [12, 14, 16, 18, 20])
+            self.assertEqual(sample["metadata"]["slot_message_counts"], [2, 0, 0, 0, 0])
+            self.assertEqual(sample["metadata"]["slot_selected_vehicle_ids"], [[2, 4], [], [], [], []])
 
 
 class PolicyAugmentedStage1Test(unittest.TestCase):
