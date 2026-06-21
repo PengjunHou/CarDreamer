@@ -70,6 +70,11 @@ def main() -> int:
         "modality_by_vehicle",
         "notable_object_ids",
         "uncertainty",
+        "motion_uncertainty",
+        "coverage_uncertainty",
+        "total_uncertainty",
+        "route_coverage_quality_mean",
+        "poor_coverage_risk_mean",
         "ade",
         "fde",
     ]

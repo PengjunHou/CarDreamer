@@ -28,6 +28,7 @@ from .targets import build_trajectory_targets
 EgoPose = Tuple[float, float, float]
 Point2D = Tuple[float, float]
 GraphBuilder = Callable[[Mapping[str, object], Sequence[object], int], object]
+CoverageBuilder = Callable[[Mapping[str, object], Sequence[object], int], object]
 
 
 def _to_xy(value) -> Optional[Point2D]:
@@ -65,6 +66,7 @@ class WAMStage1DataRecorder:
         history_window: int = 4,
         sample_period_s: Optional[float] = None,
         graph_builder: Optional[GraphBuilder] = None,
+        coverage_builder: Optional[CoverageBuilder] = None,
         receive_window_steps: Optional[int] = None,
         allow_cross_policy_messages: bool = False,
         ego_frame: bool = True,
@@ -82,6 +84,7 @@ class WAMStage1DataRecorder:
         self.horizon_steps = max(self.step_offsets)
         self.history_window = int(history_window)
         self.graph_builder = graph_builder
+        self.coverage_builder = coverage_builder
         self.receive_window_steps = None if receive_window_steps is None else int(receive_window_steps)
         self.allow_cross_policy_messages = bool(allow_cross_policy_messages)
         self.ego_frame = bool(ego_frame)
@@ -187,22 +190,31 @@ class WAMStage1DataRecorder:
         if self.graph_builder is None:
             raise RuntimeError("register_slot() requires WAMStage1DataRecorder(graph_builder=...)")
         graphs = []
+        coverage_history = []
         slot_message_counts = []
         slot_selected_vehicle_ids = []
         for slot_step, state in zip(payload["window_steps"], payload["source_window"]):
             messages = self._messages_for_slot(int(slot_step), int(prediction_step))
             graph = self.graph_builder(state, messages, int(prediction_step))
             graphs.append(graph)
+            if self.coverage_builder is not None:
+                coverage = self.coverage_builder(state, messages, int(prediction_step))
+                if coverage is not None:
+                    coverage_history.append(torch.as_tensor(coverage, dtype=torch.float32))
             slot_message_counts.append(len(messages))
             slot_selected_vehicle_ids.append(sorted({int(getattr(message, "sender_id")) for message in messages}))
-        return graphs, slot_message_counts, slot_selected_vehicle_ids
+        coverage_tensor = None
+        if coverage_history and len(coverage_history) == len(graphs):
+            coverage_tensor = torch.stack(coverage_history, dim=0)
+        return graphs, coverage_tensor, slot_message_counts, slot_selected_vehicle_ids
 
     def _emit(self, step: int, payload: Dict[str, object]) -> Path:
         if "source_window" in payload:
-            window, slot_message_counts, slot_selected_vehicle_ids = self._build_window_from_sources(step, payload)
+            window, coverage_history, slot_message_counts, slot_selected_vehicle_ids = self._build_window_from_sources(step, payload)
             object_node_ids = valid_object_ids(window[-1]) if window else []
         else:
             window = payload["window"]
+            coverage_history = None
             slot_message_counts = [0 for _ in payload.get("window_steps", ())]
             slot_selected_vehicle_ids = [[] for _ in payload.get("window_steps", ())]
             object_node_ids = payload["object_node_ids"]
@@ -227,6 +239,8 @@ class WAMStage1DataRecorder:
                 "sample_period_steps": int(self.sample_period_steps),
             },
         )
+        if coverage_history is not None:
+            sample["coverage_history"] = coverage_history
         path = self.out_dir / f"{self.prefix}_{self._written:06d}.pt"
         torch.save(sample, path)
         self._written += 1

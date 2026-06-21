@@ -242,6 +242,37 @@ class RecorderTest(unittest.TestCase):
             self.assertEqual(sample["metadata"]["slot_message_counts"], [2, 0, 0, 0, 0])
             self.assertEqual(sample["metadata"]["slot_selected_vehicle_ids"], [[2, 4], [], [], [], []])
 
+    def test_slot_recorder_writes_coverage_history_when_builder_is_present(self):
+        def graph_builder(state, messages, prediction_step):
+            del messages, prediction_step
+            step = int(state["step"])
+            return graph_with_objects([(100, float(step), 1.0)])
+
+        def coverage_builder(state, messages, prediction_step):
+            del messages, prediction_step
+            return np.full((6, 4, 4), float(state["step"]), dtype=np.float32)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = WAMStage1DataRecorder(
+                tmp,
+                fixed_dt=0.1,
+                horizon_s=0.2,
+                samples=1,
+                history_window=2,
+                sample_period_s=0.1,
+                graph_builder=graph_builder,
+                coverage_builder=coverage_builder,
+                receive_window_steps=20,
+            )
+            for step in (0, 1, 2):
+                rec.observe(step, {100: (float(step), 1.0)})
+                rec.register_slot(step, state={"step": step, "ego_pose": (0.0, 0.0, 0.0)})
+            rec.observe(4, {100: (4.0, 1.0)})
+            rec.flush_all()
+            sample = torch.load(sorted(Path(tmp).glob("*.pt"))[-1], weights_only=False)
+            self.assertIn("coverage_history", sample)
+            self.assertEqual(tuple(sample["coverage_history"].shape), (3, 6, 4, 4))
+
 
 class PolicyAugmentedStage1Test(unittest.TestCase):
     def test_policy_enumeration_covers_fixed_family(self):
@@ -273,7 +304,7 @@ class PolicyAugmentedStage1Test(unittest.TestCase):
 
         self.assertGreater(int(graph_obj[OBSERVATION].node_mask.sum()), int(graph_ego[OBSERVATION].node_mask.sum()))
         self.assertGreater(int(graph_obj[OBS_OBJ].edge_index.shape[1]), int(graph_ego[OBS_OBJ].edge_index.shape[1]))
-        self.assertLess(int(graph_bev[OBS_OBJ].edge_index.shape[1]), int(graph_obj[OBS_OBJ].edge_index.shape[1]))
+        self.assertEqual(int(graph_bev[OBS_OBJ].edge_index.shape[1]), int(graph_obj[OBS_OBJ].edge_index.shape[1]))
         self.assertTrue(hasattr(graph_bev[OBSERVATION], "bev_raster"))
         self.assertIn(MODALITY_TO_ID["bev"], graph_bev[OBSERVATION].modality_id.tolist())
 

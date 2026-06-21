@@ -75,7 +75,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jsonl", type=Path, default=None)
     parser.add_argument("--csv", dest="csv_path", type=Path, default=None)
     parser.add_argument("--out-dir", type=Path, default=None)
-    parser.add_argument("--metric", choices=("uncertainty_max", "uncertainty_mean"), default="uncertainty_max")
+    parser.add_argument(
+        "--metric",
+        choices=(
+            "total_uncertainty",
+            "motion_uncertainty",
+            "coverage_uncertainty",
+            "uncertainty_max",
+            "uncertainty_mean",
+        ),
+        default="total_uncertainty",
+    )
     parser.add_argument("--html", action="store_true", default=True)
     parser.add_argument("--no-html", dest="html", action="store_false")
     parser.add_argument("--png", action="store_true", default=True)

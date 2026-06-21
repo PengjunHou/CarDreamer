@@ -152,6 +152,7 @@ def main() -> int:
             history_window=int(stage1_cfg.history_window),
             sample_period_s=float(stage1_cfg.sample_period_s),
             graph_builder=sim._build_wam_graph_for_stage1_slot,
+            coverage_builder=getattr(sim, "_build_wam_coverage_for_stage1_slot", None),
             receive_window_steps=int(sim._comm_config.prediction_window_steps),
             allow_cross_policy_messages=bool(sim._comm_config.allow_cross_policy_messages),
         )

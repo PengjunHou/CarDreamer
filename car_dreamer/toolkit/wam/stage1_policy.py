@@ -18,6 +18,7 @@ from typing import Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Tup
 import torch
 
 from .bev import BevSpec, rasterize_bev
+from .coverage import coverage_metrics
 from .debug_recording import future_sample_step_offsets
 from .graph import (
     OBJECT_STATE_DIM,
@@ -451,6 +452,15 @@ def evaluate_stage1_uncertainty_rows(
             uncertainty = float(policy_uncertainty(out["notable_prob"], out["traj_log_var"], valid_mask=val))
             notable = out["labels"].get("notable")
             ade_fde = trajectory_ade_fde(out["traj_mu"], tgt, valid_mask=val, notable_weight=notable)
+        coverage = {"coverage_uncertainty": 0.0, "route_coverage_quality_mean": 0.0, "poor_coverage_risk_mean": 0.0}
+        if "coverage_history" in sample:
+            coverage_tensor = sample["coverage_history"]
+            if hasattr(coverage_tensor, "detach"):
+                coverage_arr = coverage_tensor[-1].detach().cpu().numpy()
+            else:
+                coverage_arr = coverage_tensor[-1]
+            coverage = coverage_metrics(coverage_arr)
+        total_uncertainty = float(uncertainty) + float(coverage.get("coverage_uncertainty", 0.0))
         metadata = dict(sample.get("metadata", {}))
         policy = dict(metadata.get("policy", {}))
         rows.append(
@@ -462,6 +472,11 @@ def evaluate_stage1_uncertainty_rows(
                 "modality_by_vehicle": dict(policy.get("modality_by_vehicle", {})),
                 "notable_object_ids": list(metadata.get("notable_object_ids", [])),
                 "uncertainty": float(uncertainty),
+                "motion_uncertainty": float(uncertainty),
+                "coverage_uncertainty": float(coverage.get("coverage_uncertainty", 0.0)),
+                "total_uncertainty": float(total_uncertainty),
+                "route_coverage_quality_mean": float(coverage.get("route_coverage_quality_mean", 0.0)),
+                "poor_coverage_risk_mean": float(coverage.get("poor_coverage_risk_mean", 0.0)),
                 "ade": float(ade_fde["ade"]),
                 "fde": float(ade_fde["fde"]),
             }

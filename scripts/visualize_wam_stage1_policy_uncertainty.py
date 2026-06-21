@@ -27,7 +27,11 @@ def parse_args() -> argparse.Namespace:
         default=Path("outputs/wam_stage1_policy_viz/policy_uncertainty.html"),
         help="output interactive HTML path",
     )
-    parser.add_argument("--metric", choices=("uncertainty", "ade", "fde"), default="uncertainty")
+    parser.add_argument(
+        "--metric",
+        choices=("uncertainty", "motion_uncertainty", "coverage_uncertainty", "total_uncertainty", "ade", "fde"),
+        default="total_uncertainty",
+    )
     parser.add_argument("--baseline", default="ego_only", help="baseline policy label or policy_type")
     parser.add_argument("--top-k", type=int, default=0, help="show only top-k policies by mean metric; 0 shows all")
     parser.add_argument("--title", default=None)

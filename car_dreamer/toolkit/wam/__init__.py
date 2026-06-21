@@ -29,6 +29,14 @@ from .bev import (
     bev_reconstruction_loss,
     rasterize_bev,
 )
+from .coverage import (
+    COVERAGE_CHANNEL_NAMES,
+    COVERAGE_NUM_CHANNELS,
+    CoverageConfig,
+    build_coverage_raster,
+    coverage_metrics,
+    route_corridor_polyline,
+)
 from .graph import (
     EDGE_ATTR_DIMS,
     EDGE_TYPES,
@@ -169,6 +177,13 @@ __all__ = [
     "bev_iou",
     "bev_reconstruction_loss",
     "rasterize_bev",
+    # route-corridor coverage uncertainty
+    "COVERAGE_CHANNEL_NAMES",
+    "COVERAGE_NUM_CHANNELS",
+    "CoverageConfig",
+    "build_coverage_raster",
+    "coverage_metrics",
+    "route_corridor_polyline",
     # hetero graph construction (§4-§7 + Edge Representation Update)
     "EDGE_ATTR_DIMS",
     "EDGE_TYPES",

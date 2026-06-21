@@ -68,13 +68,14 @@ from .toolkit.observer.handlers.utils import is_fov_visible
 from .toolkit.wam import (
     OBJECT_STATE_DIM,
     BevSpec,
+    CoverageConfig,
     GraphBuildSpec,
     ObjectState,
     ObservationNodeInput,
     VehicleNodeInput,
     WAMPolicy,
+    build_coverage_raster,
     rasterize_bev,
-    build_coop_request,
     build_wam_hetero_graph,
     hetero_graph_stats,
     predict_notable_motion,
@@ -257,6 +258,18 @@ class V2VCommMixin:
             for v in self._as_config_list(getattr(random_policy_cfg, "bandwidth_ratios", (1.0,)), default=(1.0,))
         ) or (1.0,)
         self._wam_random_policy_respect_request = bool(getattr(random_policy_cfg, "respect_request", False))
+        coverage_cfg = getattr(wam_cfg, "coverage", None)
+        self._wam_coverage_enabled = bool(getattr(coverage_cfg, "enabled", True))
+        self._wam_coverage_config = CoverageConfig(
+            past_route_distance_m=float(getattr(coverage_cfg, "past_route_distance_m", 10.0)),
+            future_route_distance_m=float(getattr(coverage_cfg, "future_route_distance_m", 40.0)),
+            corridor_width_m=float(getattr(coverage_cfg, "corridor_width_m", 8.0)),
+            coverage_distance_scale_m=float(getattr(coverage_cfg, "coverage_distance_scale_m", 20.0)),
+            route_risk_distance_scale_m=float(getattr(coverage_cfg, "route_risk_distance_scale_m", 20.0)),
+            u_prior=float(getattr(coverage_cfg, "u_prior", 1.0)),
+        )
+        self._wam_uncertainty_alpha_motion = float(getattr(coverage_cfg, "alpha_motion", 1.0))
+        self._wam_uncertainty_beta_coverage = float(getattr(coverage_cfg, "beta_coverage", 1.0))
         seed = getattr(random_policy_cfg, "seed", None)
         self._wam_policy_rng = np.random.default_rng(None if seed is None else int(seed))
 
@@ -364,6 +377,17 @@ class V2VCommMixin:
         self._wam_active_policy_by_step: Dict[int, Optional[int]] = {}
         self._wam_slot_history_last_step = -1
         self._wam_graph_embeddings = None
+        self._wam_coverage_raster = None
+        self._wam_coverage_step = -1
+        self._wam_ego_pose_history: Deque[Any] = deque(maxlen=512)
+        self._wam_uncertainty_breakdown = {
+            "motion_uncertainty": 0.0,
+            "coverage_uncertainty": 0.0,
+            "total_uncertainty": 0.0,
+            "route_coverage_ratio": 0.0,
+            "route_coverage_quality_mean": 0.0,
+            "poor_coverage_risk_mean": 0.0,
+        }
         self._wam_policy = WAMPolicy(
             selected_vehicle_ids=(),
             modality_by_vehicle={},
@@ -718,6 +742,158 @@ class V2VCommMixin:
     # WAM runtime: notable objects -> request (policy decided in _update_policy_lifecycle)
     # =========================================================
 
+    def _record_wam_ego_pose_history(self, step: int) -> None:
+        ego = getattr(self, "ego", None)
+        if ego is None:
+            return
+        tf = ego.get_transform()
+        pose = (int(step), float(tf.location.x), float(tf.location.y), float(tf.rotation.yaw))
+        hist = getattr(self, "_wam_ego_pose_history", None)
+        if hist is None:
+            self._wam_ego_pose_history = deque(maxlen=512)
+            hist = self._wam_ego_pose_history
+        if hist and int(hist[-1][0]) == int(step):
+            hist[-1] = pose
+        else:
+            hist.append(pose)
+
+    def _wam_past_route_xy(self):
+        hist = list(getattr(self, "_wam_ego_pose_history", ()))
+        if len(hist) >= 2:
+            return tuple((float(item[1]), float(item[2])) for item in hist[:-1])
+        ego = getattr(self, "ego", None)
+        if ego is None:
+            return ()
+        tf = ego.get_transform()
+        dist = float(getattr(getattr(self, "_wam_coverage_config", None), "past_route_distance_m", 10.0))
+        yaw = math.radians(float(tf.rotation.yaw))
+        return ((float(tf.location.x) - math.cos(yaw) * dist, float(tf.location.y) - math.sin(yaw) * dist),)
+
+    def _wam_actor_polygons(self) -> Dict[int, Any]:
+        actors = []
+        if getattr(self, "ego", None) is not None:
+            actors.append(self.ego)
+        actors.extend(actor for actor in getattr(self, "group_vehs", []) if actor is not None)
+        actors.extend(self._wam_object_actors())
+        polygons = {}
+        for actor in actors:
+            try:
+                polygons[int(actor.id)] = self._actor_polygon_xy(actor)
+            except Exception:
+                V2V_LOGGER.debug("Failed to build coverage polygon actor_id=%s", getattr(actor, "id", None))
+        return polygons
+
+    def _available_wam_messages(self, step: int):
+        proc = self._ensure_comm_process()
+        return proc.available_messages(int(step)) if proc.policy is not None else []
+
+    def _latest_wam_messages_by_sender(self, messages):
+        latest: Dict[int, Any] = {}
+        for message in messages:
+            current = latest.get(int(message.sender_id))
+            if current is None or int(message.t_sense) >= int(current.t_sense):
+                latest[int(message.sender_id)] = message
+        return latest
+
+    def _build_wam_coverage(self, step: Optional[int] = None) -> Dict[str, float]:
+        if step is None:
+            step = int(getattr(self, "_time_step", 0))
+        if (
+            not bool(getattr(self, "_wam_coverage_enabled", False))
+            or getattr(self, "ego", None) is None
+            or not bool(getattr(self, "_wam_build_graph", True))
+        ):
+            self._wam_coverage_raster = None
+            return {
+                "coverage_uncertainty": 0.0,
+                "route_coverage_ratio": 0.0,
+                "route_coverage_quality_mean": 0.0,
+                "poor_coverage_risk_mean": 0.0,
+            }
+        if int(getattr(self, "_wam_coverage_step", -1)) == int(step) and self._wam_coverage_raster is not None:
+            return {
+                key: float(getattr(self, "_wam_uncertainty_breakdown", {}).get(key, 0.0))
+                for key in (
+                    "coverage_uncertainty",
+                    "route_coverage_ratio",
+                    "route_coverage_quality_mean",
+                    "poor_coverage_risk_mean",
+                )
+            }
+
+        ego_tf = self.ego.get_transform()
+        ego_pose = (float(ego_tf.location.x), float(ego_tf.location.y), float(ego_tf.rotation.yaw))
+        messages = self._available_wam_messages(int(step))
+        latest = self._latest_wam_messages_by_sender(messages)
+        collaborators = []
+        for sender_id, message in sorted(latest.items()):
+            pose = message.data.get("pose", {})
+            collaborators.append(
+                (
+                    int(sender_id),
+                    float(pose.get("x", 0.0)),
+                    float(pose.get("y", 0.0)),
+                    float(pose.get("yaw", 0.0)),
+                )
+            )
+        raster, metrics = build_coverage_raster(
+            ego_pose=ego_pose,
+            route_xy=self._wam_route_xy(),
+            past_route_xy=self._wam_past_route_xy(),
+            ego_observer=(int(self.ego.id), ego_pose[0], ego_pose[1], ego_pose[2]),
+            collaborator_observers=tuple(collaborators),
+            actor_polygons=self._wam_actor_polygons(),
+            ego_fov=float(self._wam_local_sight_fov),
+            ego_sight_range=float(self._wam_local_sight_range),
+            collaborator_fov=float(self._wam_collaborator_sight_fov),
+            collaborator_sight_range=float(self._wam_collaborator_sight_range),
+            config=getattr(self, "_wam_coverage_config", CoverageConfig()),
+            spec=getattr(self, "_wam_bev_spec", BevSpec()),
+        )
+        self._wam_coverage_raster = raster
+        self._wam_coverage_step = int(step)
+        return metrics
+
+    def _update_wam_uncertainty_breakdown(self, step: int, *, motion_uncertainty: Optional[float] = None) -> None:
+        if motion_uncertainty is None:
+            vals = [float(pred.uncertainty_score) for pred in getattr(self, "_wam_motion_predictions", {}).values()]
+            motion_uncertainty = max(vals) if vals else 0.0
+        coverage = self._build_wam_coverage(int(step))
+        alpha = float(getattr(self, "_wam_uncertainty_alpha_motion", 1.0))
+        beta = float(getattr(self, "_wam_uncertainty_beta_coverage", 1.0))
+        total = alpha * float(motion_uncertainty) + beta * float(coverage.get("coverage_uncertainty", 0.0))
+        self._wam_uncertainty_breakdown = {
+            "motion_uncertainty": float(motion_uncertainty),
+            "coverage_uncertainty": float(coverage.get("coverage_uncertainty", 0.0)),
+            "total_uncertainty": float(total),
+            "route_coverage_ratio": float(coverage.get("route_coverage_ratio", 0.0)),
+            "route_coverage_quality_mean": float(coverage.get("route_coverage_quality_mean", 0.0)),
+            "poor_coverage_risk_mean": float(coverage.get("poor_coverage_risk_mean", 0.0)),
+        }
+        if float(total) > float(getattr(self, "_wam_uncertainty_threshold", 1.0)):
+            high_ids = tuple(
+                sorted(
+                    int(actor_id)
+                    for actor_id, pred in getattr(self, "_wam_motion_predictions", {}).items()
+                    if float(pred.uncertainty_score) > float(getattr(self, "_wam_uncertainty_threshold", 1.0))
+                )
+            )
+            if not high_ids:
+                high_ids = tuple(
+                    int(record.object_state.actor_id) for record in getattr(self, "_wam_notable_records", ())
+                )
+            from .toolkit.wam import CoopRequest
+
+            self._wam_coop_request = CoopRequest(
+                ego_id=int(self.ego.id),
+                step=int(step),
+                high_uncertainty_object_ids=high_ids,
+                uncertainty_threshold=float(getattr(self, "_wam_uncertainty_threshold", 1.0)),
+                reason="total_uncertainty_above_threshold",
+            )
+        else:
+            self._wam_coop_request = None
+
     def _actor_polygon_xy(self, actor: carla.Actor):
         tf = actor.get_transform()
         bb = actor.bounding_box
@@ -882,6 +1058,7 @@ class V2VCommMixin:
         if not bool(getattr(self, "_wam_enabled", True)):
             return
         step = int(getattr(self, "_time_step", 0))
+        self._record_wam_ego_pose_history(step)
         self._refresh_object_states(step)  # perception: every step (deduped)
         self._update_wam_notable_records()
         if bool(getattr(self, "_wam_build_graph", True)):
@@ -939,12 +1116,7 @@ class V2VCommMixin:
             visible_uncertainty=float(self._wam_visible_uncertainty),
             invisible_uncertainty=float(self._wam_invisible_uncertainty),
         )
-        self._wam_coop_request = build_coop_request(
-            ego_id=int(self.ego.id),
-            step=step,
-            predictions=self._wam_motion_predictions,
-            uncertainty_threshold=float(self._wam_uncertainty_threshold),
-        )
+        self._update_wam_uncertainty_breakdown(step)
 
     def _resolve_wam_predictor_device(self) -> torch.device:
         requested = str(getattr(self, "_wam_predictor_device", "auto")).lower()
@@ -1083,10 +1255,14 @@ class V2VCommMixin:
             out = model(window)
         object_ids = [int(v) for v in out["object_node_ids"].detach().cpu().tolist()]
         if not object_ids:
+            self._update_wam_uncertainty_breakdown(step, motion_uncertainty=0.0)
             return
         notable_prob = out["notable_prob"].detach()
         trace = torch.exp(out["traj_log_var"].detach()).sum(dim=-1)  # [Q, H]
         uncertainty = trace.mean(dim=-1)
+        motion_uncertainty = float(
+            (notable_prob * uncertainty).sum() / notable_prob.sum().clamp_min(1e-6)
+        )
         source = str(getattr(self, "_wam_predictor_uncertainty_source", "notable_weighted_trace"))
         score = notable_prob * uncertainty if source == "notable_weighted_trace" else uncertainty
         mu = out["traj_mu"].detach().cpu()
@@ -1106,14 +1282,12 @@ class V2VCommMixin:
                 covariance_diag=cov,
                 uncertainty_score=u,
             )
-        self._wam_coop_request = build_coop_request(
-            ego_id=int(self.ego.id),
-            step=step,
-            predictions=self._wam_motion_predictions,
-            uncertainty_threshold=float(self._wam_uncertainty_threshold),
-        )
+        self._update_wam_uncertainty_breakdown(step, motion_uncertainty=motion_uncertainty)
 
     def _wam_max_uncertainty(self) -> float:
+        breakdown = getattr(self, "_wam_uncertainty_breakdown", None) or {}
+        if "total_uncertainty" in breakdown:
+            return float(breakdown.get("total_uncertainty", 0.0))
         if not getattr(self, "_wam_motion_predictions", None):
             return 0.0
         return float(max(pred.uncertainty_score for pred in self._wam_motion_predictions.values()))
@@ -1309,6 +1483,8 @@ class V2VCommMixin:
             "ego_pose": ego_pose,
             "live_states": tuple(getattr(self, "_wam_object_states", ())),
             "route_xy": tuple(route_xy),
+            "past_route_xy": tuple(self._wam_past_route_xy()),
+            "actor_polygons": self._wam_actor_polygons(),
             "notable_ids": tuple(int(record.object_state.actor_id) for record in getattr(self, "_wam_notable_records", ())),
         }
 
@@ -1325,6 +1501,40 @@ class V2VCommMixin:
             notable_ids=state.get("notable_ids", ()),
         )
         return graph
+
+    def _build_wam_coverage_for_stage1_slot(self, state, messages, prediction_step: int):
+        """Rebuild one Stage-1 coverage raster using only messages selected by the recorder."""
+        del prediction_step
+        if not bool(getattr(self, "_wam_coverage_enabled", False)):
+            return None
+        ego_pose = tuple(state["ego_pose"])
+        latest = self._latest_wam_messages_by_sender(messages)
+        collaborators = []
+        for sender_id, message in sorted(latest.items()):
+            pose = message.data.get("pose", {})
+            collaborators.append(
+                (
+                    int(sender_id),
+                    float(pose.get("x", 0.0)),
+                    float(pose.get("y", 0.0)),
+                    float(pose.get("yaw", 0.0)),
+                )
+            )
+        raster, _ = build_coverage_raster(
+            ego_pose=ego_pose,
+            route_xy=tuple(state.get("route_xy", ())),
+            past_route_xy=tuple(state.get("past_route_xy", ())),
+            ego_observer=(int(self.ego.id), float(ego_pose[0]), float(ego_pose[1]), float(ego_pose[2])),
+            collaborator_observers=tuple(collaborators),
+            actor_polygons=state.get("actor_polygons", {}),
+            ego_fov=float(self._wam_local_sight_fov),
+            ego_sight_range=float(self._wam_local_sight_range),
+            collaborator_fov=float(self._wam_collaborator_sight_fov),
+            collaborator_sight_range=float(self._wam_collaborator_sight_range),
+            config=getattr(self, "_wam_coverage_config", CoverageConfig()),
+            spec=getattr(self, "_wam_bev_spec", BevSpec()),
+        )
+        return raster
 
     def _update_wam_graph(self, step: Optional[int] = None) -> None:
         if step is None:
@@ -1439,6 +1649,7 @@ class V2VCommMixin:
             self._update_wam_graph(step)
         notable = list(getattr(self, "_wam_notable_records", []))
         policy = getattr(self, "_wam_policy", None)
+        uncertainty = dict(getattr(self, "_wam_uncertainty_breakdown", {}) or {})
         info = {
             "wam_notable_object_ids": [int(record.object_state.actor_id) for record in notable],
             "wam_visible_notable_object_ids": [
@@ -1448,6 +1659,12 @@ class V2VCommMixin:
                 int(record.object_state.actor_id) for record in notable if bool(record.invisible)
             ],
             "wam_uncertainty_max": float(self._wam_max_uncertainty()),
+            "wam_motion_uncertainty": float(uncertainty.get("motion_uncertainty", 0.0)),
+            "wam_coverage_uncertainty": float(uncertainty.get("coverage_uncertainty", 0.0)),
+            "wam_total_uncertainty": float(uncertainty.get("total_uncertainty", self._wam_max_uncertainty())),
+            "wam_route_coverage_ratio": float(uncertainty.get("route_coverage_ratio", 0.0)),
+            "wam_route_coverage_quality_mean": float(uncertainty.get("route_coverage_quality_mean", 0.0)),
+            "wam_poor_coverage_risk_mean": float(uncertainty.get("poor_coverage_risk_mean", 0.0)),
             "wam_coop_triggered": bool(getattr(self, "_wam_coop_request", None) is not None),
             "wam_policy_selected_vehicle_ids": list(policy.selected_vehicle_ids) if policy is not None else [],
             "wam_policy_modality_by_vehicle": dict(policy.modality_by_vehicle) if policy is not None else {},

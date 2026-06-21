@@ -9,7 +9,7 @@ from typing import Iterable, List, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
-METRICS = ("uncertainty", "ade", "fde")
+METRICS = ("uncertainty", "motion_uncertainty", "coverage_uncertainty", "total_uncertainty", "ade", "fde")
 PLOTLY_INSTALL_HINT = (
     "Plotly is required for interactive HTML output. Install it with "
     "`conda install -n cardreamer_gnn plotly` or update/recreate the environment from environment.yml."
@@ -50,7 +50,7 @@ def policy_label(policy_type: str, selected_vehicle_ids: Sequence[object]) -> st
 def load_policy_uncertainty_csv(path: Union[str, Path]) -> pd.DataFrame:
     """Load uncertainty CSV and add parsed JSON + readable policy columns."""
     df = pd.read_csv(path)
-    required = {"step", "episode_id", "policy_type", "selected_vehicle_ids", "modality_by_vehicle", *METRICS}
+    required = {"step", "episode_id", "policy_type", "selected_vehicle_ids", "modality_by_vehicle", "uncertainty", "ade", "fde"}
     missing = sorted(required - set(df.columns))
     if missing:
         raise ValueError(f"missing required columns in {path}: {missing}")
@@ -66,7 +66,8 @@ def load_policy_uncertainty_csv(path: Union[str, Path]) -> pd.DataFrame:
     for key in ("step", "episode_id"):
         df[key] = pd.to_numeric(df[key], errors="coerce").fillna(-1).astype(int)
     for key in METRICS:
-        df[key] = pd.to_numeric(df[key], errors="coerce")
+        if key in df.columns:
+            df[key] = pd.to_numeric(df[key], errors="coerce")
 
     df["policy_label"] = [
         policy_label(pt, selected)
@@ -82,6 +83,8 @@ def add_metric_delta(df: pd.DataFrame, *, metric: str, baseline: str = "ego_only
     """Add ``{metric}_baseline`` and ``{metric}_delta`` using matching episode/step rows."""
     if metric not in METRICS:
         raise ValueError(f"metric must be one of {METRICS}, got {metric!r}")
+    if metric not in df.columns:
+        raise ValueError(f"metric {metric!r} is not present in the CSV; columns={list(df.columns)}")
     out = df.copy()
     base_mask = (out["policy_label"] == baseline) | (out["policy_type"] == baseline)
     baseline_df = (
@@ -99,6 +102,8 @@ def summarize_policies(df: pd.DataFrame, *, metric: str) -> pd.DataFrame:
     """Per-policy ranking summary. Lower metric is better."""
     if metric not in METRICS:
         raise ValueError(f"metric must be one of {METRICS}, got {metric!r}")
+    if metric not in df.columns:
+        raise ValueError(f"metric {metric!r} is not present in the CSV; columns={list(df.columns)}")
     delta_col = f"{metric}_delta"
     best = df.loc[df.groupby(["episode_id", "step"])[metric].idxmin(), ["policy_label"]]
     best_counts = best["policy_label"].value_counts().rename("best_step_count")
@@ -173,9 +178,13 @@ def build_policy_uncertainty_figure(
         "modality",
         "notable_objects",
         "uncertainty",
+        "motion_uncertainty",
+        "coverage_uncertainty",
+        "total_uncertainty",
         "ade",
         "fde",
     ]
+    hover_cols = [col for col in hover_cols if col in df.columns]
     for label, group in df.sort_values(["episode_id", "step"]).groupby("policy_label", sort=False):
         custom = group[hover_cols].to_numpy()
         fig.add_trace(
@@ -191,7 +200,7 @@ def build_policy_uncertainty_figure(
                     "policy=%{customdata[2]}<br>"
                     "selected=%{customdata[3]} modality=%{customdata[4]}<br>"
                     "notable=%{customdata[5]}<br>"
-                    "uncertainty=%{customdata[6]:.4f} ADE=%{customdata[7]:.4f} FDE=%{customdata[8]:.4f}"
+                    f"{metric}=%{{y:.4f}}"
                     "<extra></extra>"
                 ),
             ),

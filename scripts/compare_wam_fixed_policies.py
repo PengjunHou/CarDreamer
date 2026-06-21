@@ -164,6 +164,23 @@ def _max_mean_uncertainty(predictions: Dict[int, object]) -> Tuple[float, float]
     return max(vals), sum(vals) / len(vals)
 
 
+def _uncertainty_breakdown(sim, legacy_max: float, legacy_mean: float) -> Dict[str, float]:
+    breakdown = dict(getattr(sim, "_wam_uncertainty_breakdown", {}) or {})
+    motion = float(breakdown.get("motion_uncertainty", legacy_mean))
+    coverage = float(breakdown.get("coverage_uncertainty", 0.0))
+    total = float(breakdown.get("total_uncertainty", motion + coverage))
+    return {
+        "motion_uncertainty": motion,
+        "coverage_uncertainty": coverage,
+        "total_uncertainty": total,
+        "route_coverage_quality_mean": float(breakdown.get("route_coverage_quality_mean", 0.0)),
+        "poor_coverage_risk_mean": float(breakdown.get("poor_coverage_risk_mean", 0.0)),
+        "route_coverage_ratio": float(breakdown.get("route_coverage_ratio", 0.0)),
+        "legacy_uncertainty_max": float(legacy_max),
+        "legacy_uncertainty_mean": float(legacy_mean),
+    }
+
+
 def _json_list(values: Iterable[int]) -> str:
     return json.dumps([int(v) for v in values], separators=(",", ":"))
 
@@ -266,6 +283,12 @@ def main() -> int:
         "num_selected",
         "uncertainty_max",
         "uncertainty_mean",
+        "motion_uncertainty",
+        "coverage_uncertainty",
+        "total_uncertainty",
+        "route_coverage_quality_mean",
+        "poor_coverage_risk_mean",
+        "route_coverage_ratio",
         "num_predictions",
         "notable_object_ids",
         "visible_notable_object_ids",
@@ -361,6 +384,7 @@ def main() -> int:
                 notable = list(getattr(sim, "_wam_notable_records", []))
                 predictions = dict(getattr(sim, "_wam_motion_predictions", {}))
                 unc_max, unc_mean = _max_mean_uncertainty(predictions)
+                unc = _uncertainty_breakdown(sim, unc_max, unc_mean)
                 modality_by_vehicle = {int(k): list(v) for k, v in policy.modalities_by_vehicle.items()}
                 writer.writerow(
                     {
@@ -373,6 +397,12 @@ def main() -> int:
                         "num_selected": len(selected),
                         "uncertainty_max": float(unc_max),
                         "uncertainty_mean": float(unc_mean),
+                        "motion_uncertainty": float(unc["motion_uncertainty"]),
+                        "coverage_uncertainty": float(unc["coverage_uncertainty"]),
+                        "total_uncertainty": float(unc["total_uncertainty"]),
+                        "route_coverage_quality_mean": float(unc["route_coverage_quality_mean"]),
+                        "poor_coverage_risk_mean": float(unc["poor_coverage_risk_mean"]),
+                        "route_coverage_ratio": float(unc["route_coverage_ratio"]),
                         "num_predictions": len(predictions),
                         "notable_object_ids": _json_list(
                             int(r.object_state.actor_id) for r in notable
@@ -393,7 +423,8 @@ def main() -> int:
 
                 if local_step % int(args.print_every) == 0:
                     print(
-                        f"  step={step} uncertainty_max={unc_max:.4f} "
+                        f"  step={step} total_uncertainty={unc['total_uncertainty']:.4f} "
+                        f"legacy_max={unc_max:.4f} "
                         f"notable={[int(r.object_state.actor_id) for r in notable]}",
                         flush=True,
                     )

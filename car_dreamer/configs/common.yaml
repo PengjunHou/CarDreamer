@@ -248,6 +248,16 @@ env:
         - [objlist, bev]
       bandwidth_ratios: [0.2,0.5, 0.8, 1.0]
       respect_request: False
+    coverage:
+      enabled: True
+      past_route_distance_m: 8.0
+      future_route_distance_m: 20.0
+      corridor_width_m: 8.0
+      coverage_distance_scale_m: 20.0
+      route_risk_distance_scale_m: 20.0
+      u_prior: 1.0
+      alpha_motion: 1.0
+      beta_coverage: 1.0
 
 runtime_logging:
   enabled: True
