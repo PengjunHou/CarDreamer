@@ -231,6 +231,14 @@ class V2VCommMixin:
         self._wam_predictor_history_window = int(
             getattr(wam_cfg, "predictor_history_window", getattr(stage1_cfg, "history_window", 4))
         )
+        sample_period_s = float(
+            getattr(
+                stage1_cfg,
+                "sample_period_s",
+                getattr(getattr(self._config, "communication", None), "sensor_period_s", self._comm_config.dt),
+            )
+        )
+        self._wam_predictor_sample_period_steps = max(1, int(round(sample_period_s / float(self._comm_config.dt))))
         self._wam_predictor_model = None
         self._wam_predictor_loaded_path = None
         self._wam_predictor_device_resolved = None
@@ -351,6 +359,10 @@ class V2VCommMixin:
         graph_window_len = max(int(getattr(self, "_wam_predictor_history_window", 4)), 0) + 1
         self._wam_graph_window: Deque[Any] = deque(maxlen=graph_window_len)
         self._wam_graph_window_last_step = -1
+        self._wam_slot_state_history: Dict[int, Any] = {}
+        self._wam_received_message_cache: Dict[Any, Any] = {}
+        self._wam_active_policy_by_step: Dict[int, Optional[int]] = {}
+        self._wam_slot_history_last_step = -1
         self._wam_graph_embeddings = None
         self._wam_policy = WAMPolicy(
             selected_vehicle_ids=(),
@@ -875,6 +887,7 @@ class V2VCommMixin:
         if bool(getattr(self, "_wam_build_graph", True)):
             self._update_wam_graph(step)
             self._update_wam_graph_window(step)
+        self._update_wam_checkpoint_slot_cache(step)
 
         last = int(getattr(self, "_wam_last_predict_step", -1))
         action_period = max(int(self._comm_config.action_period_steps), 1)
@@ -978,19 +991,94 @@ class V2VCommMixin:
         self._wam_predictor_device_resolved = device
         return model
 
+    def _update_wam_checkpoint_slot_cache(self, step: int) -> None:
+        proc = self._ensure_comm_process()
+        self._wam_active_policy_by_step[int(step)] = proc.active_policy_id
+        for message in getattr(proc.receive_queue, "messages", ()):
+            msg_id = getattr(message, "msg_id", None)
+            if msg_id is None:
+                msg_id = (
+                    int(getattr(message, "policy_id", -1)),
+                    int(getattr(message, "sender_id", -1)),
+                    int(getattr(message, "t_sense", -1)),
+                    int(getattr(message, "t_recv", -1)),
+                )
+            self._wam_received_message_cache[msg_id] = message
+
+        sample_period = max(int(getattr(self, "_wam_predictor_sample_period_steps", 1)), 1)
+        if int(step) % sample_period == 0 and int(getattr(self, "_wam_slot_history_last_step", -1)) != int(step):
+            self._wam_slot_state_history[int(step)] = self._wam_stage1_slot_state(int(step))
+            self._wam_slot_history_last_step = int(step)
+        self._prune_wam_checkpoint_slot_cache(int(step))
+
+    def _prune_wam_checkpoint_slot_cache(self, step: int) -> None:
+        history = max(int(getattr(self, "_wam_predictor_history_window", 4)), 0)
+        sample_period = max(int(getattr(self, "_wam_predictor_sample_period_steps", 1)), 1)
+        keep_from = int(step) - history * sample_period - int(self._comm_config.prediction_window_steps) - sample_period
+        for slot_step in list(getattr(self, "_wam_slot_state_history", {})):
+            if int(slot_step) < keep_from:
+                del self._wam_slot_state_history[slot_step]
+        for key, message in list(getattr(self, "_wam_received_message_cache", {}).items()):
+            if int(getattr(message, "t_sense", keep_from)) < keep_from:
+                del self._wam_received_message_cache[key]
+        for policy_step in list(getattr(self, "_wam_active_policy_by_step", {})):
+            if int(policy_step) < keep_from:
+                del self._wam_active_policy_by_step[policy_step]
+
+    def _wam_checkpoint_anchor_step(self, step: int) -> int:
+        sample_period = max(int(getattr(self, "_wam_predictor_sample_period_steps", 1)), 1)
+        return int(step) - (int(step) % sample_period)
+
+    def _wam_checkpoint_window_steps(self, step: int):
+        history = max(int(getattr(self, "_wam_predictor_history_window", 4)), 0)
+        sample_period = max(int(getattr(self, "_wam_predictor_sample_period_steps", 1)), 1)
+        anchor = self._wam_checkpoint_anchor_step(int(step))
+        return [anchor - sample_period * idx for idx in range(history, -1, -1)]
+
+    def _messages_for_checkpoint_slot(self, slot_step: int, prediction_step: int):
+        oldest = int(prediction_step) - int(self._comm_config.prediction_window_steps)
+        active_policy_id = self._wam_active_policy_by_step.get(int(prediction_step), self._ensure_comm_process().active_policy_id)
+        out = []
+        for message in getattr(self, "_wam_received_message_cache", {}).values():
+            t_sense = int(getattr(message, "t_sense"))
+            if t_sense != int(slot_step):
+                continue
+            if int(getattr(message, "t_recv")) > int(prediction_step):
+                continue
+            if not (oldest <= t_sense <= int(prediction_step)):
+                continue
+            if (
+                not bool(self._comm_config.allow_cross_policy_messages)
+                and active_policy_id is not None
+                and int(getattr(message, "policy_id")) != int(active_policy_id)
+            ):
+                continue
+            out.append(message)
+        return out
+
+    def _checkpoint_graph_window_ready(self, step: int) -> bool:
+        return all(int(slot_step) in self._wam_slot_state_history for slot_step in self._wam_checkpoint_window_steps(step))
+
+    def _build_checkpoint_graph_window(self, step: int):
+        window = []
+        for slot_step in self._wam_checkpoint_window_steps(step):
+            state = self._wam_slot_state_history[int(slot_step)]
+            messages = self._messages_for_checkpoint_slot(int(slot_step), int(step))
+            window.append(self._build_wam_graph_for_stage1_slot(state, messages, int(step)))
+        return window
+
     def _graph_window_ready(self) -> bool:
-        required = max(int(getattr(self, "_wam_predictor_history_window", 4)), 0) + 1
-        return len(getattr(self, "_wam_graph_window", ())) >= required
+        step = int(getattr(self, "_time_step", 0))
+        return self._checkpoint_graph_window_ready(step)
 
     def _predict_wam_with_checkpoint(self, step: int) -> None:
         self._wam_motion_predictions = {}
         self._wam_coop_request = None
-        if not self._graph_window_ready():
+        if not self._checkpoint_graph_window_ready(int(step)):
             return
         model = self._load_wam_predictor()
         device = self._wam_predictor_device_resolved or self._resolve_wam_predictor_device()
-        required = max(int(getattr(self, "_wam_predictor_history_window", 4)), 0) + 1
-        window = [graph.clone().to(device) for graph in list(self._wam_graph_window)[-required:]]
+        window = [graph.clone().to(device) for graph in self._build_checkpoint_graph_window(int(step))]
         with torch.no_grad():
             out = model(window)
         object_ids = [int(v) for v in out["object_node_ids"].detach().cpu().tolist()]

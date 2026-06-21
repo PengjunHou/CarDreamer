@@ -148,8 +148,11 @@ class WAMRuntimeTest(unittest.TestCase):
         self.assertEqual(policy.selected_vehicle_ids, ())
         self.assertEqual(policy.modality_by_vehicle, {})
 
-    def test_checkpoint_predictor_uses_graph_window_to_request_coop(self):
+    def test_checkpoint_predictor_uses_slot_rebuilt_window_to_request_coop(self):
         class DummyGraph:
+            def __init__(self, step):
+                self.step = step
+
             def clone(self):
                 return self
 
@@ -159,7 +162,7 @@ class WAMRuntimeTest(unittest.TestCase):
 
         class DummyModel:
             def __call__(self, window):
-                self.window_len = len(window)
+                self.window_steps = [graph.step for graph in window]
                 return {
                     "object_node_ids": torch.tensor([7, 8], dtype=torch.long),
                     "notable_prob": torch.tensor([1.0, 0.1], dtype=torch.float32),
@@ -170,7 +173,13 @@ class WAMRuntimeTest(unittest.TestCase):
         mixin = object.__new__(V2VCommMixin)
         model = DummyModel()
         mixin._wam_predictor_history_window = 1
-        mixin._wam_graph_window = deque([DummyGraph(), DummyGraph()], maxlen=2)
+        mixin._wam_predictor_sample_period_steps = 2
+        mixin._wam_slot_state_history = {10: {"step": 10}, 12: {"step": 12}}
+        mixin._comm_config = SimpleNamespace(prediction_window_steps=20, allow_cross_policy_messages=False)
+        mixin._wam_active_policy_by_step = {12: 1}
+        mixin._wam_received_message_cache = {}
+        mixin._ensure_comm_process = lambda: SimpleNamespace(active_policy_id=1)
+        mixin._build_wam_graph_for_stage1_slot = lambda state, messages, prediction_step: DummyGraph(state["step"])
         mixin._wam_predictor_device_resolved = torch.device("cpu")
         mixin._wam_predictor_uncertainty_source = "notable_weighted_trace"
         mixin._wam_uncertainty_threshold = 0.5
@@ -179,11 +188,37 @@ class WAMRuntimeTest(unittest.TestCase):
 
         mixin._predict_wam_with_checkpoint(step=12)
 
-        self.assertEqual(model.window_len, 2)
+        self.assertEqual(model.window_steps, [10, 12])
         self.assertIsNotNone(mixin._wam_coop_request)
         self.assertEqual(mixin._wam_coop_request.high_uncertainty_object_ids, (7,))
         self.assertIn(7, mixin._wam_motion_predictions)
         self.assertNotIn(8, mixin._wam_coop_request.high_uncertainty_object_ids)
+
+    def test_checkpoint_slot_message_filter_matches_training_semantics(self):
+        def msg(msg_id, *, sender_id, t_sense, t_recv, policy_id=1):
+            return SimpleNamespace(
+                msg_id=msg_id,
+                sender_id=sender_id,
+                t_sense=t_sense,
+                t_recv=t_recv,
+                policy_id=policy_id,
+            )
+
+        mixin = object.__new__(V2VCommMixin)
+        mixin._comm_config = SimpleNamespace(prediction_window_steps=20, allow_cross_policy_messages=False)
+        mixin._wam_active_policy_by_step = {20: 1}
+        mixin._wam_received_message_cache = {
+            1: msg(1, sender_id=2, t_sense=12, t_recv=18),
+            2: msg(2, sender_id=3, t_sense=14, t_recv=22),
+            3: msg(3, sender_id=4, t_sense=12, t_recv=19),
+            4: msg(4, sender_id=5, t_sense=16, t_recv=17, policy_id=2),
+            5: msg(5, sender_id=6, t_sense=-2, t_recv=0),
+        }
+        mixin._ensure_comm_process = lambda: SimpleNamespace(active_policy_id=1)
+
+        self.assertEqual([m.sender_id for m in mixin._messages_for_checkpoint_slot(12, 20)], [2, 4])
+        self.assertEqual(mixin._messages_for_checkpoint_slot(14, 20), [])
+        self.assertEqual(mixin._messages_for_checkpoint_slot(16, 20), [])
 
     def test_random_duration_sampler_builds_valid_comm_policy(self):
         mixin = object.__new__(V2VCommMixin)
