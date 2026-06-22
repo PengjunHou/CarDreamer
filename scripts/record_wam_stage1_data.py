@@ -75,8 +75,22 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
         default=1.0,
         help="bandwidth ratio written into policy-augmented metadata",
     )
+    parser.add_argument(
+        "--policy-replay-mode",
+        choices=("instant", "communication"),
+        default="instant",
+        help=(
+            "policy-augmented replay mode: instant builds counterfactual graphs directly; "
+            "communication replays V2V sender/receiver queues and delayed messages offline"
+        ),
+    )
     parser.add_argument("--display", dest="display", action="store_true", default=True)
     parser.add_argument("--no-display", dest="display", action="store_false")
+    parser.add_argument(
+        "--single-episode",
+        action="store_true",
+        help="stop at the first terminated/truncated episode instead of resetting to keep collecting steps",
+    )
     known, passthrough = parser.parse_known_args()
     passthrough = [arg for arg in passthrough if arg != "--"]
     return known, passthrough
@@ -214,6 +228,7 @@ def main() -> int:
     import car_dreamer
     from car_dreamer.toolkit.wam import (
         WAMStage1DataRecorder,
+        WAMStage1CommunicationPolicyDataRecorder,
         WAMStage1PolicyDataRecorder,
         STAGE1_POLICY_TYPES,
         wam_stage1_configs_from_env,
@@ -237,21 +252,43 @@ def main() -> int:
         env.reset(seed=_episode_seed(known.seed, 0))
         fixed_dt = _fixed_dt(sim, config)
         if known.policy_augmented:
-            recorder = WAMStage1PolicyDataRecorder(
-                known.out_dir,
-                fixed_dt=fixed_dt,
-                horizon_s=future_horizon_s,
-                samples=int(perc_cfg.traj_samples),
-                history_window=int(stage1_cfg.history_window),
-                manifest={
-                    "task": known.task,
-                    "policy_augmented": True,
-                    "policy_types": list(STAGE1_POLICY_TYPES),
-                    "sample_period_s": float(stage1_cfg.sample_period_s),
-                    "sample_period_steps": max(1, int(round(float(stage1_cfg.sample_period_s) / fixed_dt))),
-                },
-            )
             sample_period_steps = max(1, int(round(float(stage1_cfg.sample_period_s) / fixed_dt)))
+            manifest = {
+                "task": known.task,
+                "policy_augmented": True,
+                "policy_replay_mode": str(known.policy_replay_mode),
+                "policy_types": list(STAGE1_POLICY_TYPES),
+                "sample_period_s": float(stage1_cfg.sample_period_s),
+                "sample_period_steps": int(sample_period_steps),
+            }
+            if str(known.policy_replay_mode) == "communication":
+                recorder = WAMStage1CommunicationPolicyDataRecorder(
+                    known.out_dir,
+                    fixed_dt=fixed_dt,
+                    comm_config=sim._comm_config,
+                    link_rate_bps=sim._link_rate_bps,
+                    graph_builder=sim._build_wam_graph_for_stage1_slot,
+                    coverage_builder=getattr(sim, "_build_wam_coverage_for_stage1_slot", None),
+                    horizon_s=future_horizon_s,
+                    samples=int(perc_cfg.traj_samples),
+                    history_window=int(stage1_cfg.history_window),
+                    manifest=manifest,
+                    bandwidth_ratio=float(known.policy_bandwidth_ratio),
+                    bev_spec=getattr(sim, "_wam_bev_spec"),
+                    bev_payload_mode=str(getattr(sim, "_wam_bev_payload_mode", "feature")),
+                    bev_feature_dim=int(getattr(sim, "_wam_bev_feature_dim", 256)),
+                    bev_feature_dtype_bytes=int(getattr(sim, "_wam_bev_feature_dtype_bytes", 4)),
+                    overhead_bytes=int(getattr(sim, "_comm_overhead_bytes", 64)),
+                )
+            else:
+                recorder = WAMStage1PolicyDataRecorder(
+                    known.out_dir,
+                    fixed_dt=fixed_dt,
+                    horizon_s=future_horizon_s,
+                    samples=int(perc_cfg.traj_samples),
+                    history_window=int(stage1_cfg.history_window),
+                    manifest=manifest,
+                )
         else:
             recorder = WAMStage1DataRecorder(
                 known.out_dir,
@@ -271,7 +308,8 @@ def main() -> int:
             f"(horizon={future_horizon_s:.1f}s/{perc_cfg.traj_samples} samples, "
             f"window={stage1_cfg.history_window + 1}@{stage1_cfg.sample_period_s:.3f}s, "
             f"sample_period_steps={sample_period_steps}, extra_steps={recorder.horizon_steps}, "
-            f"policy_sampler={known.policy_sampler}, policy_augmented={known.policy_augmented})",
+            f"policy_sampler={known.policy_sampler}, policy_augmented={known.policy_augmented}, "
+            f"policy_replay_mode={known.policy_replay_mode})",
             flush=True,
         )
 
@@ -286,7 +324,18 @@ def main() -> int:
             messages, active_policy_id = _comm_snapshot(sim)
             if hasattr(recorder, "observe_messages"):
                 recorder.observe_messages(episode_step, messages, active_policy_id=active_policy_id)
-            if global_step <= last_record_global_step and int(episode_step) % int(sample_period_steps) == 0:
+            is_sample_step = int(episode_step) % int(sample_period_steps) == 0
+            if known.policy_augmented and str(known.policy_replay_mode) == "communication":
+                state_fn = getattr(sim, "_wam_stage1_slot_state", None)
+                if state_fn is not None:
+                    recorder.register_step(
+                        episode_step,
+                        state=state_fn(episode_step),
+                        episode_id=episode_id,
+                        fixed_dt=fixed_dt,
+                        is_sample_step=global_step <= last_record_global_step and is_sample_step,
+                    )
+            elif global_step <= last_record_global_step and is_sample_step:
                 if known.policy_augmented:
                     _register_policy_augmented_slot(
                         sim,
@@ -316,9 +365,12 @@ def main() -> int:
                 print(
                     f"episode={episode_id} ended at global_step={global_step} "
                     f"episode_step={int(getattr(sim, '_time_step', 0))} "
-                    f"terminated={terminated} truncated={truncated}; resetting",
+                    f"terminated={terminated} truncated={truncated}"
+                    f"{'; stopping' if known.single_episode else '; resetting'}",
                     flush=True,
                 )
+                if known.single_episode:
+                    break
                 episode_id += 1
                 if known.policy_augmented:
                     recorder.reset_episode()

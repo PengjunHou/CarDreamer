@@ -66,12 +66,14 @@ from .toolkit import (
 )
 from .toolkit.observer.handlers.utils import is_fov_visible
 from .toolkit.wam import (
+    OBJECT,
     OBJECT_STATE_DIM,
     BevSpec,
     CoverageConfig,
     GraphBuildSpec,
     ObjectState,
     ObservationNodeInput,
+    VEHICLE,
     VehicleNodeInput,
     WAMPolicy,
     build_coverage_raster,
@@ -388,6 +390,7 @@ class V2VCommMixin:
             "route_coverage_quality_mean": 0.0,
             "poor_coverage_risk_mean": 0.0,
         }
+        self._wam_checkpoint_prediction_stats = self._empty_wam_checkpoint_prediction_stats()
         self._wam_policy = WAMPolicy(
             selected_vehicle_ids=(),
             modality_by_vehicle={},
@@ -1239,6 +1242,98 @@ class V2VCommMixin:
             window.append(self._build_wam_graph_for_stage1_slot(state, messages, int(step)))
         return window
 
+    def _empty_wam_checkpoint_prediction_stats(self) -> Dict[str, float]:
+        return {
+            "checkpoint_window_slots": 0.0,
+            "checkpoint_window_has_v2v_graph": 0.0,
+            "checkpoint_window_v2v_slots": 0.0,
+            "checkpoint_window_v2v_slot_rate": 0.0,
+            "checkpoint_final_has_v2v_graph": 0.0,
+            "checkpoint_final_graph_objects": 0.0,
+            "checkpoint_final_ego_visible_objects": 0.0,
+            "checkpoint_final_collab_only_objects": 0.0,
+            "checkpoint_final_collab_object_ratio": 0.0,
+            "checkpoint_window_union_objects": 0.0,
+            "checkpoint_window_union_ego_visible_objects": 0.0,
+            "checkpoint_window_union_collab_only_objects": 0.0,
+            "checkpoint_window_union_collab_object_ratio": 0.0,
+            "checkpoint_prediction_query_objects": 0.0,
+        }
+
+    def _wam_graph_object_visibility_sets(self, graph) -> Dict[str, set]:
+        if graph is None or OBJECT not in graph.node_types:
+            return {"all": set(), "ego_visible": set(), "collab_only": set()}
+        obj = graph[OBJECT]
+        node_id = getattr(obj, "node_id", None)
+        if node_id is None:
+            return {"all": set(), "ego_visible": set(), "collab_only": set()}
+        valid = node_id >= 0
+        node_mask = getattr(obj, "node_mask", None)
+        if node_mask is not None:
+            valid = valid & (node_mask > 0.5)
+        visible = getattr(obj, "visible", torch.zeros_like(node_id, dtype=torch.float32)) > 0.5
+        invisible = getattr(obj, "invisible", torch.zeros_like(node_id, dtype=torch.float32)) > 0.5
+        ids = [int(v) for v in node_id[valid].detach().cpu().tolist()]
+        visible_ids = [int(v) for v in node_id[valid & visible].detach().cpu().tolist()]
+        invisible_ids = [int(v) for v in node_id[valid & invisible].detach().cpu().tolist()]
+        return {
+            "all": set(ids),
+            "ego_visible": set(visible_ids),
+            "collab_only": set(invisible_ids),
+        }
+
+    def _wam_graph_has_v2v_vehicle(self, graph) -> bool:
+        if graph is None or VEHICLE not in graph.node_types:
+            return False
+        veh = graph[VEHICLE]
+        node_id = getattr(veh, "node_id", None)
+        if node_id is None:
+            return False
+        valid = node_id >= 0
+        node_mask = getattr(veh, "node_mask", None)
+        if node_mask is not None:
+            valid = valid & (node_mask > 0.5)
+        return int(valid.sum().item()) > 1
+
+    def _summarize_wam_checkpoint_graph_window(self, window) -> Dict[str, float]:
+        stats = self._empty_wam_checkpoint_prediction_stats()
+        graphs = list(window or ())
+        if not graphs:
+            return stats
+        slot_count = len(graphs)
+        v2v_slots = sum(1 for graph in graphs if self._wam_graph_has_v2v_vehicle(graph))
+        union_ids, union_ego_visible, union_collab_only = set(), set(), set()
+        for graph in graphs:
+            sets = self._wam_graph_object_visibility_sets(graph)
+            union_ids |= sets["all"]
+            union_ego_visible |= sets["ego_visible"]
+            union_collab_only |= sets["collab_only"]
+        final_sets = self._wam_graph_object_visibility_sets(graphs[-1])
+        final_total = len(final_sets["all"])
+        union_total = len(union_ids)
+        stats.update(
+            {
+                "checkpoint_window_slots": float(slot_count),
+                "checkpoint_window_has_v2v_graph": 1.0 if v2v_slots else 0.0,
+                "checkpoint_window_v2v_slots": float(v2v_slots),
+                "checkpoint_window_v2v_slot_rate": float(v2v_slots) / float(slot_count),
+                "checkpoint_final_has_v2v_graph": 1.0 if self._wam_graph_has_v2v_vehicle(graphs[-1]) else 0.0,
+                "checkpoint_final_graph_objects": float(final_total),
+                "checkpoint_final_ego_visible_objects": float(len(final_sets["ego_visible"])),
+                "checkpoint_final_collab_only_objects": float(len(final_sets["collab_only"])),
+                "checkpoint_final_collab_object_ratio": (
+                    float(len(final_sets["collab_only"])) / float(final_total) if final_total else 0.0
+                ),
+                "checkpoint_window_union_objects": float(union_total),
+                "checkpoint_window_union_ego_visible_objects": float(len(union_ego_visible)),
+                "checkpoint_window_union_collab_only_objects": float(len(union_collab_only)),
+                "checkpoint_window_union_collab_object_ratio": (
+                    float(len(union_collab_only)) / float(union_total) if union_total else 0.0
+                ),
+            }
+        )
+        return stats
+
     def _graph_window_ready(self) -> bool:
         step = int(getattr(self, "_time_step", 0))
         return self._checkpoint_graph_window_ready(step)
@@ -1246,14 +1341,18 @@ class V2VCommMixin:
     def _predict_wam_with_checkpoint(self, step: int) -> None:
         self._wam_motion_predictions = {}
         self._wam_coop_request = None
+        self._wam_checkpoint_prediction_stats = self._empty_wam_checkpoint_prediction_stats()
         if not self._checkpoint_graph_window_ready(int(step)):
             return
         model = self._load_wam_predictor()
         device = self._wam_predictor_device_resolved or self._resolve_wam_predictor_device()
-        window = [graph.clone().to(device) for graph in self._build_checkpoint_graph_window(int(step))]
+        raw_window = self._build_checkpoint_graph_window(int(step))
+        self._wam_checkpoint_prediction_stats = self._summarize_wam_checkpoint_graph_window(raw_window)
+        window = [graph.clone().to(device) for graph in raw_window]
         with torch.no_grad():
             out = model(window)
         object_ids = [int(v) for v in out["object_node_ids"].detach().cpu().tolist()]
+        self._wam_checkpoint_prediction_stats["checkpoint_prediction_query_objects"] = float(len(object_ids))
         if not object_ids:
             self._update_wam_uncertainty_breakdown(step, motion_uncertainty=0.0)
             return

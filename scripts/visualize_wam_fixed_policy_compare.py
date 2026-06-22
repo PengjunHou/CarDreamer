@@ -44,28 +44,136 @@ def _write_uncertainty_plot(csv_path: Path, out_png: Path, *, metric: str) -> Op
     return out_png
 
 
-def _write_summary(csv_path: Path, out_csv: Path, *, metric: str) -> Optional[Path]:
+SUMMARY_METRICS = (
+    "motion_uncertainty",
+    "coverage_uncertainty",
+    "total_uncertainty",
+    "route_coverage_quality_mean",
+    "poor_coverage_risk_mean",
+    "uncertainty_max",
+    "uncertainty_mean",
+    "checkpoint_window_slots",
+    "checkpoint_window_has_v2v_graph",
+    "checkpoint_window_v2v_slots",
+    "checkpoint_window_v2v_slot_rate",
+    "checkpoint_final_has_v2v_graph",
+    "checkpoint_final_graph_objects",
+    "checkpoint_final_ego_visible_objects",
+    "checkpoint_final_collab_only_objects",
+    "checkpoint_final_collab_object_ratio",
+    "checkpoint_window_union_objects",
+    "checkpoint_window_union_ego_visible_objects",
+    "checkpoint_window_union_collab_only_objects",
+    "checkpoint_window_union_collab_object_ratio",
+    "checkpoint_prediction_query_objects",
+)
+
+COMPACT_SUMMARY_COLUMNS = (
+    "policy_label",
+    "policy_type",
+    "steps",
+    "mean_selected",
+    "total_uncertainty_mean",
+    "total_uncertainty_delta_vs_ego_only",
+    "motion_uncertainty_mean",
+    "motion_uncertainty_delta_vs_ego_only",
+    "coverage_uncertainty_mean",
+    "coverage_uncertainty_delta_vs_ego_only",
+    "checkpoint_window_has_v2v_graph_mean",
+    "checkpoint_window_v2v_prediction_steps",
+    "checkpoint_window_v2v_slots_mean",
+    "checkpoint_window_v2v_slots_total",
+    "checkpoint_window_v2v_slot_rate_mean",
+    "checkpoint_final_has_v2v_graph_mean",
+    "checkpoint_final_v2v_prediction_steps",
+    "checkpoint_final_ego_visible_objects_mean",
+    "checkpoint_final_collab_only_objects_mean",
+    "checkpoint_final_collab_object_ratio_mean",
+    "checkpoint_window_union_ego_visible_objects_mean",
+    "checkpoint_window_union_collab_only_objects_mean",
+    "checkpoint_window_union_collab_object_ratio_mean",
+    "checkpoint_prediction_query_objects_mean",
+    "mean_graph_objects",
+    "mean_graph_veh_veh",
+)
+
+
+def _compact_summary_path(summary_csv: Path) -> Path:
+    suffix = "_summary"
+    stem = summary_csv.stem
+    compact_stem = f"{stem[:-len(suffix)]}_compact_summary" if stem.endswith(suffix) else f"{stem}_compact"
+    return summary_csv.with_name(f"{compact_stem}{summary_csv.suffix}")
+
+
+def _write_compact_summary(summary, out_csv: Path) -> Optional[Path]:
+    columns = [name for name in COMPACT_SUMMARY_COLUMNS if name in summary.columns]
+    if not columns:
+        return None
+    compact = summary.loc[:, columns].copy()
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    compact.to_csv(out_csv, index=False)
+    return out_csv
+
+
+def _write_summary(csv_path: Path, out_csv: Path, *, metric: str, baseline: str = "ego_only") -> Optional[Path]:
     import pandas as pd
 
     df = pd.read_csv(csv_path)
     if df.empty:
         return None
+    if metric not in df.columns:
+        raise ValueError(f"metric {metric!r} is not in {csv_path}; columns={list(df.columns)}")
+
+    group_cols = ["policy_label", "policy_type"]
+    grouped = df.groupby(group_cols, dropna=False)
     summary = (
-        df.groupby(["policy_label", "policy_type"], dropna=False)
-        .agg(
-            steps=("step", "count"),
-            mean_metric=(metric, "mean"),
-            min_metric=(metric, "min"),
-            max_metric=(metric, "max"),
-            mean_selected=("num_selected", "mean"),
-            mean_graph_veh_veh=("graph_veh_veh", "mean"),
-            mean_graph_objects=("graph_objects", "mean"),
-        )
+        grouped.size()
+        .rename("steps")
         .reset_index()
-        .sort_values("mean_metric")
+        .merge(grouped["num_selected"].mean().rename("mean_selected").reset_index(), on=group_cols, how="left")
+        .merge(grouped["graph_veh_veh"].mean().rename("mean_graph_veh_veh").reset_index(), on=group_cols, how="left")
+        .merge(grouped["graph_objects"].mean().rename("mean_graph_objects").reset_index(), on=group_cols, how="left")
     )
+
+    available = [name for name in SUMMARY_METRICS if name in df.columns]
+    baseline_mask = (df["policy_label"] == baseline) | (df["policy_type"] == baseline)
+    baseline_means = df.loc[baseline_mask, available].mean(numeric_only=True).to_dict()
+    for name in available:
+        agg = (
+            grouped[name]
+            .agg(["mean", "std", "min", "max"])
+            .rename(
+                columns={
+                    "mean": f"{name}_mean",
+                    "std": f"{name}_std",
+                    "min": f"{name}_min",
+                    "max": f"{name}_max",
+                }
+            )
+            .reset_index()
+        )
+        summary = summary.merge(agg, on=group_cols, how="left")
+        if name in baseline_means:
+            summary[f"{name}_delta_vs_{baseline}"] = summary[f"{name}_mean"] - float(baseline_means[name])
+
+    for name, out_name in (
+        ("checkpoint_window_has_v2v_graph", "checkpoint_window_v2v_prediction_steps"),
+        ("checkpoint_final_has_v2v_graph", "checkpoint_final_v2v_prediction_steps"),
+        ("checkpoint_window_v2v_slots", "checkpoint_window_v2v_slots_total"),
+    ):
+        if name in df.columns:
+            summary = summary.merge(grouped[name].sum().rename(out_name).reset_index(), on=group_cols, how="left")
+
+    summary["mean_metric"] = summary[f"{metric}_mean"] if f"{metric}_mean" in summary.columns else grouped[metric].mean().values
+    summary["min_metric"] = summary[f"{metric}_min"] if f"{metric}_min" in summary.columns else grouped[metric].min().values
+    summary["max_metric"] = summary[f"{metric}_max"] if f"{metric}_max" in summary.columns else grouped[metric].max().values
+    for col in summary.columns:
+        if col.endswith("_std"):
+            summary[col] = summary[col].fillna(0.0)
+    summary = summary.sort_values(["mean_metric", "policy_label"], ascending=[True, True])
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     summary.to_csv(out_csv, index=False)
+    _write_compact_summary(summary, _compact_summary_path(out_csv))
     return out_csv
 
 
@@ -92,6 +200,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-png", dest="png", action="store_false")
     parser.add_argument("--fps", type=float, default=2.0)
     parser.add_argument("--dpi", type=int, default=110)
+    parser.add_argument("--baseline", default="ego_only", help="baseline policy label or policy_type for delta columns")
     return parser.parse_args()
 
 
@@ -116,9 +225,13 @@ def main() -> int:
         uncertainty_csv,
         out_dir / f"fixed_policy_{args.metric}_summary.csv",
         metric=args.metric,
+        baseline=args.baseline,
     )
     if summary is not None:
         wrote.append(summary)
+        compact = _compact_summary_path(summary)
+        if compact.exists():
+            wrote.append(compact)
 
     if args.html:
         from car_dreamer.toolkit.wam import load_records_jsonl, write_graph_timeline_html

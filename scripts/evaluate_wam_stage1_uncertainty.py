@@ -41,6 +41,7 @@ def main() -> int:
         WAMPerceptionModel,
         WAMPerceptionConfig,
         WAMStage1Dataset,
+        COMM_REPLAY_METADATA_FIELDS,
         evaluate_stage1_uncertainty_rows,
         wam_stage1_configs_from_env,
     )
@@ -77,6 +78,7 @@ def main() -> int:
         "poor_coverage_risk_mean",
         "ade",
         "fde",
+        *COMM_REPLAY_METADATA_FIELDS,
     ]
     with out_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)

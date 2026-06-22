@@ -181,6 +181,29 @@ def _uncertainty_breakdown(sim, legacy_max: float, legacy_mean: float) -> Dict[s
     }
 
 
+CHECKPOINT_STATS_FIELDS = (
+    "checkpoint_window_slots",
+    "checkpoint_window_has_v2v_graph",
+    "checkpoint_window_v2v_slots",
+    "checkpoint_window_v2v_slot_rate",
+    "checkpoint_final_has_v2v_graph",
+    "checkpoint_final_graph_objects",
+    "checkpoint_final_ego_visible_objects",
+    "checkpoint_final_collab_only_objects",
+    "checkpoint_final_collab_object_ratio",
+    "checkpoint_window_union_objects",
+    "checkpoint_window_union_ego_visible_objects",
+    "checkpoint_window_union_collab_only_objects",
+    "checkpoint_window_union_collab_object_ratio",
+    "checkpoint_prediction_query_objects",
+)
+
+
+def _checkpoint_prediction_stats(sim) -> Dict[str, float]:
+    stats = dict(getattr(sim, "_wam_checkpoint_prediction_stats", {}) or {})
+    return {name: float(stats.get(name, 0.0)) for name in CHECKPOINT_STATS_FIELDS}
+
+
 def _json_list(values: Iterable[int]) -> str:
     return json.dumps([int(v) for v in values], separators=(",", ":"))
 
@@ -290,6 +313,7 @@ def main() -> int:
         "poor_coverage_risk_mean",
         "route_coverage_ratio",
         "num_predictions",
+        *CHECKPOINT_STATS_FIELDS,
         "notable_object_ids",
         "visible_notable_object_ids",
         "invisible_notable_object_ids",
@@ -385,6 +409,7 @@ def main() -> int:
                 predictions = dict(getattr(sim, "_wam_motion_predictions", {}))
                 unc_max, unc_mean = _max_mean_uncertainty(predictions)
                 unc = _uncertainty_breakdown(sim, unc_max, unc_mean)
+                checkpoint_stats = _checkpoint_prediction_stats(sim)
                 modality_by_vehicle = {int(k): list(v) for k, v in policy.modalities_by_vehicle.items()}
                 writer.writerow(
                     {
@@ -404,6 +429,7 @@ def main() -> int:
                         "poor_coverage_risk_mean": float(unc["poor_coverage_risk_mean"]),
                         "route_coverage_ratio": float(unc["route_coverage_ratio"]),
                         "num_predictions": len(predictions),
+                        **checkpoint_stats,
                         "notable_object_ids": _json_list(
                             int(r.object_state.actor_id) for r in notable
                         ),

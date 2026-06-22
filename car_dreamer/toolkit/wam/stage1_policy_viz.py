@@ -9,6 +9,19 @@ from typing import Iterable, List, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
+COMM_METRICS = (
+    "comm_window_slots",
+    "comm_window_v2v_slots",
+    "comm_window_v2v_slot_rate",
+    "comm_window_has_v2v_graph",
+    "comm_final_has_v2v_graph",
+    "comm_final_ego_visible_objects",
+    "comm_final_collab_only_objects",
+    "comm_final_total_objects",
+    "comm_final_collab_object_ratio",
+    "comm_generated_messages",
+    "comm_received_messages_by_prediction_step",
+)
 METRICS = (
     "uncertainty",
     "motion_uncertainty",
@@ -18,6 +31,7 @@ METRICS = (
     "poor_coverage_risk_mean",
     "ade",
     "fde",
+    *COMM_METRICS,
 )
 SUMMARY_METRICS = (
     "motion_uncertainty",
@@ -27,6 +41,7 @@ SUMMARY_METRICS = (
     "poor_coverage_risk_mean",
     "ade",
     "fde",
+    *COMM_METRICS,
 )
 PLOTLY_INSTALL_HINT = (
     "Plotly is required for interactive HTML output. Install it with "
@@ -263,6 +278,9 @@ def build_policy_uncertainty_figure(
         "motion_uncertainty",
         "coverage_uncertainty",
         "total_uncertainty",
+        "comm_window_v2v_slot_rate",
+        "comm_final_collab_only_objects",
+        "comm_received_messages_by_prediction_step",
         "ade",
         "fde",
     ]

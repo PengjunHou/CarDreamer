@@ -238,7 +238,7 @@ env:
     predictor_checkpoint: null # Stage-1 checkpoint path when predictor_mode=checkpoint
     predictor_device: auto     # auto | cpu | cuda
     predictor_uncertainty_source: notable_weighted_trace
-    predictor_history_window: 4
+    predictor_history_window: 10
     policy_sampler_mode: request_all  # request_all | random_duration
     random_policy:
       local_prob: 0.2

@@ -120,7 +120,9 @@ from .stage1 import (
 )
 from .stage1_recorder import WAMStage1DataRecorder, valid_object_ids
 from .stage1_policy import (
+    COMM_REPLAY_METADATA_FIELDS,
     STAGE1_POLICY_TYPES,
+    WAMStage1CommunicationPolicyDataRecorder,
     WAMStage1PolicyDataRecorder,
     bev_payload_bytes,
     build_stage1_policy_graph,
@@ -256,7 +258,9 @@ __all__ = [
     "WAMStage1Config",
     "WAMStage1Dataset",
     "WAMStage1DataRecorder",
+    "WAMStage1CommunicationPolicyDataRecorder",
     "WAMStage1PolicyDataRecorder",
+    "COMM_REPLAY_METADATA_FIELDS",
     "WAMStage1Trainer",
     "STAGE1_POLICY_TYPES",
     "bev_payload_bytes",

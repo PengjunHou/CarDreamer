@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-html", dest="html", action="store_false", help="skip interactive HTML")
     parser.add_argument(
         "--metric",
-        choices=("uncertainty", "motion_uncertainty", "coverage_uncertainty", "total_uncertainty", "ade", "fde"),
+        choices=("uncertainty", "motion_uncertainty", "coverage_uncertainty", "total_uncertainty", "mean_uncertainty", "ade", "fde"),
         default="total_uncertainty",
     )
     parser.add_argument("--baseline", default="ego_only", help="baseline policy label or policy_type")
@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    metric = "uncertainty" if str(args.metric) == "mean_uncertainty" else str(args.metric)
 
     from car_dreamer.toolkit.wam.stage1_policy_viz import (
         write_policy_uncertainty_html,
@@ -58,7 +59,7 @@ def main() -> int:
         out_path = write_policy_uncertainty_html(
             args.csv_path,
             args.out_html,
-            metric=args.metric,
+            metric=metric,
             baseline=args.baseline,
             top_k=args.top_k,
             title=args.title,
