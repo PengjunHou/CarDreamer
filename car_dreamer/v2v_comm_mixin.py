@@ -1477,9 +1477,15 @@ class V2VCommMixin:
             float(ego_tf.location.y),
             float(ego_tf.rotation.yaw),
         )
+        collaborators = tuple(
+            self._wam_vehicle_node_input(actor, is_ego=False, agent_slot=idx + 1, route_xy=())
+            for idx, actor in enumerate(getattr(self, "group_vehs", ()))
+            if actor is not None
+        )
         return {
             "step": int(step),
             "ego": ego,
+            "collaborators": collaborators,
             "ego_pose": ego_pose,
             "live_states": tuple(getattr(self, "_wam_object_states", ())),
             "route_xy": tuple(route_xy),
@@ -1520,6 +1526,34 @@ class V2VCommMixin:
                     float(pose.get("yaw", 0.0)),
                 )
             )
+        raster, _ = build_coverage_raster(
+            ego_pose=ego_pose,
+            route_xy=tuple(state.get("route_xy", ())),
+            past_route_xy=tuple(state.get("past_route_xy", ())),
+            ego_observer=(int(self.ego.id), float(ego_pose[0]), float(ego_pose[1]), float(ego_pose[2])),
+            collaborator_observers=tuple(collaborators),
+            actor_polygons=state.get("actor_polygons", {}),
+            ego_fov=float(self._wam_local_sight_fov),
+            ego_sight_range=float(self._wam_local_sight_range),
+            collaborator_fov=float(self._wam_collaborator_sight_fov),
+            collaborator_sight_range=float(self._wam_collaborator_sight_range),
+            config=getattr(self, "_wam_coverage_config", CoverageConfig()),
+            spec=getattr(self, "_wam_bev_spec", BevSpec()),
+        )
+        return raster
+
+    def _build_wam_coverage_for_stage1_policy(self, state, policy):
+        """Build one Stage-1 coverage raster for a counterfactual fixed policy."""
+        if not bool(getattr(self, "_wam_coverage_enabled", False)):
+            return None
+        ego_pose = tuple(state["ego_pose"])
+        collaborator_by_id = {int(v.actor_id): v for v in state.get("collaborators", ())}
+        collaborators = []
+        for vid in sorted(int(v) for v in getattr(policy, "selected_vehicle_ids", ())):
+            node = collaborator_by_id.get(int(vid))
+            if node is None:
+                continue
+            collaborators.append((int(vid), float(node.x), float(node.y), float(node.yaw)))
         raster, _ = build_coverage_raster(
             ego_pose=ego_pose,
             route_xy=tuple(state.get("route_xy", ())),

@@ -96,10 +96,24 @@ class WAMStage1DataRecorder:
         self._active_policy_by_step: Dict[int, Optional[int]] = {}
         self._pending: Deque[Tuple[int, Dict[str, object]]] = deque()
         self._written = 0
+        self._episode_id = 0
 
     @property
     def written(self) -> int:
         return self._written
+
+    def reset_episode(self, *, episode_id: Optional[int] = None) -> None:
+        """Clear episode-local buffers without resetting the output file counter."""
+        self._window.clear()
+        self._slot_window.clear()
+        self._history.clear()
+        self._messages.clear()
+        self._active_policy_by_step.clear()
+        self._pending.clear()
+        if episode_id is None:
+            self._episode_id += 1
+        else:
+            self._episode_id = int(episode_id)
 
     def observe(self, step: int, snapshots: Mapping[int, object]) -> None:
         positions: Dict[int, Point2D] = {}
@@ -231,6 +245,7 @@ class WAMStage1DataRecorder:
             object_node_ids,
             metadata={
                 "step": int(step),
+                "episode_id": int(self._episode_id),
                 "window_steps": [int(v) for v in payload.get("window_steps", ())],
                 "slot_message_counts": [int(v) for v in slot_message_counts],
                 "slot_selected_vehicle_ids": [[int(v) for v in ids] for ids in slot_selected_vehicle_ids],

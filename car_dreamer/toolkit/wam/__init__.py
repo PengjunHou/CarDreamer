@@ -136,8 +136,10 @@ from .stage1_policy_viz import (
     add_metric_delta,
     load_policy_uncertainty_csv,
     policy_label,
+    summarize_policy_breakdown,
     summarize_policies,
     write_policy_uncertainty_html,
+    write_policy_uncertainty_summary_csv,
 )
 from .graph_timeline_viz import (
     BevOptions,
@@ -271,11 +273,13 @@ __all__ = [
     "policy_label",
     "policy_key",
     "policy_to_dict",
+    "summarize_policy_breakdown",
     "summarize_policies",
     "valid_object_ids",
     "visible_object_ids_by_vehicle",
     "wam_stage1_configs_from_env",
     "write_policy_uncertainty_html",
+    "write_policy_uncertainty_summary_csv",
     # per-step cooperative-graph timeline visualization
     "BevOptions",
     "append_record_jsonl",

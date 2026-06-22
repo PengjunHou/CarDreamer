@@ -28,6 +28,14 @@ def parse_args() -> argparse.Namespace:
         help="output interactive HTML path",
     )
     parser.add_argument(
+        "--out-summary",
+        type=Path,
+        default=None,
+        help="optional output policy-level summary CSV path",
+    )
+    parser.add_argument("--html", action="store_true", default=True, help="write interactive HTML")
+    parser.add_argument("--no-html", dest="html", action="store_false", help="skip interactive HTML")
+    parser.add_argument(
         "--metric",
         choices=("uncertainty", "motion_uncertainty", "coverage_uncertainty", "total_uncertainty", "ade", "fde"),
         default="total_uncertainty",
@@ -41,17 +49,28 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    from car_dreamer.toolkit.wam.stage1_policy_viz import write_policy_uncertainty_html
-
-    out_path = write_policy_uncertainty_html(
-        args.csv_path,
-        args.out_html,
-        metric=args.metric,
-        baseline=args.baseline,
-        top_k=args.top_k,
-        title=args.title,
+    from car_dreamer.toolkit.wam.stage1_policy_viz import (
+        write_policy_uncertainty_html,
+        write_policy_uncertainty_summary_csv,
     )
-    print(f"Wrote interactive policy uncertainty visualization to {out_path}", flush=True)
+
+    if args.html:
+        out_path = write_policy_uncertainty_html(
+            args.csv_path,
+            args.out_html,
+            metric=args.metric,
+            baseline=args.baseline,
+            top_k=args.top_k,
+            title=args.title,
+        )
+        print(f"Wrote interactive policy uncertainty visualization to {out_path}", flush=True)
+    if args.out_summary is not None:
+        summary_path = write_policy_uncertainty_summary_csv(
+            args.csv_path,
+            args.out_summary,
+            baseline=args.baseline,
+        )
+        print(f"Wrote policy uncertainty summary to {summary_path}", flush=True)
     return 0
 
 

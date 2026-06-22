@@ -347,11 +347,13 @@ class WAMStage1PolicyDataRecorder:
         graph,
         ego_pose: EgoPose,
         metadata: Mapping[str, object],
+        coverage=None,
     ) -> None:
         window = self._windows.setdefault(str(key), deque(maxlen=self.history_window + 1))
-        window.append(graph)
+        window.append((graph, None if coverage is None else torch.as_tensor(coverage, dtype=torch.float32)))
         payload = {
-            "window": list(window),
+            "window": [item[0] for item in window],
+            "coverage_history": [item[1] for item in window],
             "object_node_ids": valid_object_ids(graph),
             "ego_pose": tuple(ego_pose),
             "metadata": dict(metadata),
@@ -375,6 +377,9 @@ class WAMStage1PolicyDataRecorder:
             payload["object_node_ids"],
             metadata=payload.get("metadata"),
         )
+        coverage_history = payload.get("coverage_history")
+        if coverage_history and all(item is not None for item in coverage_history):
+            sample["coverage_history"] = torch.stack(list(coverage_history), dim=0)
         path = self.out_dir / f"{self.prefix}_{self._written:06d}.pt"
         torch.save(sample, path)
         self._written += 1

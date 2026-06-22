@@ -9,7 +9,25 @@ from typing import Iterable, List, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
-METRICS = ("uncertainty", "motion_uncertainty", "coverage_uncertainty", "total_uncertainty", "ade", "fde")
+METRICS = (
+    "uncertainty",
+    "motion_uncertainty",
+    "coverage_uncertainty",
+    "total_uncertainty",
+    "route_coverage_quality_mean",
+    "poor_coverage_risk_mean",
+    "ade",
+    "fde",
+)
+SUMMARY_METRICS = (
+    "motion_uncertainty",
+    "coverage_uncertainty",
+    "total_uncertainty",
+    "route_coverage_quality_mean",
+    "poor_coverage_risk_mean",
+    "ade",
+    "fde",
+)
 PLOTLY_INSTALL_HINT = (
     "Plotly is required for interactive HTML output. Install it with "
     "`conda install -n cardreamer_gnn plotly` or update/recreate the environment from environment.yml."
@@ -42,6 +60,8 @@ def policy_label(policy_type: str, selected_vehicle_ids: Sequence[object]) -> st
     """Readable label for per-member policy comparisons."""
     policy_type = str(policy_type)
     selected = [int(v) for v in selected_vehicle_ids]
+    if not policy_type or policy_type.lower() == "nan":
+        return "unknown_policy"
     if policy_type == "ego_only" or not selected:
         return policy_type
     return f"{policy_type}[{_selected_ids_text(selected)}]"
@@ -123,6 +143,68 @@ def summarize_policies(df: pd.DataFrame, *, metric: str) -> pd.DataFrame:
     agg["std_metric"] = agg["std_metric"].fillna(0.0)
     agg["best_step_count"] = agg["policy_label"].map(best_counts).fillna(0).astype(int)
     return agg.sort_values(["mean_metric", "policy_label"], ascending=[True, True]).reset_index(drop=True)
+
+
+def summarize_policy_breakdown(
+    df: pd.DataFrame,
+    *,
+    baseline: str = "ego_only",
+    metrics: Sequence[str] = SUMMARY_METRICS,
+) -> pd.DataFrame:
+    """Summarize motion/coverage/total uncertainty for each policy."""
+    available = [metric for metric in metrics if metric in df.columns]
+    if not available:
+        raise ValueError(f"none of the requested summary metrics are present; columns={list(df.columns)}")
+
+    out = df.copy()
+    for metric in available:
+        out = add_metric_delta(out, metric=metric, baseline=baseline)
+
+    group_cols = ["policy_label", "policy_type", "selected_members", "modality"]
+    grouped = out.groupby(group_cols, dropna=False)
+    summary = grouped.size().rename("rows").reset_index()
+
+    for metric in available:
+        agg = (
+            grouped[metric]
+            .agg(["mean", "std", "min", "max"])
+            .rename(
+                columns={
+                    "mean": f"{metric}_mean",
+                    "std": f"{metric}_std",
+                    "min": f"{metric}_min",
+                    "max": f"{metric}_max",
+                }
+            )
+            .reset_index()
+        )
+        summary = summary.merge(agg, on=group_cols, how="left")
+        delta_col = f"{metric}_delta"
+        if delta_col in out.columns:
+            delta = grouped[delta_col].mean().rename(f"{metric}_delta_vs_{baseline}").reset_index()
+            summary = summary.merge(delta, on=group_cols, how="left")
+
+    for col in summary.columns:
+        if col.endswith("_std"):
+            summary[col] = summary[col].fillna(0.0)
+
+    sort_col = "total_uncertainty_mean" if "total_uncertainty_mean" in summary.columns else f"{available[0]}_mean"
+    return summary.sort_values([sort_col, "policy_label"], ascending=[True, True]).reset_index(drop=True)
+
+
+def write_policy_uncertainty_summary_csv(
+    csv_path: Union[str, Path],
+    out_csv: Union[str, Path],
+    *,
+    baseline: str = "ego_only",
+) -> Path:
+    """Write a policy-level uncertainty breakdown summary CSV."""
+    df = load_policy_uncertainty_csv(csv_path)
+    summary = summarize_policy_breakdown(df, baseline=baseline)
+    out_path = Path(out_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(out_path, index=False)
+    return out_path
 
 
 def select_top_policy_labels(summary: pd.DataFrame, *, baseline: str = "ego_only", top_k: int = 0) -> List[str]:

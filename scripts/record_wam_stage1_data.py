@@ -64,6 +64,17 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
         default="request_all",
         help="communication policy sampler used during recording",
     )
+    parser.add_argument(
+        "--policy-augmented",
+        action="store_true",
+        help="record counterfactual samples for ego/single/all candidate policies with policy metadata",
+    )
+    parser.add_argument(
+        "--policy-bandwidth-ratio",
+        type=float,
+        default=1.0,
+        help="bandwidth ratio written into policy-augmented metadata",
+    )
     parser.add_argument("--display", dest="display", action="store_true", default=True)
     parser.add_argument("--no-display", dest="display", action="store_false")
     known, passthrough = parser.parse_known_args()
@@ -115,6 +126,82 @@ def _register_current_slot(sim, recorder, step: int) -> bool:
     return True
 
 
+def _register_policy_augmented_slot(sim, recorder, step: int, *, episode_id: int, fixed_dt: float, bandwidth_ratio: float) -> int:
+    from car_dreamer.toolkit.wam import (
+        BevSpec,
+        GraphBuildSpec,
+        build_stage1_policy_graph,
+        enumerate_stage1_policies,
+        make_stage1_policy_metadata,
+        policy_key,
+        visible_object_ids_by_vehicle,
+    )
+
+    state_fn = getattr(sim, "_wam_stage1_slot_state", None)
+    if state_fn is None:
+        return 0
+    state = state_fn(step)
+    ego = state["ego"]
+    collaborators = tuple(state.get("collaborators", ()))
+    objects = tuple(state.get("live_states", ()))
+    candidate_ids = [int(v.actor_id) for v in collaborators]
+    policies = enumerate_stage1_policies(
+        candidate_ids,
+        bandwidth_ratio=float(bandwidth_ratio),
+        frequency_steps=int(getattr(sim._comm_config, "sensor_period_steps", 1)),
+    )
+    visible_ids = visible_object_ids_by_vehicle(int(ego.actor_id), candidate_ids, objects)
+    spec = GraphBuildSpec(
+        route_waypoints=int(getattr(sim, "_wam_graph_route_waypoints", 16)),
+        max_object_nodes=int(getattr(sim, "_wam_graph_max_object_nodes", 32)),
+    )
+    bev_spec = getattr(sim, "_wam_bev_spec", BevSpec())
+    coverage_fn = getattr(sim, "_build_wam_coverage_for_stage1_policy", None)
+    count = 0
+    for policy_type, policy in policies:
+        graph = build_stage1_policy_graph(
+            ego=ego,
+            collaborators=collaborators,
+            objects=objects,
+            policy=policy,
+            spec=spec,
+            notable_ids=state.get("notable_ids", ()),
+            latency_by_vehicle={},
+            bev_spec=bev_spec,
+            bev_payload_mode=str(getattr(sim, "_wam_bev_payload_mode", "feature")),
+            bev_feature_dim=int(getattr(sim, "_wam_bev_feature_dim", 256)),
+            bev_feature_dtype_bytes=int(getattr(sim, "_wam_bev_feature_dtype_bytes", 4)),
+            gamma_freshness=float(getattr(sim, "_wam_graph_gamma_freshness", 5.0)),
+            overhead_bytes=int(getattr(sim, "_comm_overhead_bytes", 64)),
+        )
+        metadata = make_stage1_policy_metadata(
+            step=int(step),
+            episode_id=int(episode_id),
+            policy_type=policy_type,
+            policy=policy,
+            candidate_vehicle_ids=candidate_ids,
+            notable_object_ids=state.get("notable_ids", ()),
+            visible_ids_by_vehicle=visible_ids,
+            ego_pose=tuple(state["ego_pose"]),
+            fixed_dt=float(fixed_dt),
+        )
+        coverage = None if coverage_fn is None else coverage_fn(state, policy)
+        recorder.register(
+            int(step),
+            key=policy_key(policy_type, policy),
+            graph=graph,
+            ego_pose=tuple(state["ego_pose"]),
+            metadata=metadata,
+            coverage=coverage,
+        )
+        count += 1
+    return count
+
+
+def _episode_seed(base_seed, episode_id: int):
+    return None if base_seed is None else int(base_seed) + int(episode_id)
+
+
 def main() -> int:
     known, passthrough = parse_args()
     if known.steps <= 0:
@@ -125,7 +212,12 @@ def main() -> int:
     _setup_carla_pythonapi()
 
     import car_dreamer
-    from car_dreamer.toolkit.wam import WAMStage1DataRecorder, wam_stage1_configs_from_env
+    from car_dreamer.toolkit.wam import (
+        WAMStage1DataRecorder,
+        WAMStage1PolicyDataRecorder,
+        STAGE1_POLICY_TYPES,
+        wam_stage1_configs_from_env,
+    )
 
     env_args = [
         f"--env.world.carla_port={known.carla_port}",
@@ -142,47 +234,97 @@ def main() -> int:
     known.out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        env.reset(seed=known.seed)
+        env.reset(seed=_episode_seed(known.seed, 0))
         fixed_dt = _fixed_dt(sim, config)
-        recorder = WAMStage1DataRecorder(
-            known.out_dir,
-            fixed_dt=fixed_dt,
-            horizon_s=future_horizon_s,
-            samples=int(perc_cfg.traj_samples),
-            history_window=int(stage1_cfg.history_window),
-            sample_period_s=float(stage1_cfg.sample_period_s),
-            graph_builder=sim._build_wam_graph_for_stage1_slot,
-            coverage_builder=getattr(sim, "_build_wam_coverage_for_stage1_slot", None),
-            receive_window_steps=int(sim._comm_config.prediction_window_steps),
-            allow_cross_policy_messages=bool(sim._comm_config.allow_cross_policy_messages),
-        )
+        if known.policy_augmented:
+            recorder = WAMStage1PolicyDataRecorder(
+                known.out_dir,
+                fixed_dt=fixed_dt,
+                horizon_s=future_horizon_s,
+                samples=int(perc_cfg.traj_samples),
+                history_window=int(stage1_cfg.history_window),
+                manifest={
+                    "task": known.task,
+                    "policy_augmented": True,
+                    "policy_types": list(STAGE1_POLICY_TYPES),
+                    "sample_period_s": float(stage1_cfg.sample_period_s),
+                    "sample_period_steps": max(1, int(round(float(stage1_cfg.sample_period_s) / fixed_dt))),
+                },
+            )
+            sample_period_steps = max(1, int(round(float(stage1_cfg.sample_period_s) / fixed_dt)))
+        else:
+            recorder = WAMStage1DataRecorder(
+                known.out_dir,
+                fixed_dt=fixed_dt,
+                horizon_s=future_horizon_s,
+                samples=int(perc_cfg.traj_samples),
+                history_window=int(stage1_cfg.history_window),
+                sample_period_s=float(stage1_cfg.sample_period_s),
+                graph_builder=sim._build_wam_graph_for_stage1_slot,
+                coverage_builder=getattr(sim, "_build_wam_coverage_for_stage1_slot", None),
+                receive_window_steps=int(sim._comm_config.prediction_window_steps),
+                allow_cross_policy_messages=bool(sim._comm_config.allow_cross_policy_messages),
+            )
+            sample_period_steps = int(recorder.sample_period_steps)
         print(
             f"Recording {known.steps} steps to {known.out_dir} "
             f"(horizon={future_horizon_s:.1f}s/{perc_cfg.traj_samples} samples, "
             f"window={stage1_cfg.history_window + 1}@{stage1_cfg.sample_period_s:.3f}s, "
-            f"sample_period_steps={recorder.sample_period_steps}, extra_steps={recorder.horizon_steps}, "
-            f"policy_sampler={known.policy_sampler})",
+            f"sample_period_steps={sample_period_steps}, extra_steps={recorder.horizon_steps}, "
+            f"policy_sampler={known.policy_sampler}, policy_augmented={known.policy_augmented})",
             flush=True,
         )
 
-        last_record_step = int(known.steps) - 1
-        last_observe_step = last_record_step + int(recorder.horizon_steps)
+        last_record_global_step = int(known.steps) - 1
+        last_observe_global_step = last_record_global_step + int(recorder.horizon_steps)
+        episode_id = 0
+        global_step = 0
 
-        while int(getattr(sim, "_time_step", 0)) <= last_observe_step:
-            current_step = int(getattr(sim, "_time_step", 0))
-            recorder.observe(current_step, _actor_snapshots(sim))
+        while global_step <= last_observe_global_step:
+            episode_step = int(getattr(sim, "_time_step", 0))
+            recorder.observe(episode_step, _actor_snapshots(sim))
             messages, active_policy_id = _comm_snapshot(sim)
-            recorder.observe_messages(current_step, messages, active_policy_id=active_policy_id)
-            if current_step <= last_record_step and recorder.should_register_step(current_step):
-                _register_current_slot(sim, recorder, current_step)
-            recorder.flush_ready(current_step)
+            if hasattr(recorder, "observe_messages"):
+                recorder.observe_messages(episode_step, messages, active_policy_id=active_policy_id)
+            if global_step <= last_record_global_step and int(episode_step) % int(sample_period_steps) == 0:
+                if known.policy_augmented:
+                    _register_policy_augmented_slot(
+                        sim,
+                        recorder,
+                        episode_step,
+                        episode_id=episode_id,
+                        fixed_dt=fixed_dt,
+                        bandwidth_ratio=float(known.policy_bandwidth_ratio),
+                    )
+                else:
+                    _register_current_slot(sim, recorder, episode_step)
+            recorder.flush_ready(episode_step)
 
-            if current_step % known.print_every == 0:
-                print(f"step={current_step} written={recorder.written}", flush=True)
+            if global_step % known.print_every == 0:
+                print(
+                    f"global_step={global_step} episode={episode_id} "
+                    f"episode_step={episode_step} written={recorder.written}",
+                    flush=True,
+                )
+
+            if global_step >= last_observe_global_step:
+                break
 
             _, _, terminated, truncated, _ = env.step(env.action_space.sample())
+            global_step += 1
             if terminated or truncated:
-                env.reset(seed=known.seed)
+                print(
+                    f"episode={episode_id} ended at global_step={global_step} "
+                    f"episode_step={int(getattr(sim, '_time_step', 0))} "
+                    f"terminated={terminated} truncated={truncated}; resetting",
+                    flush=True,
+                )
+                episode_id += 1
+                if known.policy_augmented:
+                    recorder.reset_episode()
+                else:
+                    recorder.reset_episode(episode_id=episode_id)
+                env.reset(seed=_episode_seed(known.seed, episode_id))
 
         recorder.flush_all()
         print(f"Done. wrote {recorder.written} samples to {known.out_dir}", flush=True)

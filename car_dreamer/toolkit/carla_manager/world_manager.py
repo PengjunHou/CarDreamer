@@ -38,9 +38,14 @@ class WorldManager:
         self._config = env_config.world
         self._env_config = env_config
 
-        WORLD_LOGGER.info("Connecting to Carla server at port=%s", self._config.carla_port)
+        client_timeout_s = float(getattr(self._config, "client_timeout_s", 20.0))
+        WORLD_LOGGER.info(
+            "Connecting to Carla server at port=%s timeout=%.1fs",
+            self._config.carla_port,
+            client_timeout_s,
+        )
         self._client = carla.Client("127.0.0.1", self._config.carla_port)
-        self._client.set_timeout(20.0)
+        self._client.set_timeout(client_timeout_s)
         self._world = self._client.load_world(self._config.town)
         self._map = self._world.get_map()
         WORLD_LOGGER.info("Loaded CARLA map town=%s", self._config.town)

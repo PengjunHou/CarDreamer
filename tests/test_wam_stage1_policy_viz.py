@@ -10,8 +10,10 @@ from car_dreamer.toolkit.wam import (
     add_metric_delta,
     load_policy_uncertainty_csv,
     policy_label,
+    summarize_policy_breakdown,
     summarize_policies,
     write_policy_uncertainty_html,
+    write_policy_uncertainty_summary_csv,
 )
 
 
@@ -23,6 +25,11 @@ FIELDS = [
     "modality_by_vehicle",
     "notable_object_ids",
     "uncertainty",
+    "motion_uncertainty",
+    "coverage_uncertainty",
+    "total_uncertainty",
+    "route_coverage_quality_mean",
+    "poor_coverage_risk_mean",
     "ade",
     "fde",
 ]
@@ -30,19 +37,34 @@ FIELDS = [
 
 def _write_synthetic_csv(path: Path) -> None:
     rows = [
-        (0, 0, "ego_only", [], {}, [100], 1.0, 5.0, 6.0),
-        (0, 0, "single_candidate_objlist", [444], {444: "objlist"}, [100], 0.8, 4.0, 5.0),
-        (0, 0, "single_candidate_bev", [447], {447: "bev"}, [100], 1.2, 6.0, 7.0),
-        (0, 0, "all_candidates_bev", [444, 447], {444: "bev", 447: "bev"}, [100], 0.7, 3.0, 4.0),
-        (1, 0, "ego_only", [], {}, [100], 1.1, 5.5, 6.5),
-        (1, 0, "single_candidate_objlist", [444], {444: "objlist"}, [100], 0.9, 4.5, 5.5),
-        (1, 0, "single_candidate_bev", [447], {447: "bev"}, [100], 1.3, 6.5, 7.5),
-        (1, 0, "all_candidates_bev", [444, 447], {444: "bev", 447: "bev"}, [100], 0.6, 3.5, 4.5),
+        (0, 0, "ego_only", [], {}, [100], 1.0, 0.8, 0.2, 1.0, 0.8, 0.2, 5.0, 6.0),
+        (0, 0, "single_candidate_objlist", [444], {444: "objlist"}, [100], 0.8, 0.7, 0.1, 0.8, 0.9, 0.1, 4.0, 5.0),
+        (0, 0, "single_candidate_bev", [447], {447: "bev"}, [100], 1.2, 0.7, 0.5, 1.2, 0.5, 0.5, 6.0, 7.0),
+        (0, 0, "all_candidates_bev", [444, 447], {444: "bev", 447: "bev"}, [100], 0.7, 0.6, 0.1, 0.7, 0.9, 0.1, 3.0, 4.0),
+        (1, 0, "ego_only", [], {}, [100], 1.1, 0.8, 0.3, 1.1, 0.7, 0.3, 5.5, 6.5),
+        (1, 0, "single_candidate_objlist", [444], {444: "objlist"}, [100], 0.9, 0.7, 0.2, 0.9, 0.8, 0.2, 4.5, 5.5),
+        (1, 0, "single_candidate_bev", [447], {447: "bev"}, [100], 1.3, 0.7, 0.6, 1.3, 0.4, 0.6, 6.5, 7.5),
+        (1, 0, "all_candidates_bev", [444, 447], {444: "bev", 447: "bev"}, [100], 0.6, 0.5, 0.1, 0.6, 0.9, 0.1, 3.5, 4.5),
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
         writer.writeheader()
-        for step, episode, policy_type, selected, modality, notable, unc, ade, fde in rows:
+        for (
+            step,
+            episode,
+            policy_type,
+            selected,
+            modality,
+            notable,
+            unc,
+            motion_unc,
+            coverage_unc,
+            total_unc,
+            coverage_quality,
+            poor_coverage,
+            ade,
+            fde,
+        ) in rows:
             writer.writerow(
                 {
                     "step": step,
@@ -52,6 +74,11 @@ def _write_synthetic_csv(path: Path) -> None:
                     "modality_by_vehicle": json.dumps({str(k): v for k, v in modality.items()}),
                     "notable_object_ids": json.dumps(notable),
                     "uncertainty": unc,
+                    "motion_uncertainty": motion_unc,
+                    "coverage_uncertainty": coverage_unc,
+                    "total_uncertainty": total_unc,
+                    "route_coverage_quality_mean": coverage_quality,
+                    "poor_coverage_risk_mean": poor_coverage,
                     "ade": ade,
                     "fde": fde,
                 }
@@ -100,6 +127,29 @@ class Stage1PolicyVizTest(unittest.TestCase):
         self.assertEqual(best["policy_label"], "all_candidates_bev[444,447]")
         self.assertTrue(np.isfinite(float(best["mean_metric"])))
         self.assertEqual(int(best["best_step_count"]), 2)
+
+    def test_writes_policy_breakdown_summary_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "uncertainty_by_policy.csv"
+            out_csv = Path(tmp) / "policy_summary.csv"
+            _write_synthetic_csv(csv_path)
+            df = load_policy_uncertainty_csv(csv_path)
+            summary = summarize_policy_breakdown(df, baseline="ego_only")
+            write_policy_uncertainty_summary_csv(csv_path, out_csv, baseline="ego_only")
+
+            self.assertTrue(out_csv.exists())
+            required = {
+                "policy_label",
+                "motion_uncertainty_mean",
+                "coverage_uncertainty_mean",
+                "total_uncertainty_mean",
+                "total_uncertainty_delta_vs_ego_only",
+                "rows",
+            }
+            self.assertTrue(required.issubset(set(summary.columns)))
+            best = summary.iloc[0]
+            self.assertEqual(best["policy_label"], "all_candidates_bev[444,447]")
+            self.assertAlmostEqual(float(best["total_uncertainty_mean"]), 0.65, places=5)
 
     def test_writes_interactive_html(self):
         try:

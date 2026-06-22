@@ -3,6 +3,7 @@ env:
 
   world:
     carla_port: 2000
+    client_timeout_s: 20.0
     town: "Town04" # which town map to use
     actor_active_distance: 100
     fixed_delta_seconds: 0.1
