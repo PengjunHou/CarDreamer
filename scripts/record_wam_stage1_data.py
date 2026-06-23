@@ -193,6 +193,8 @@ def _register_policy_augmented_slot(sim, recorder, step: int, *, episode_id: int
             ego_pose=tuple(state["ego_pose"]),
             metadata=metadata,
             coverage=coverage,
+            live_states=objects,  # t-time ObjectStates (ground-truth visibility) for the perception labels
+            notable_ids=state.get("notable_ids", ()),
         )
         count += 1
     return count

@@ -66,6 +66,46 @@ def union_object_ids(graphs: Sequence[object]) -> List[int]:
     return sorted(ids)
 
 
+def perception_labels_at_t(
+    object_node_ids: Sequence[int],
+    live_states: Sequence[object],
+    notable_ids: Sequence[int],
+) -> Optional[Dict[str, torch.Tensor]]:
+    """t-time GT perception labels for ``object_node_ids`` (row order = ``object_node_ids``).
+
+    ``live_states`` are the prediction-step (t) :class:`ObjectState`s with ground-truth visibility;
+    ``notable_ids`` the notable set at t. Mirrors
+    :func:`car_dreamer.toolkit.wam.runtime.select_notable_objects`: ``visible = visible_to_ego``,
+    ``invisible = (not visible) and visible_to_collaborators``, ``notable = id in notable_ids``.
+    Objects absent at t (e.g. already left the scene) get all-zero labels; their GT future is masked.
+    Returns ``None`` when no ``live_states`` are available -> the trainer falls back to node labels.
+    """
+    if not live_states:
+        return None
+    live = {int(s.actor_id): s for s in live_states}
+    notable = {int(i) for i in (notable_ids or ())}
+    notable_t: List[float] = []
+    visible_t: List[float] = []
+    invisible_t: List[float] = []
+    for oid in object_node_ids:
+        state = live.get(int(oid))
+        if state is None:
+            notable_t.append(0.0)
+            visible_t.append(0.0)
+            invisible_t.append(0.0)
+            continue
+        visible = bool(state.visible_to_ego)
+        invisible = (not visible) and bool(state.visible_to_collaborators)
+        notable_t.append(1.0 if int(oid) in notable else 0.0)
+        visible_t.append(1.0 if visible else 0.0)
+        invisible_t.append(1.0 if invisible else 0.0)
+    return {
+        "notable": torch.tensor(notable_t, dtype=torch.float32),
+        "visible": torch.tensor(visible_t, dtype=torch.float32),
+        "invisible": torch.tensor(invisible_t, dtype=torch.float32),
+    }
+
+
 class WAMStage1DataRecorder:
     """Buffer per-step graph windows + GT futures and emit ``.pt`` Stage-1 window samples."""
 
@@ -240,38 +280,15 @@ class WAMStage1DataRecorder:
         object_node_ids: Sequence[int],
         last_state: Optional[Mapping[str, object]],
     ) -> Optional[Dict[str, torch.Tensor]]:
-        """t-time GT perception labels for ``object_node_ids`` (row order = ``object_node_ids``).
-
-        Built from the prediction-step (last) slot state's ``live_states`` + ``notable_ids`` so the
-        labels reflect each object's status *at t* (not at the earlier frame it happened to appear in).
-        Mirrors :func:`car_dreamer.toolkit.wam.runtime.select_notable_objects` visibility logic. Objects
-        absent at t (e.g. already left the scene) get all-zero labels; their GT future is masked anyway.
-        Returns ``None`` when no slot state is available (pre-built-graph path) -> trainer falls back.
-        """
+        """t-time GT perception labels from the prediction-step (last) slot state -> see
+        :func:`perception_labels_at_t`. ``None`` when no slot state (pre-built-graph path)."""
         if last_state is None:
             return None
-        live = {int(s.actor_id): s for s in last_state.get("live_states", ())}
-        notable = {int(i) for i in last_state.get("notable_ids", ())}
-        notable_t: List[float] = []
-        visible_t: List[float] = []
-        invisible_t: List[float] = []
-        for oid in object_node_ids:
-            state = live.get(int(oid))
-            if state is None:
-                notable_t.append(0.0)
-                visible_t.append(0.0)
-                invisible_t.append(0.0)
-                continue
-            visible = bool(state.visible_to_ego)
-            invisible = (not visible) and bool(state.visible_to_collaborators)
-            notable_t.append(1.0 if int(oid) in notable else 0.0)
-            visible_t.append(1.0 if visible else 0.0)
-            invisible_t.append(1.0 if invisible else 0.0)
-        return {
-            "notable": torch.tensor(notable_t, dtype=torch.float32),
-            "visible": torch.tensor(visible_t, dtype=torch.float32),
-            "invisible": torch.tensor(invisible_t, dtype=torch.float32),
-        }
+        return perception_labels_at_t(
+            object_node_ids,
+            last_state.get("live_states", ()),
+            last_state.get("notable_ids", ()),
+        )
 
     def _emit(self, step: int, payload: Dict[str, object]) -> Path:
         last_state: Optional[Mapping[str, object]] = None
