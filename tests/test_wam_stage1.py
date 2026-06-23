@@ -242,6 +242,60 @@ class RecorderTest(unittest.TestCase):
             self.assertEqual(sample["metadata"]["slot_message_counts"], [2, 0, 0, 0, 0])
             self.assertEqual(sample["metadata"]["slot_selected_vehicle_ids"], [[2, 4], [], [], [], []])
 
+    def test_union_object_set_and_t_time_perception_labels(self):
+        # Last slot (prediction step t) is ego-only with object 100; collaborator-only object 101 only
+        # appears in the earlier (already-received) slots. The recorded target/label set must be the
+        # union {100, 101}, and labels must reflect each object's status *at t* (101 -> invisible).
+        def graph_builder(state, messages, prediction_step):
+            del messages, prediction_step
+            return graph_with_objects(list(state["objs"]))
+
+        def last_live_states():
+            return (
+                ObjectState(actor_id=100, actor_type="vehicle.x", object_class="vehicle", x=2.0, y=1.0,
+                            z=0.0, vx=0.5, vy=0.0, yaw=0.0, length=4.0, width=2.0, height=1.5,
+                            visible_to_ego=True),
+                ObjectState(actor_id=101, actor_type="vehicle.x", object_class="vehicle", x=5.0, y=2.0,
+                            z=0.0, vx=0.0, vy=0.0, yaw=0.0, length=4.0, width=2.0, height=1.5,
+                            visible_to_ego=False, visible_to_collaborators=(2,)),
+            )
+
+        objs_by_step = {
+            0: [(100, 2.0, 1.0), (101, 5.0, 2.0)],   # cooperative (received) frame
+            1: [(100, 2.0, 1.0), (101, 5.0, 2.0)],
+            2: [(100, 2.0, 1.0)],                     # ego-only last frame
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = WAMStage1DataRecorder(
+                tmp, fixed_dt=0.1, horizon_s=0.2, samples=1, history_window=2,
+                sample_period_s=0.1, graph_builder=graph_builder, receive_window_steps=20,
+            )
+            for step in (0, 1, 2):
+                rec.observe(step, {100: (2.0, 1.0), 101: (5.0, 2.0)})
+                rec.register_slot(step, state={
+                    "step": step,
+                    "ego_pose": (0.0, 0.0, 0.0),
+                    "objs": objs_by_step[step],
+                    "live_states": last_live_states(),
+                    "notable_ids": (101,),  # the invisible collaborator object is the notable one at t
+                })
+            rec.observe(4, {100: (2.0, 1.0), 101: (5.0, 2.0)})
+            rec.flush_all()
+            sample = torch.load(sorted(Path(tmp).glob("*.pt"))[-1], weights_only=False)
+
+            self.assertEqual(sample["object_node_ids"], [100, 101])  # union, sorted
+            self.assertIn("perception_labels", sample)
+            labels = sample["perception_labels"]
+            row = {oid: i for i, oid in enumerate(sample["object_node_ids"])}
+            # object 101 (collaborator-only, absent from last frame) is still supervised at t:
+            self.assertEqual(float(labels["invisible"][row[101]]), 1.0)
+            self.assertEqual(float(labels["visible"][row[101]]), 0.0)
+            self.assertEqual(float(labels["notable"][row[101]]), 1.0)
+            # object 100 is ego-visible and not notable at t:
+            self.assertEqual(float(labels["visible"][row[100]]), 1.0)
+            self.assertEqual(float(labels["invisible"][row[100]]), 0.0)
+            self.assertEqual(float(labels["notable"][row[100]]), 0.0)
+
     def test_slot_recorder_writes_coverage_history_when_builder_is_present(self):
         def graph_builder(state, messages, prediction_step):
             del messages, prediction_step
@@ -423,6 +477,42 @@ class DatasetTrainerTest(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(losses["total"])))
         self.assertIn("perception", losses)
         self.assertIn("traj", losses)
+
+    def test_trainer_uses_recorded_t_time_labels(self):
+        # A sample whose recorded perception_labels disagree with the graph-node labels: the trainer
+        # must supervise against the recorded (t-time) labels, aligned by node_id, not the node labels.
+        cfg = perc_config()
+        sample = synthetic_sample(cfg, objs=[(100, 8.0, 1.0), (101, 5.0, 2.0)])
+        ids = sample["object_node_ids"]
+        # force notable=1 for *both* objects via the recorded labels (graph marks only the first notable)
+        sample["perception_labels"] = {
+            "notable": torch.ones(len(ids)),
+            "visible": torch.ones(len(ids)),
+            "invisible": torch.zeros(len(ids)),
+        }
+        model, _ = self._model_and_cfg()
+        trainer = WAMStage1Trainer(model, WAMStage1Config(ckpt_dir=tempfile.mkdtemp(), log_interval=0,
+                                                          ckpt_interval=0))
+        model.eval()
+        with torch.no_grad():
+            out = model([g for g in sample["window"]])
+        gt = trainer._gt_labels(out, sample)
+        aligned_ids = [int(v) for v in out["object_node_ids"].tolist()]
+        for i, oid in enumerate(aligned_ids):
+            self.assertEqual(float(gt["notable"][i]), 1.0)  # recorded label wins for every object
+        losses = trainer.loss_on_batch(collate_stage1_samples([sample]))
+        self.assertTrue(bool(torch.isfinite(losses["total"])))
+
+    def test_trainer_falls_back_to_node_labels_without_recorded_labels(self):
+        # Back-compat: an older sample with no perception_labels still trains via the graph-node labels.
+        cfg = perc_config()
+        sample = synthetic_sample(cfg)
+        self.assertNotIn("perception_labels", sample)
+        model, _ = self._model_and_cfg()
+        trainer = WAMStage1Trainer(model, WAMStage1Config(ckpt_dir=tempfile.mkdtemp(), log_interval=0,
+                                                          ckpt_interval=0))
+        losses = trainer.loss_on_batch(collate_stage1_samples([sample]))
+        self.assertTrue(bool(torch.isfinite(losses["total"])))
 
     def test_overfit_decreases_loss(self):
         torch.manual_seed(0)

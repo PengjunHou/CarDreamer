@@ -184,19 +184,27 @@ class WAMPerceptionModel(nn.Module):
 
         obj_embeddings: List[torch.Tensor] = []
         obj_ids: List[torch.Tensor] = []
+        valid_ids_per_frame: List[torch.Tensor] = []
         for graph in graphs:
             h = self.graph_net(graph)
             obj_embeddings.append(h[OBJECT])
-            obj_ids.append(graph[OBJECT].node_id.to(device))
+            ids = graph[OBJECT].node_id.to(device)
+            obj_ids.append(ids)
+            if hasattr(graph[OBJECT], "node_mask"):
+                frame_mask = graph[OBJECT].node_mask.to(device) > 0.5
+            else:
+                frame_mask = torch.ones_like(ids, dtype=torch.bool)
+            valid_ids_per_frame.append(ids[frame_mask & (ids >= 0)])
 
-        current = graphs[-1]
-        cur_ids = current[OBJECT].node_id.to(device)
-        if hasattr(current[OBJECT], "node_mask"):
-            cur_mask = current[OBJECT].node_mask.to(device) > 0.5
+        # Query set = union of valid object ids across the *whole* window (not just the last frame).
+        # Due to V2V latency the last frame is ego-only, so collaborator-only (invisible) objects only
+        # appear in earlier frames; align_object_history + the GRU still produce a prediction for them
+        # via their history (presence is 0 at absent frames). torch.unique returns sorted-ascending ids,
+        # matching ``stage1_recorder.union_object_ids`` so recorded targets/labels align by node_id.
+        if valid_ids_per_frame and any(int(t.numel()) for t in valid_ids_per_frame):
+            query_ids = torch.unique(torch.cat(valid_ids_per_frame))
         else:
-            cur_mask = torch.ones_like(cur_ids, dtype=torch.bool)
-        valid = cur_mask & (cur_ids >= 0)
-        query_ids = cur_ids[valid]
+            query_ids = torch.empty(0, dtype=torch.long, device=device)
 
         seq, presence = align_object_history(obj_embeddings, obj_ids, query_ids)
         z = self.temporal(seq, presence)
@@ -204,15 +212,33 @@ class WAMPerceptionModel(nn.Module):
         perception_logits = self.notable_head(z)
         traj_mu, traj_log_var = self.trajectory_head(z)
 
+        # Best-effort labels aligned to ``query_ids`` (newest frame containing the object wins).
+        # These are for live inference / debugging only; Stage-1 training overrides them with the
+        # t-time ground-truth labels recorded in the sample (see stage1.WAMStage1Trainer).
+        query_list = [int(v) for v in query_ids.tolist()]
         labels = {}
         for key in ("notable", "visible", "invisible"):
-            if hasattr(current[OBJECT], key):
-                labels[key] = getattr(current[OBJECT], key).to(device)[valid]
+            if not any(hasattr(g[OBJECT], key) for g in graphs):
+                continue
+            id_to_val: Dict[int, torch.Tensor] = {}
+            for graph in graphs:  # oldest -> newest, so the newest occurrence overwrites
+                if not hasattr(graph[OBJECT], key):
+                    continue
+                gids = [int(v) for v in graph[OBJECT].node_id.tolist()]
+                gval = getattr(graph[OBJECT], key).to(device)
+                for idx, vid in enumerate(gids):
+                    if vid >= 0:
+                        id_to_val[vid] = gval[idx]
+            vals = torch.zeros(len(query_list), device=device)
+            for i, qid in enumerate(query_list):
+                if qid in id_to_val:
+                    vals[i] = id_to_val[qid]
+            labels[key] = vals
 
         out: Dict[str, object] = {
             "z_object": z,
             "object_node_ids": query_ids,
-            "object_mask": valid,
+            "object_mask": torch.ones_like(query_ids, dtype=torch.bool),
             "traj_mu": traj_mu,
             "traj_log_var": traj_log_var,
             "labels": labels,

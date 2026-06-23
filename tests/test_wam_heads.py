@@ -95,6 +95,30 @@ class WAMPerceptionModelTest(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(out["traj_mu"]).all()))
         self.assertEqual(set(out["labels"].keys()), {"notable", "visible", "invisible"})
 
+    def test_query_set_is_union_over_window_not_last_frame(self):
+        # Simulate V2V latency: collaborator-only objects 101/102 appear only in earlier frames,
+        # while the last frame is "ego-only" with just object 100. The query/prediction set must be
+        # the union over the window so 101/102 are still predicted (not dropped with the last frame).
+        model = make_model(traj_samples=4)
+        window = [
+            graph_with_objects([(100, 8.0, 1.0), (101, 5.0, 2.0), (102, 3.0, 0.5)]),  # t-2: cooperative
+            graph_with_objects([(100, 8.5, 1.0), (101, 5.5, 2.0)]),                    # t-1: partial
+            graph_with_objects([(100, 9.0, 1.0)]),                                     # t:   ego-only
+        ]
+        with torch.no_grad():
+            out = model(window)
+        self.assertEqual([int(v) for v in out["object_node_ids"].tolist()], [100, 101, 102])
+        self.assertEqual(out["traj_mu"].shape, (3, 4, 2))
+        self.assertTrue(bool(torch.isfinite(out["traj_mu"]).all()))
+        # presence: object 102 only seen in the oldest frame, absent at t-1 and t.
+        seq, presence = align_object_history(
+            [model.graph_net(g)["object"] for g in window],
+            [g["object"].node_id for g in window],
+            out["object_node_ids"],
+        )
+        row_102 = [int(v) for v in out["object_node_ids"].tolist()].index(102)
+        self.assertTrue(torch.equal(presence[row_102], torch.tensor([1.0, 0.0, 0.0])))
+
     def test_single_graph_window(self):
         model = make_model()
         with torch.no_grad():
