@@ -118,7 +118,7 @@ from .stage1 import (
     make_stage1_sample,
     wam_stage1_configs_from_env,
 )
-from .stage1_recorder import WAMStage1DataRecorder, valid_object_ids
+from .stage1_recorder import WAMStage1DataRecorder, perception_labels_at_t, union_object_ids, valid_object_ids
 from .stage1_policy import (
     COMM_REPLAY_METADATA_FIELDS,
     STAGE1_POLICY_TYPES,
@@ -279,6 +279,8 @@ __all__ = [
     "policy_to_dict",
     "summarize_policy_breakdown",
     "summarize_policies",
+    "perception_labels_at_t",
+    "union_object_ids",
     "valid_object_ids",
     "visible_object_ids_by_vehicle",
     "wam_stage1_configs_from_env",

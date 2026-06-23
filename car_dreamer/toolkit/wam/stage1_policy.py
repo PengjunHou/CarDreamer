@@ -32,8 +32,8 @@ from .graph import (
 )
 from .heads import policy_uncertainty, trajectory_ade_fde
 from .runtime import ObjectState, WAMPolicy
-from .stage1 import _align_target, make_stage1_sample
-from .stage1_recorder import _to_xy, valid_object_ids
+from .stage1 import _align_labels, _align_target, make_stage1_sample
+from .stage1_recorder import _to_xy, perception_labels_at_t, union_object_ids, valid_object_ids
 from .targets import build_trajectory_targets
 
 EgoPose = Tuple[float, float, float]
@@ -367,13 +367,21 @@ class WAMStage1PolicyDataRecorder:
         ego_pose: EgoPose,
         metadata: Mapping[str, object],
         coverage=None,
+        live_states: Optional[Sequence[object]] = None,
+        notable_ids: Sequence[int] = (),
     ) -> None:
         window = self._windows.setdefault(str(key), deque(maxlen=self.history_window + 1))
         window.append((graph, None if coverage is None else torch.as_tensor(coverage, dtype=torch.float32)))
+        window_graphs = [item[0] for item in window]
+        # Predict/supervise the union over this policy's window (matches WAMPerceptionModel.forward), and
+        # attach t-time GT labels when the caller provides the prediction-step live states (else None ->
+        # the trainer falls back to per-graph node labels).
+        object_node_ids = union_object_ids(window_graphs)
         payload = {
-            "window": [item[0] for item in window],
+            "window": window_graphs,
             "coverage_history": [item[1] for item in window],
-            "object_node_ids": valid_object_ids(graph),
+            "object_node_ids": object_node_ids,
+            "perception_labels": perception_labels_at_t(object_node_ids, live_states, notable_ids),
             "ego_pose": tuple(ego_pose),
             "metadata": dict(metadata),
         }
@@ -394,6 +402,7 @@ class WAMStage1PolicyDataRecorder:
             torch.from_numpy(target_xy),
             torch.from_numpy(valid),
             payload["object_node_ids"],
+            perception_labels=payload.get("perception_labels"),
             metadata=payload.get("metadata"),
         )
         coverage_history = payload.get("coverage_history")
@@ -1001,7 +1010,11 @@ def evaluate_stage1_uncertainty_rows(
                 sample["valid"].to(device),
             )
             uncertainty = float(policy_uncertainty(out["notable_prob"], out["traj_log_var"], valid_mask=val))
-            notable = out["labels"].get("notable")
+            rec_labels = sample.get("perception_labels")
+            if rec_labels is not None:
+                notable = _align_labels(out["object_node_ids"], sample["object_node_ids"], rec_labels, device).get("notable")
+            else:
+                notable = out["labels"].get("notable")
             ade_fde = trajectory_ade_fde(out["traj_mu"], tgt, valid_mask=val, notable_weight=notable)
         coverage = {"coverage_uncertainty": 0.0, "route_coverage_quality_mean": 0.0, "poor_coverage_risk_mean": 0.0}
         if "coverage_history" in sample:

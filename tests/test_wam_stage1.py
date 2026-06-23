@@ -37,6 +37,7 @@ from car_dreamer.toolkit.wam import (
     perception_metrics,
     policy_key,
     trajectory_ade_fde,
+    union_object_ids,
     valid_object_ids,
     visible_object_ids_by_vehicle,
 )
@@ -427,6 +428,59 @@ class PolicyAugmentedStage1Test(unittest.TestCase):
             self.assertEqual(len(files), 1)
             sample = torch.load(files[0], weights_only=False)
             self.assertEqual(sample["metadata"]["policy_type"], "single_candidate_objlist")
+
+    def test_policy_recorder_union_object_set_and_t_time_labels(self):
+        # Policy-augmented recording must also predict/supervise the window union and carry t-time GT
+        # labels: collaborator-only object 101 (ego can't see it) must appear and be labelled invisible.
+        cfg = perc_config()
+        ego, collaborators, objects = policy_scene_inputs()
+        policy = WAMPolicy((2, 3), {2: "objlist", 3: "objlist"}, {2: 1.0, 3: 1.0}, 5, "t")
+        graph = build_stage1_policy_graph(ego=ego, collaborators=collaborators, objects=objects,
+                                          policy=policy, spec=GraphBuildSpec(route_waypoints=ROUTE_WAYPOINTS,
+                                                                             max_object_nodes=8),
+                                          notable_ids={101})
+        metadata = make_stage1_policy_metadata(
+            step=0, episode_id=0, policy_type="all_candidates_objlist", policy=policy,
+            candidate_vehicle_ids=[2, 3], notable_object_ids=[101],
+            visible_ids_by_vehicle=visible_object_ids_by_vehicle(1, [2, 3], objects),
+            ego_pose=(0.0, 0.0, 0.0), fixed_dt=0.1,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = WAMStage1PolicyDataRecorder(tmp, fixed_dt=0.1, horizon_s=0.2, samples=cfg.traj_samples,
+                                              history_window=1, manifest={"task": "unit"})
+            for step in range(4):
+                rec.observe(step, {100: (8.0 + step, 1.0), 101: (12.0, 2.0), 102: (-7.0, 7.0)})
+            rec.register(0, key=policy_key("all_candidates_objlist", policy), graph=graph,
+                         ego_pose=(0.0, 0.0, 0.0), metadata=metadata,
+                         live_states=objects, notable_ids=(101,))
+            rec.flush_all()
+            sample = torch.load(sorted(Path(tmp).glob("sample_*.pt"))[0], weights_only=False)
+            self.assertEqual(sample["object_node_ids"], union_object_ids(sample["window"]))
+            self.assertIn(101, sample["object_node_ids"])
+            self.assertIn("perception_labels", sample)
+            row = {oid: i for i, oid in enumerate(sample["object_node_ids"])}
+            self.assertEqual(float(sample["perception_labels"]["invisible"][row[101]]), 1.0)
+            self.assertEqual(float(sample["perception_labels"]["visible"][row[101]]), 0.0)
+            self.assertEqual(float(sample["perception_labels"]["notable"][row[101]]), 1.0)
+            self.assertEqual(float(sample["perception_labels"]["visible"][row[100]]), 1.0)
+
+    def test_policy_recorder_without_live_states_has_no_labels(self):
+        # Back-compat: omitting live_states leaves perception_labels off -> trainer uses node labels.
+        cfg = perc_config()
+        ego, collaborators, objects = policy_scene_inputs()
+        policy = WAMPolicy((2,), {2: "objlist"}, {2: 1.0}, 5, "t")
+        graph = build_stage1_policy_graph(ego=ego, collaborators=collaborators, objects=objects,
+                                          policy=policy, spec=GraphBuildSpec(route_waypoints=ROUTE_WAYPOINTS))
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = WAMStage1PolicyDataRecorder(tmp, fixed_dt=0.1, horizon_s=0.2, samples=cfg.traj_samples,
+                                              history_window=1, manifest={"task": "unit"})
+            for step in range(4):
+                rec.observe(step, {100: (8.0 + step, 1.0), 101: (12.0, 2.0)})
+            rec.register(0, key=policy_key("single_candidate_objlist", policy), graph=graph,
+                         ego_pose=(0.0, 0.0, 0.0), metadata={"policy_type": "single_candidate_objlist"})
+            rec.flush_all()
+            sample = torch.load(sorted(Path(tmp).glob("sample_*.pt"))[0], weights_only=False)
+            self.assertNotIn("perception_labels", sample)
 
     def test_uncertainty_rows_are_csv_ready_and_finite(self):
         cfg = perc_config()
