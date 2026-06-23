@@ -53,6 +53,19 @@ def valid_object_ids(graph) -> List[int]:
     return [int(i) for i in node_id[valid].tolist()]
 
 
+def union_object_ids(graphs: Sequence[object]) -> List[int]:
+    """Union of valid object node ids across a window of graphs (sorted ascending).
+
+    Matches the query-object set :meth:`WAMPerceptionModel.forward` forms (``torch.unique`` over the
+    whole window, sorted ascending), so a recorded target/label row order aligns with the model's
+    ``object_node_ids`` output by node_id.
+    """
+    ids: set = set()
+    for graph in graphs:
+        ids.update(valid_object_ids(graph))
+    return sorted(ids)
+
+
 class WAMStage1DataRecorder:
     """Buffer per-step graph windows + GT futures and emit ``.pt`` Stage-1 window samples."""
 
@@ -222,27 +235,73 @@ class WAMStage1DataRecorder:
             coverage_tensor = torch.stack(coverage_history, dim=0)
         return graphs, coverage_tensor, slot_message_counts, slot_selected_vehicle_ids
 
+    def _perception_labels_at_t(
+        self,
+        object_node_ids: Sequence[int],
+        last_state: Optional[Mapping[str, object]],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """t-time GT perception labels for ``object_node_ids`` (row order = ``object_node_ids``).
+
+        Built from the prediction-step (last) slot state's ``live_states`` + ``notable_ids`` so the
+        labels reflect each object's status *at t* (not at the earlier frame it happened to appear in).
+        Mirrors :func:`car_dreamer.toolkit.wam.runtime.select_notable_objects` visibility logic. Objects
+        absent at t (e.g. already left the scene) get all-zero labels; their GT future is masked anyway.
+        Returns ``None`` when no slot state is available (pre-built-graph path) -> trainer falls back.
+        """
+        if last_state is None:
+            return None
+        live = {int(s.actor_id): s for s in last_state.get("live_states", ())}
+        notable = {int(i) for i in last_state.get("notable_ids", ())}
+        notable_t: List[float] = []
+        visible_t: List[float] = []
+        invisible_t: List[float] = []
+        for oid in object_node_ids:
+            state = live.get(int(oid))
+            if state is None:
+                notable_t.append(0.0)
+                visible_t.append(0.0)
+                invisible_t.append(0.0)
+                continue
+            visible = bool(state.visible_to_ego)
+            invisible = (not visible) and bool(state.visible_to_collaborators)
+            notable_t.append(1.0 if int(oid) in notable else 0.0)
+            visible_t.append(1.0 if visible else 0.0)
+            invisible_t.append(1.0 if invisible else 0.0)
+        return {
+            "notable": torch.tensor(notable_t, dtype=torch.float32),
+            "visible": torch.tensor(visible_t, dtype=torch.float32),
+            "invisible": torch.tensor(invisible_t, dtype=torch.float32),
+        }
+
     def _emit(self, step: int, payload: Dict[str, object]) -> Path:
+        last_state: Optional[Mapping[str, object]] = None
         if "source_window" in payload:
             window, coverage_history, slot_message_counts, slot_selected_vehicle_ids = self._build_window_from_sources(step, payload)
-            object_node_ids = valid_object_ids(window[-1]) if window else []
+            source_window = payload.get("source_window") or ()
+            if source_window:
+                last_state = source_window[-1]
         else:
             window = payload["window"]
             coverage_history = None
             slot_message_counts = [0 for _ in payload.get("window_steps", ())]
             slot_selected_vehicle_ids = [[] for _ in payload.get("window_steps", ())]
-            object_node_ids = payload["object_node_ids"]
+        # Query/target set = union of valid object ids across the whole window (matches the model's
+        # forward), so collaborator-only objects that only appear in earlier (lower-latency) frames
+        # are still predicted and supervised -- not silently dropped because the last frame is ego-only.
+        object_node_ids = union_object_ids(window) if window else []
         target_xy, valid = build_trajectory_targets(
             object_node_ids,
             payload["ego_pose"],
             self._futures_for(step),
             ego_frame=self.ego_frame,
         )
+        perception_labels = self._perception_labels_at_t(object_node_ids, last_state)
         sample = make_stage1_sample(
             window,
             torch.from_numpy(target_xy),
             torch.from_numpy(valid),
             object_node_ids,
+            perception_labels=perception_labels,
             metadata={
                 "step": int(step),
                 "episode_id": int(self._episode_id),

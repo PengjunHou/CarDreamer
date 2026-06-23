@@ -55,13 +55,17 @@ def make_stage1_sample(
     target_xy: torch.Tensor,
     valid: torch.Tensor,
     object_node_ids: Sequence[int],
+    perception_labels: Optional[Dict[str, torch.Tensor]] = None,
     metadata: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """Assemble one Stage-1 sample.
 
-    ``window`` is the list of ``K+1`` graphs (oldest->newest); ``target_xy [Q,H,2]`` / ``valid [Q,H]`` are
-    the GT future positions of the **last graph's valid object nodes** (in node order). Perception labels
-    (notable/visible/invisible) ride inside ``window[-1]`` object nodes -- no separate label tensor.
+    ``window`` is the list of ``K+1`` graphs (oldest->newest); ``object_node_ids`` is the **union of
+    valid object nodes across the window** (so collaborator-only objects absent from the ego-only last
+    frame are still supervised). ``target_xy [Q,H,2]`` / ``valid [Q,H]`` are the GT future positions in
+    that id order. ``perception_labels`` (optional) holds the t-time GT ``notable/visible/invisible``
+    tensors (length ``Q``, same id order); when absent the trainer falls back to the per-graph node
+    labels carried inside ``window`` (back-compat with older recordings).
     """
     sample: Dict[str, object] = {
         "window": list(window),
@@ -69,6 +73,8 @@ def make_stage1_sample(
         "valid": valid.float(),
         "object_node_ids": [int(i) for i in object_node_ids],
     }
+    if perception_labels is not None:
+        sample["perception_labels"] = {k: v.float() for k, v in perception_labels.items()}
     if metadata is not None:
         sample["metadata"] = dict(metadata)
     return sample
@@ -161,6 +167,31 @@ def _align_target(
     return tgt, val
 
 
+def _align_labels(
+    out_ids: torch.Tensor,
+    rec_ids: Sequence[int],
+    labels: Dict[str, torch.Tensor],
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Reorder recorded perception ``labels`` (keyed by ``rec_ids``) to the model's ``out_ids`` order.
+
+    Missing ids default to 0 (e.g. an object absent at t). Robust to ordering differences between the
+    recorder's union and the model's union since alignment is by node_id.
+    """
+    out_list = [int(v) for v in out_ids.tolist()]
+    id_to_row = {int(v): r for r, v in enumerate(rec_ids)}
+    aligned: Dict[str, torch.Tensor] = {}
+    for key, vec in labels.items():
+        vec = vec.to(device)
+        out_vec = torch.zeros(len(out_list), device=device)
+        for i, oid in enumerate(out_list):
+            r = id_to_row.get(oid)
+            if r is not None and r < vec.shape[0]:
+                out_vec[i] = vec[r]
+        aligned[key] = out_vec
+    return aligned
+
+
 class WAMStage1Trainer:
     """§16.1 training loop for the deterministic perception model (`WAMPerceptionModel`)."""
 
@@ -173,6 +204,17 @@ class WAMStage1Trainer:
         self.optimizer = torch.optim.Adam(self.params, lr=config.lr)
         self.step = 0
 
+    def _gt_labels(self, out: Dict[str, object], sample: Dict[str, object]) -> Dict[str, torch.Tensor]:
+        """t-time GT perception labels aligned to the model's ``object_node_ids``.
+
+        Prefers the recorded ``perception_labels`` (labels at the prediction step t); falls back to the
+        per-graph node labels the model surfaces in ``out["labels"]`` for older recordings.
+        """
+        rec_labels = sample.get("perception_labels")
+        if rec_labels is not None:
+            return _align_labels(out["object_node_ids"], sample["object_node_ids"], rec_labels, self.device)
+        return out["labels"]
+
     def _sample_loss(self, sample: Dict[str, object]) -> Optional[Dict[str, torch.Tensor]]:
         window = [g.to(self.device) for g in sample["window"]]
         out = self.model(window)
@@ -184,8 +226,9 @@ class WAMStage1Trainer:
             sample["target_xy"].to(self.device),
             sample["valid"].to(self.device),
         )
-        perc = perception_loss(out["perception_logits"], out["labels"], weights=self.config.perception_weights)
-        notable_weight = out["labels"].get("notable")
+        gt_labels = self._gt_labels(out, sample)
+        perc = perception_loss(out["perception_logits"], gt_labels, weights=self.config.perception_weights)
+        notable_weight = gt_labels.get("notable")
         if notable_weight is None:
             notable_weight = torch.ones(out["object_node_ids"].shape[0], device=self.device)
         nll = gaussian_trajectory_nll(
@@ -279,10 +322,11 @@ class WAMStage1Trainer:
                     out["object_node_ids"], sample["object_node_ids"],
                     sample["target_xy"].to(self.device), sample["valid"].to(self.device),
                 )
-                nw = out["labels"].get("notable")
+                gt_labels = self._gt_labels(out, sample)
+                nw = gt_labels.get("notable")
                 nw = torch.ones(out["object_node_ids"].shape[0], device=self.device) if nw is None else nw
-                notable_p.append(out["notable_prob"]); notable_l.append(out["labels"].get("notable", torch.zeros_like(out["notable_prob"])))
-                inv_p.append(out["invisible_prob"]); inv_l.append(out["labels"].get("invisible", torch.zeros_like(out["invisible_prob"])))
+                notable_p.append(out["notable_prob"]); notable_l.append(gt_labels.get("notable", torch.zeros_like(out["notable_prob"])))
+                inv_p.append(out["invisible_prob"]); inv_l.append(gt_labels.get("invisible", torch.zeros_like(out["invisible_prob"])))
                 mus.append(out["traj_mu"]); tgts.append(tgt); vals.append(val)
                 nws.append(nw); logvars.append(out["traj_log_var"])
         self.model.train()
