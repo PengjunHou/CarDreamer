@@ -22,6 +22,13 @@ COMM_METRICS = (
     "comm_generated_messages",
     "comm_received_messages_by_prediction_step",
 )
+# Task-focused (GT-notable-only) variants emitted by evaluate_stage1_uncertainty_rows.
+NOTABLE_METRICS = (
+    "motion_uncertainty_notable",
+    "total_uncertainty_notable",
+    "ade_notable",
+    "fde_notable",
+)
 METRICS = (
     "uncertainty",
     "motion_uncertainty",
@@ -31,6 +38,7 @@ METRICS = (
     "poor_coverage_risk_mean",
     "ade",
     "fde",
+    *NOTABLE_METRICS,
     *COMM_METRICS,
 )
 SUMMARY_METRICS = (
@@ -41,6 +49,7 @@ SUMMARY_METRICS = (
     "poor_coverage_risk_mean",
     "ade",
     "fde",
+    *NOTABLE_METRICS,
     *COMM_METRICS,
 )
 PLOTLY_INSTALL_HINT = (
