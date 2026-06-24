@@ -37,7 +37,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-html", dest="html", action="store_false", help="skip interactive HTML")
     parser.add_argument(
         "--metric",
-        choices=("uncertainty", "motion_uncertainty", "coverage_uncertainty", "total_uncertainty", "mean_uncertainty", "ade", "fde"),
+        choices=("uncertainty", "motion_uncertainty", "coverage_uncertainty", "total_uncertainty",
+                 "mean_uncertainty", "ade", "fde",
+                 "motion_uncertainty_notable", "total_uncertainty_notable", "ade_notable", "fde_notable"),
         default="total_uncertainty",
     )
     parser.add_argument("--baseline", default="ego_only", help="baseline policy label or policy_type")

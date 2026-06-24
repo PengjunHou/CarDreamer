@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from car_dreamer.toolkit.communication.process import CommConfig
 from car_dreamer.toolkit.wam import (
     GraphBuildSpec,
     MODALITY_TO_ID,
@@ -20,6 +21,7 @@ from car_dreamer.toolkit.wam import (
     WAMPerceptionConfig,
     WAMPerceptionModel,
     WAMPolicy,
+    WAMStage1CommunicationPolicyDataRecorder,
     WAMStage1Config,
     WAMStage1DataRecorder,
     WAMStage1Dataset,
@@ -481,6 +483,79 @@ class PolicyAugmentedStage1Test(unittest.TestCase):
             rec.flush_all()
             sample = torch.load(sorted(Path(tmp).glob("sample_*.pt"))[0], weights_only=False)
             self.assertNotIn("perception_labels", sample)
+
+    def test_comm_recorder_union_object_set_and_t_time_labels(self):
+        # Communication replay path: under latency the last frame is ego-only, so the collaborator-only
+        # object 101 only appears in earlier slots. _emit must still emit the union and t-time labels.
+        cfg = perc_config()
+        ego, collaborators, _ = policy_scene_inputs()
+        live = (
+            ObjectState(actor_id=100, actor_type="vehicle.x", object_class="vehicle", x=2.0, y=1.0,
+                        z=0.0, vx=0.5, vy=0.0, yaw=0.0, length=4.0, width=2.0, height=1.5,
+                        visible_to_ego=True),
+            ObjectState(actor_id=101, actor_type="vehicle.x", object_class="vehicle", x=5.0, y=2.0,
+                        z=0.0, vx=0.0, vy=0.0, yaw=0.0, length=4.0, width=2.0, height=1.5,
+                        visible_to_ego=False, visible_to_collaborators=(2,)),
+        )
+        base_state = {"ego": ego, "collaborators": collaborators, "live_states": live,
+                      "notable_ids": (101,), "ego_pose": (0.0, 0.0, 0.0)}
+
+        def graph_builder(state, messages, prediction_step):
+            del messages, prediction_step
+            return graph_with_objects(list(state["objs"]))
+
+        def slot(objs):
+            s = dict(base_state)
+            s["objs"] = objs
+            return s
+
+        comm = CommConfig(dt=0.1, sensor_period_steps=1, proc_delay_s=0.0, policy_duration_steps=10)
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = WAMStage1CommunicationPolicyDataRecorder(
+                tmp, fixed_dt=0.1, comm_config=comm, link_rate_bps=lambda *a, **k: 1e9,
+                graph_builder=graph_builder, horizon_s=0.2, samples=cfg.traj_samples,
+                history_window=2, manifest={"task": "unit"},
+            )
+            rec._ensure_runtimes(base_state, start_step=0)
+            key = list(rec._runtimes)[0]
+            payload = {
+                "key": key,
+                "source_window": [slot([(100, 2.0, 1.0), (101, 5.0, 2.0)]),   # cooperative
+                                  slot([(100, 2.0, 1.0), (101, 5.0, 2.0)]),
+                                  slot([(100, 2.0, 1.0)])],                    # ego-only @ t
+                "window_steps": [0, 1, 2],
+                "ego_pose": (0.0, 0.0, 0.0),
+                "metadata": {"step": 2, "episode_id": 0, "policy_type": "x"},
+            }
+            path = rec._emit(2, payload)
+            sample = torch.load(path, weights_only=False)
+            self.assertEqual(sample["object_node_ids"], [100, 101])  # union, not last-frame ego-only
+            self.assertIn("perception_labels", sample)
+            row = {oid: i for i, oid in enumerate(sample["object_node_ids"])}
+            self.assertEqual(float(sample["perception_labels"]["invisible"][row[101]]), 1.0)
+            self.assertEqual(float(sample["perception_labels"]["visible"][row[100]]), 1.0)
+            self.assertEqual(float(sample["perception_labels"]["notable"][row[101]]), 1.0)
+
+    def test_evaluate_emits_notable_only_metrics(self):
+        cfg = perc_config()
+        sample = synthetic_sample(cfg, objs=[(100, 8.0, 1.0), (101, 5.0, 2.0)])
+        ids = sample["object_node_ids"]
+        n = len(ids)
+        sample["perception_labels"] = {
+            "notable": torch.tensor([1.0] + [0.0] * (n - 1)),
+            "visible": torch.ones(n),
+            "invisible": torch.zeros(n),
+        }
+        sample["metadata"] = make_stage1_policy_metadata(
+            step=3, episode_id=0, policy_type="ego_only", policy=WAMPolicy((), {}, {}, 5, "t"),
+            candidate_vehicle_ids=[], notable_object_ids=[ids[0]], visible_ids_by_vehicle={1: [ids[0]]},
+            ego_pose=(0.0, 0.0, 0.0), fixed_dt=0.1,
+        )
+        rows = evaluate_stage1_uncertainty_rows(WAMPerceptionModel(cfg), [sample], device="cpu")
+        row = rows[0]
+        for key in ("motion_uncertainty_notable", "total_uncertainty_notable", "ade_notable", "fde_notable"):
+            self.assertIn(key, row)
+            self.assertTrue(np.isfinite(row[key]))
 
     def test_uncertainty_rows_are_csv_ready_and_finite(self):
         cfg = perc_config()

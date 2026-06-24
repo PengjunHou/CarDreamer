@@ -912,13 +912,26 @@ class WAMStage1CommunicationPolicyDataRecorder:
     def _emit(self, step: int, payload: Dict[str, object]) -> Path:
         runtime = self._runtimes[str(payload["key"])]
         window, coverage_history = self._build_window(runtime, int(step), payload)
-        object_node_ids = valid_object_ids(window[-1]) if window else []
+        # Predict/supervise the union over the window (matches WAMPerceptionModel.forward). Under real
+        # V2V latency the last frame is often ego-only, so collaborator-only notable objects only appear
+        # in earlier (already-received) slots -- the union keeps them instead of dropping them.
+        object_node_ids = union_object_ids(window) if window else []
         target_xy, valid = build_trajectory_targets(
             object_node_ids,
             payload["ego_pose"],
             self._futures_for(step),
             ego_frame=self.ego_frame,
         )
+        # t-time GT perception labels from the prediction-step (last) slot state.
+        source_window = payload.get("source_window") or ()
+        last_state = source_window[-1] if source_window else None
+        perception_labels = None
+        if last_state is not None:
+            perception_labels = perception_labels_at_t(
+                object_node_ids,
+                last_state.get("live_states", ()),
+                last_state.get("notable_ids", ()),
+            )
         metadata = dict(payload.get("metadata", {}))
         metadata.update(self._window_stats(runtime, int(step), window))
         sample = make_stage1_sample(
@@ -926,6 +939,7 @@ class WAMStage1CommunicationPolicyDataRecorder:
             torch.from_numpy(target_xy),
             torch.from_numpy(valid),
             object_node_ids,
+            perception_labels=perception_labels,
             metadata=metadata,
         )
         if coverage_history is not None:
@@ -1001,7 +1015,8 @@ def evaluate_stage1_uncertainty_rows(
         out = model(window)
         if int(out["object_node_ids"].numel()) == 0:
             uncertainty = 0.0
-            ade_fde = {"ade": 0.0, "fde": 0.0}
+            uncertainty_notable = 0.0
+            ade_fde = {"ade": 0.0, "fde": 0.0, "ade_notable": 0.0, "fde_notable": 0.0}
         else:
             tgt, val = _align_target(
                 out["object_node_ids"],
@@ -1016,6 +1031,12 @@ def evaluate_stage1_uncertainty_rows(
             else:
                 notable = out["labels"].get("notable")
             ade_fde = trajectory_ade_fde(out["traj_mu"], tgt, valid_mask=val, notable_weight=notable)
+            # Notable-only uncertainty: weight Tr(Σ) by the (hard) GT notable label instead of the
+            # model's soft notable_prob, so the comparison is restricted to the task-relevant objects.
+            if notable is not None:
+                uncertainty_notable = float(policy_uncertainty(notable.to(device), out["traj_log_var"], valid_mask=val))
+            else:
+                uncertainty_notable = float(uncertainty)
         coverage = {"coverage_uncertainty": 0.0, "route_coverage_quality_mean": 0.0, "poor_coverage_risk_mean": 0.0}
         if "coverage_history" in sample:
             coverage_tensor = sample["coverage_history"]
@@ -1024,7 +1045,9 @@ def evaluate_stage1_uncertainty_rows(
             else:
                 coverage_arr = coverage_tensor[-1]
             coverage = coverage_metrics(coverage_arr)
-        total_uncertainty = float(uncertainty) + float(coverage.get("coverage_uncertainty", 0.0))
+        coverage_uncertainty = float(coverage.get("coverage_uncertainty", 0.0))
+        total_uncertainty = float(uncertainty) + coverage_uncertainty
+        total_uncertainty_notable = float(uncertainty_notable) + coverage_uncertainty
         metadata = dict(sample.get("metadata", {}))
         policy = dict(metadata.get("policy", {}))
         row = {
@@ -1036,12 +1059,18 @@ def evaluate_stage1_uncertainty_rows(
             "notable_object_ids": list(metadata.get("notable_object_ids", [])),
             "uncertainty": float(uncertainty),
             "motion_uncertainty": float(uncertainty),
-            "coverage_uncertainty": float(coverage.get("coverage_uncertainty", 0.0)),
+            "coverage_uncertainty": coverage_uncertainty,
             "total_uncertainty": float(total_uncertainty),
+            # Notable-only variants: restricted to GT-notable objects (the task set), so collaborator
+            # clutter in the window union does not dilute/inflate the comparison.
+            "motion_uncertainty_notable": float(uncertainty_notable),
+            "total_uncertainty_notable": float(total_uncertainty_notable),
             "route_coverage_quality_mean": float(coverage.get("route_coverage_quality_mean", 0.0)),
             "poor_coverage_risk_mean": float(coverage.get("poor_coverage_risk_mean", 0.0)),
             "ade": float(ade_fde["ade"]),
             "fde": float(ade_fde["fde"]),
+            "ade_notable": float(ade_fde.get("ade_notable", 0.0)),
+            "fde_notable": float(ade_fde.get("fde_notable", 0.0)),
         }
         for field in COMM_REPLAY_METADATA_FIELDS:
             if field in metadata:

@@ -74,10 +74,14 @@ def main() -> int:
         "motion_uncertainty",
         "coverage_uncertainty",
         "total_uncertainty",
+        "motion_uncertainty_notable",
+        "total_uncertainty_notable",
         "route_coverage_quality_mean",
         "poor_coverage_risk_mean",
         "ade",
         "fde",
+        "ade_notable",
+        "fde_notable",
         *COMM_REPLAY_METADATA_FIELDS,
     ]
     with out_path.open("w", newline="", encoding="utf-8") as f:
