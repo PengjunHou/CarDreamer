@@ -38,7 +38,8 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
                         choices=("uncertainty", "motion_uncertainty", "coverage_uncertainty",
                                  "total_uncertainty", "mean_uncertainty", "ade", "fde",
                                  "motion_uncertainty_notable", "total_uncertainty_notable",
-                                 "ade_notable", "fde_notable"))
+                                 "ade_notable", "fde_notable",
+                                 "motion_uncertainty_norm", "total_uncertainty_norm"))
     parser.add_argument("--baseline", default="ego_only")
     parser.add_argument("--future-horizon-s", type=float, default=None)
     parser.add_argument("--policy-sampler", choices=("request_all", "random_duration"), default="request_all")

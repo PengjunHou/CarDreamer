@@ -333,6 +333,21 @@ def policy_uncertainty(
     return (weight * trace).sum() / weight.sum().clamp_min(eps)
 
 
+def per_object_trace(log_var: torch.Tensor, *, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Per-object predicted variance ``TrΣ_o = mean_h(σ_x² + σ_y²)`` -> ``[Q]`` (no GT needed).
+
+    Averaged over the horizon (or over valid steps if ``valid_mask`` is given). Building block for the
+    saturating [0, 1] uncertainty ``1 - exp(-TrΣ_o / τ)``.
+    """
+    if log_var.numel() == 0:
+        return log_var.new_zeros((0,))
+    trace = torch.exp(log_var).sum(dim=-1)  # [Q, H]
+    if valid_mask is not None:
+        w = valid_mask.to(trace.dtype)
+        return (trace * w).sum(dim=1) / w.sum(dim=1).clamp_min(1e-6)
+    return trace.mean(dim=1)
+
+
 # =====================================================================
 # Stage-1 evaluation metrics (§20.1 perception / §20.2 motion prediction)
 # =====================================================================

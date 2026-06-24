@@ -557,6 +557,23 @@ class PolicyAugmentedStage1Test(unittest.TestCase):
             self.assertIn(key, row)
             self.assertTrue(np.isfinite(row[key]))
 
+    def test_evaluate_normalized_uncertainty_in_unit_interval(self):
+        cfg = perc_config()
+        sample = synthetic_sample(cfg, objs=[(100, 8.0, 1.0), (101, 5.0, 2.0)])
+        sample["metadata"] = make_stage1_policy_metadata(
+            step=3, episode_id=0, policy_type="ego_only", policy=WAMPolicy((), {}, {}, 5, "t"),
+            candidate_vehicle_ids=[], notable_object_ids=[100, 101], visible_ids_by_vehicle={1: [100]},
+            ego_pose=(0.0, 0.0, 0.0), fixed_dt=0.1,
+        )
+        rows = evaluate_stage1_uncertainty_rows(WAMPerceptionModel(cfg), [sample], device="cpu",
+                                                sigma_scale=4.0, alpha=0.5)
+        row = rows[0]
+        for key in ("motion_uncertainty_norm", "total_uncertainty_norm"):
+            self.assertIn(key, row)
+            self.assertGreaterEqual(float(row[key]), 0.0)
+            self.assertLessEqual(float(row[key]), 1.0)
+        self.assertEqual(float(row["sigma_scale"]), 4.0)
+
     def test_uncertainty_rows_are_csv_ready_and_finite(self):
         cfg = perc_config()
         policy = WAMPolicy((), {}, {}, 5, "t")

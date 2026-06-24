@@ -28,6 +28,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--csv-name", default="uncertainty_by_policy.csv")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--sigma-scale", type=float, default=None,
+                        help="tau (m^2) for the [0,1] saturation 1-exp(-TrSigma/tau); default=auto (median TrSigma)")
+    parser.add_argument("--alpha", type=float, default=0.5,
+                        help="convex weight on motion vs coverage for total_uncertainty_norm (in [0,1])")
     return parser.parse_args()
 
 
@@ -59,7 +63,10 @@ def main() -> int:
     model.load_state_dict(state)
 
     dataset = WAMStage1Dataset(args.data_dir)
-    rows = evaluate_stage1_uncertainty_rows(model, dataset, device=args.device, limit=args.limit)
+    rows = evaluate_stage1_uncertainty_rows(
+        model, dataset, device=args.device, limit=args.limit,
+        sigma_scale=args.sigma_scale, alpha=args.alpha,
+    )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.out_dir / args.csv_name
@@ -76,6 +83,9 @@ def main() -> int:
         "total_uncertainty",
         "motion_uncertainty_notable",
         "total_uncertainty_notable",
+        "motion_uncertainty_norm",
+        "total_uncertainty_norm",
+        "sigma_scale",
         "route_coverage_quality_mean",
         "poor_coverage_risk_mean",
         "ade",
@@ -93,7 +103,8 @@ def main() -> int:
                 encoded[key] = json.dumps(encoded.get(key, []), sort_keys=True)
             writer.writerow({key: encoded.get(key, "") for key in fields})
 
-    print(f"Wrote {len(rows)} rows to {out_path}", flush=True)
+    tau = rows[0].get("sigma_scale") if rows else None
+    print(f"Wrote {len(rows)} rows to {out_path} (sigma_scale tau={tau}, alpha={args.alpha})", flush=True)
     return 0
 
 

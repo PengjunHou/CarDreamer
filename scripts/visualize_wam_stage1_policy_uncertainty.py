@@ -39,7 +39,8 @@ def parse_args() -> argparse.Namespace:
         "--metric",
         choices=("uncertainty", "motion_uncertainty", "coverage_uncertainty", "total_uncertainty",
                  "mean_uncertainty", "ade", "fde",
-                 "motion_uncertainty_notable", "total_uncertainty_notable", "ade_notable", "fde_notable"),
+                 "motion_uncertainty_notable", "total_uncertainty_notable", "ade_notable", "fde_notable",
+                 "motion_uncertainty_norm", "total_uncertainty_norm"),
         default="total_uncertainty",
     )
     parser.add_argument("--baseline", default="ego_only", help="baseline policy label or policy_type")

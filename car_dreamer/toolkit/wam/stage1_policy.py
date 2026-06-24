@@ -30,7 +30,7 @@ from .graph import (
     VehicleNodeInput,
     build_wam_hetero_graph,
 )
-from .heads import policy_uncertainty, trajectory_ade_fde
+from .heads import per_object_trace, policy_uncertainty, trajectory_ade_fde
 from .runtime import ObjectState, WAMPolicy
 from .stage1 import _align_labels, _align_target, make_stage1_sample
 from .stage1_recorder import _to_xy, perception_labels_at_t, union_object_ids, valid_object_ids
@@ -994,6 +994,15 @@ class WAMStage1CommunicationPolicyDataRecorder:
                     del runtime.messages[key]
 
 
+def _median(values: Sequence[float]) -> Optional[float]:
+    vals = sorted(float(v) for v in values)
+    n = len(vals)
+    if n == 0:
+        return None
+    mid = n // 2
+    return vals[mid] if n % 2 else 0.5 * (vals[mid - 1] + vals[mid])
+
+
 @torch.no_grad()
 def evaluate_stage1_uncertainty_rows(
     model,
@@ -1001,18 +1010,34 @@ def evaluate_stage1_uncertainty_rows(
     *,
     device: Union[str, torch.device] = "cpu",
     limit: Optional[int] = None,
+    sigma_scale: Optional[float] = None,
+    alpha: float = 0.5,
 ) -> List[Dict[str, object]]:
-    """Run a Stage-1 model over samples and return CSV-ready uncertainty rows."""
+    """Run a Stage-1 model over samples and return CSV-ready uncertainty rows.
+
+    Also emits [0, 1]-normalized columns: ``motion_uncertainty_norm`` = mean over the GT-notable set
+    of ``1 - exp(-TrΣ_o / τ)`` (un-observed notable objects count as 1, the blind-spot penalty), and
+    ``total_uncertainty_norm`` = ``alpha * motion_norm + (1-alpha) * coverage_uncertainty`` (a convex
+    combination, so in [0, 1]). ``sigma_scale`` (τ, m²) sets the saturation scale; if ``None`` it is the
+    median observed ``TrΣ_o`` across all samples (so the values spread across [0, 1]).
+    """
     device = torch.device(device)
     model.to(device)
     was_training = bool(model.training)
     model.eval()
     rows: List[Dict[str, object]] = []
+    all_traces: List[float] = []
     for idx, sample in enumerate(samples):
         if limit is not None and idx >= int(limit):
             break
         window = [g.to(device) for g in sample["window"]]
         out = model(window)
+        trace_by_id: Dict[int, float] = {}
+        if int(out["object_node_ids"].numel()) > 0:
+            trace_o = per_object_trace(out["traj_log_var"])  # [Q]; TrΣ_o, no GT needed
+            for i, oid in enumerate(out["object_node_ids"].tolist()):
+                trace_by_id[int(oid)] = float(trace_o[i])
+            all_traces.extend(trace_by_id.values())
         if int(out["object_node_ids"].numel()) == 0:
             uncertainty = 0.0
             uncertainty_notable = 0.0
@@ -1075,7 +1100,32 @@ def evaluate_stage1_uncertainty_rows(
         for field in COMM_REPLAY_METADATA_FIELDS:
             if field in metadata:
                 row[field] = metadata[field]
+        row["_trace_by_id"] = trace_by_id
+        row["_ref_ids"] = [int(v) for v in metadata.get("notable_object_ids", [])]
         rows.append(row)
+
+    # [0, 1] normalization: saturate per-object TrΣ, fixed GT-notable set with blind-spot=1, then a
+    # convex combination with the (already [0, 1]) coverage term. tau defaults to the median TrΣ.
+    if sigma_scale is not None:
+        tau = max(float(sigma_scale), 1e-6)
+    else:
+        tau = max(float(_median(all_traces) or 1.0), 1e-6)
+    a = float(min(max(alpha, 0.0), 1.0))
+    for row in rows:
+        trace_by_id = row.pop("_trace_by_id", {})
+        ref_ids = row.pop("_ref_ids", [])
+        if ref_ids:  # fixed GT-notable set; un-observed -> blind-spot penalty 1
+            u_vals = [(1.0 - math.exp(-trace_by_id[o] / tau)) if o in trace_by_id else 1.0 for o in ref_ids]
+        elif trace_by_id:  # fallback: observed objects only, no blind-spot term
+            u_vals = [1.0 - math.exp(-t / tau) for t in trace_by_id.values()]
+        else:
+            u_vals = []
+        motion_norm = float(sum(u_vals) / len(u_vals)) if u_vals else 0.0
+        cov01 = min(max(float(row.get("coverage_uncertainty", 0.0)), 0.0), 1.0)
+        row["motion_uncertainty_norm"] = motion_norm
+        row["total_uncertainty_norm"] = a * motion_norm + (1.0 - a) * cov01
+        row["sigma_scale"] = float(tau)
+
     if was_training:
         model.train()
     return rows

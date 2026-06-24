@@ -29,6 +29,11 @@ NOTABLE_METRICS = (
     "ade_notable",
     "fde_notable",
 )
+# [0, 1]-normalized (saturated) uncertainty variants.
+NORM_METRICS = (
+    "motion_uncertainty_norm",
+    "total_uncertainty_norm",
+)
 METRICS = (
     "uncertainty",
     "motion_uncertainty",
@@ -39,6 +44,7 @@ METRICS = (
     "ade",
     "fde",
     *NOTABLE_METRICS,
+    *NORM_METRICS,
     *COMM_METRICS,
 )
 SUMMARY_METRICS = (
@@ -50,6 +56,7 @@ SUMMARY_METRICS = (
     "ade",
     "fde",
     *NOTABLE_METRICS,
+    *NORM_METRICS,
     *COMM_METRICS,
 )
 PLOTLY_INSTALL_HINT = (

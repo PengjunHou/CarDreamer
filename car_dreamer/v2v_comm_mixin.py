@@ -273,6 +273,10 @@ class V2VCommMixin:
         )
         self._wam_uncertainty_alpha_motion = float(getattr(coverage_cfg, "alpha_motion", 1.0))
         self._wam_uncertainty_beta_coverage = float(getattr(coverage_cfg, "beta_coverage", 1.0))
+        # [0,1]-normalized uncertainty (reported alongside the raw total; does not drive the threshold):
+        # motion_norm = 1 - exp(-motion / sigma_scale); total_norm = alpha_norm*motion_norm + (1-alpha_norm)*coverage.
+        self._wam_uncertainty_sigma_scale = float(getattr(coverage_cfg, "sigma_scale", 4.0))
+        self._wam_uncertainty_alpha_norm = float(getattr(coverage_cfg, "alpha_norm", 0.5))
         seed = getattr(random_policy_cfg, "seed", None)
         self._wam_policy_rng = np.random.default_rng(None if seed is None else int(seed))
 
@@ -872,11 +876,20 @@ class V2VCommMixin:
         coverage = self._build_wam_coverage(int(step))
         alpha = float(getattr(self, "_wam_uncertainty_alpha_motion", 1.0))
         beta = float(getattr(self, "_wam_uncertainty_beta_coverage", 1.0))
-        total = alpha * float(motion_uncertainty) + beta * float(coverage.get("coverage_uncertainty", 0.0))
+        coverage_uncertainty = float(coverage.get("coverage_uncertainty", 0.0))
+        total = alpha * float(motion_uncertainty) + beta * coverage_uncertainty
+        # [0,1]-normalized view (same saturation as the offline evaluator); reported only -- the coop
+        # threshold below still uses the raw ``total`` so its tuning is unchanged.
+        tau = max(float(getattr(self, "_wam_uncertainty_sigma_scale", 4.0)), 1e-6)
+        a_norm = float(min(max(getattr(self, "_wam_uncertainty_alpha_norm", 0.5), 0.0), 1.0))
+        motion_norm = 1.0 - math.exp(-max(float(motion_uncertainty), 0.0) / tau)
+        cov01 = min(max(coverage_uncertainty, 0.0), 1.0)
         self._wam_uncertainty_breakdown = {
             "motion_uncertainty": float(motion_uncertainty),
-            "coverage_uncertainty": float(coverage.get("coverage_uncertainty", 0.0)),
+            "coverage_uncertainty": coverage_uncertainty,
             "total_uncertainty": float(total),
+            "motion_uncertainty_norm": float(motion_norm),
+            "total_uncertainty_norm": float(a_norm * motion_norm + (1.0 - a_norm) * cov01),
             "route_coverage_ratio": float(coverage.get("route_coverage_ratio", 0.0)),
             "route_coverage_quality_mean": float(coverage.get("route_coverage_quality_mean", 0.0)),
             "poor_coverage_risk_mean": float(coverage.get("poor_coverage_risk_mean", 0.0)),
