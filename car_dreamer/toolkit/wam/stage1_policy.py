@@ -1015,11 +1015,13 @@ def evaluate_stage1_uncertainty_rows(
 ) -> List[Dict[str, object]]:
     """Run a Stage-1 model over samples and return CSV-ready uncertainty rows.
 
-    Also emits [0, 1]-normalized columns: ``motion_uncertainty_norm`` = mean over the GT-notable set
-    of ``1 - exp(-TrΣ_o / τ)`` (un-observed notable objects count as 1, the blind-spot penalty), and
-    ``total_uncertainty_norm`` = ``alpha * motion_norm + (1-alpha) * coverage_uncertainty`` (a convex
-    combination, so in [0, 1]). ``sigma_scale`` (τ, m²) sets the saturation scale; if ``None`` it is the
-    median observed ``TrΣ_o`` across all samples (so the values spread across [0, 1]).
+    Also emits [0, 1]-normalized columns. ``motion_uncertainty_norm`` is the mean over the GT-notable
+    set (``metadata['notable_object_ids']``) of ``1 - exp(-TrΣ_o / τ)``, with un-observed notable objects
+    counted as 1 (blind-spot penalty); a step with no notable objects -> 0 (it is NOT averaged over the
+    union -- that union fallback applies only to legacy samples lacking the ``notable_object_ids`` field).
+    ``total_uncertainty_norm`` = ``alpha * motion_norm + (1-alpha) * coverage_uncertainty`` (convex, so in
+    [0, 1]). ``sigma_scale`` (τ, m²) sets the saturation scale; if ``None`` it is the median observed
+    ``TrΣ_o`` across all samples (so the values spread across [0, 1]).
     """
     device = torch.device(device)
     model.to(device)
@@ -1101,6 +1103,10 @@ def evaluate_stage1_uncertainty_rows(
             if field in metadata:
                 row[field] = metadata[field]
         row["_trace_by_id"] = trace_by_id
+        # ``_has_ref`` distinguishes "notable set is known (this is policy/eval data)" from "field absent
+        # (legacy data)". A known-but-empty notable set means no notable objects this step -> motion 0,
+        # NOT a fallback to the union.
+        row["_has_ref"] = "notable_object_ids" in metadata
         row["_ref_ids"] = [int(v) for v in metadata.get("notable_object_ids", [])]
         rows.append(row)
 
@@ -1114,9 +1120,10 @@ def evaluate_stage1_uncertainty_rows(
     for row in rows:
         trace_by_id = row.pop("_trace_by_id", {})
         ref_ids = row.pop("_ref_ids", [])
-        if ref_ids:  # fixed GT-notable set; un-observed -> blind-spot penalty 1
+        has_ref = bool(row.pop("_has_ref", False))
+        if has_ref:  # known GT-notable set: average over it (blind-spot=1); empty -> no notable -> 0
             u_vals = [(1.0 - math.exp(-trace_by_id[o] / tau)) if o in trace_by_id else 1.0 for o in ref_ids]
-        elif trace_by_id:  # fallback: observed objects only, no blind-spot term
+        elif trace_by_id:  # notable set unknown (legacy data) -> fall back to the observed union
             u_vals = [1.0 - math.exp(-t / tau) for t in trace_by_id.values()]
         else:
             u_vals = []
