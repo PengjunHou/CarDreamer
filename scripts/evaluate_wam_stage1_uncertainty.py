@@ -83,6 +83,8 @@ def main() -> int:
         "total_uncertainty",
         "motion_uncertainty_notable",
         "total_uncertainty_notable",
+        "motion_uncertainty_norm",
+        "total_uncertainty_norm",
         "motion_uncertainty_norm_notable",
         "total_uncertainty_norm_notable",
         "sigma_scale",

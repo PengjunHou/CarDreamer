@@ -1020,8 +1020,10 @@ def evaluate_stage1_uncertainty_rows(
     notable objects counted as 1 (blind-spot penalty); a step with no notable objects -> 0 (it is NOT
     averaged over the union -- that union fallback applies only to legacy samples lacking the
     ``notable_object_ids`` field). ``total_uncertainty_norm_notable`` =
-    ``alpha * motion_norm + (1-alpha) * coverage_uncertainty`` (convex, so in [0, 1]). ``sigma_scale``
-    (τ, m²) sets the saturation scale; if ``None`` it is the median observed ``TrΣ_o`` across all samples.
+    ``alpha * motion_norm + (1-alpha) * coverage_uncertainty`` (convex, so in [0, 1]). The ``_norm``
+    (without ``_notable``) variants are the same saturation but averaged over *all* observed objects
+    (the union; no fixed set / blind-spot term). ``sigma_scale`` (τ, m²) sets the saturation scale; if
+    ``None`` it is the median observed ``TrΣ_o`` across all samples.
     """
     device = torch.device(device)
     model.to(device)
@@ -1129,6 +1131,11 @@ def evaluate_stage1_uncertainty_rows(
             u_vals = []
         motion_norm = float(sum(u_vals) / len(u_vals)) if u_vals else 0.0
         cov01 = min(max(float(row.get("coverage_uncertainty", 0.0)), 0.0), 1.0)
+        # Union variant: saturate over *all* observed objects (no fixed set / blind-spot term).
+        u_union = [1.0 - math.exp(-t / tau) for t in trace_by_id.values()]
+        motion_norm_union = float(sum(u_union) / len(u_union)) if u_union else 0.0
+        row["motion_uncertainty_norm"] = motion_norm_union
+        row["total_uncertainty_norm"] = a * motion_norm_union + (1.0 - a) * cov01
         row["motion_uncertainty_norm_notable"] = motion_norm
         row["total_uncertainty_norm_notable"] = a * motion_norm + (1.0 - a) * cov01
         row["sigma_scale"] = float(tau)

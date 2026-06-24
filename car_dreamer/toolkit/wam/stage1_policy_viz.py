@@ -29,8 +29,11 @@ NOTABLE_METRICS = (
     "ade_notable",
     "fde_notable",
 )
-# [0, 1]-normalized (saturated) notable-task-set uncertainty variants.
+# [0, 1]-normalized (saturated) uncertainty variants: ``_norm`` over the observed union,
+# ``_norm_notable`` over the fixed GT-notable set (with blind-spot penalty).
 NORM_METRICS = (
+    "motion_uncertainty_norm",
+    "total_uncertainty_norm",
     "motion_uncertainty_norm_notable",
     "total_uncertainty_norm_notable",
 )
@@ -196,28 +199,13 @@ def summarize_policy_breakdown(
     summary = grouped.size().rename("rows").reset_index()
 
     for metric in available:
-        agg = (
-            grouped[metric]
-            .agg(["mean", "std", "min", "max"])
-            .rename(
-                columns={
-                    "mean": f"{metric}_mean",
-                    "std": f"{metric}_std",
-                    "min": f"{metric}_min",
-                    "max": f"{metric}_max",
-                }
-            )
-            .reset_index()
-        )
+        # Keep the table compact: per-metric mean + delta-vs-baseline only (no std/min/max).
+        agg = grouped[metric].mean().rename(f"{metric}_mean").reset_index()
         summary = summary.merge(agg, on=group_cols, how="left")
         delta_col = f"{metric}_delta"
         if delta_col in out.columns:
             delta = grouped[delta_col].mean().rename(f"{metric}_delta_vs_{baseline}").reset_index()
             summary = summary.merge(delta, on=group_cols, how="left")
-
-    for col in summary.columns:
-        if col.endswith("_std"):
-            summary[col] = summary[col].fillna(0.0)
 
     sort_col = "total_uncertainty_mean" if "total_uncertainty_mean" in summary.columns else f"{available[0]}_mean"
     return summary.sort_values([sort_col, "policy_label"], ascending=[True, True]).reset_index(drop=True)
