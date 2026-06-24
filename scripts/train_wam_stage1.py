@@ -32,7 +32,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt-dir", default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--val-fraction", type=float, default=0.0)
+    parser.add_argument("--val-interval", type=int, default=0,
+                        help="evaluate on the val set every N steps for logging (0=only at end; needs --val-fraction>0)")
+    parser.add_argument("--log-interval", type=int, default=None, help="override text log interval (steps)")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--wandb", action="store_true", help="log training to Weights & Biases")
+    parser.add_argument("--wandb-project", default="cardreamer-wam-stage1")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
     return parser.parse_args()
 
 
@@ -60,6 +67,9 @@ def main() -> int:
         stage1_cfg.lr = args.lr
     if args.ckpt_dir is not None:
         stage1_cfg.ckpt_dir = args.ckpt_dir
+    if args.log_interval is not None:
+        stage1_cfg.log_interval = args.log_interval
+    stage1_cfg.val_interval = int(args.val_interval)
     stage1_cfg.device = args.device
     stage1_cfg.seed = args.seed
 
@@ -80,12 +90,51 @@ def main() -> int:
         f"ckpt_dir={stage1_cfg.ckpt_dir}",
         flush=True,
     )
-    result = trainer.train(train_set, val_set)
+
+    metrics_callback = None
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise SystemExit("wandb is not installed in this env; `pip install wandb` or drop --wandb") from exc
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            config={
+                "lr": stage1_cfg.lr,
+                "batch_size": stage1_cfg.batch_size,
+                "max_steps": stage1_cfg.max_steps,
+                "hidden_dim": perc_cfg.hidden_dim,
+                "history_window": stage1_cfg.history_window,
+                "sample_period_s": stage1_cfg.sample_period_s,
+                "traj_samples": perc_cfg.traj_samples,
+                "lambda_perc": stage1_cfg.lambda_perc,
+                "lambda_traj": stage1_cfg.lambda_traj,
+                "num_samples": len(dataset),
+                "val_fraction": args.val_fraction,
+                "val_interval": stage1_cfg.val_interval,
+                "data_dir": str(args.data_dir),
+                "device": stage1_cfg.device,
+                "seed": stage1_cfg.seed,
+            },
+        )
+
+        def metrics_callback(step, metrics):
+            wandb.log(dict(metrics), step=int(step))
+
+    result = trainer.train(train_set, val_set, metrics_callback=metrics_callback)
     msg = f"[wam-stage1] done final_loss={result['final_loss']:.4f} steps={int(result['steps'])}"
     for key in ("val_notable_f1", "val_invisible_recall", "val_ade", "val_fde", "val_mean_uncertainty"):
         if key in result:
             msg += f" {key}={result[key]:.4f}"
     print(msg, flush=True)
+
+    if wandb_run is not None:
+        import wandb
+        wandb.summary.update({k: float(v) for k, v in result.items()})
+        wandb.finish()
     return 0
 
 

@@ -25,7 +25,7 @@ from __future__ import annotations
 import functools
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -130,6 +130,7 @@ class WAMStage1Config:
     history_window: int = 4
     sample_period_s: float = 0.1
     val_fraction: float = 0.0
+    val_interval: int = 0  # evaluate on val set every N steps for logging (0 = only at the end)
     device: str = "cpu"
     seed: int = 0
     num_workers: int = 0
@@ -269,7 +270,10 @@ class WAMStage1Trainer:
         val_dataset: Optional[WAMStage1Dataset] = None,
         *,
         logger=None,
+        metrics_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
     ) -> Dict[str, float]:
+        """Train the model. ``metrics_callback(step, metrics)`` (optional) receives per-step train
+        scalars (and periodic / final val metrics) for external logging, e.g. Weights & Biases."""
         torch.manual_seed(self.config.seed)
         loader = self._loader(dataset, shuffle=self.config.shuffle)
         self.model.train()
@@ -287,12 +291,21 @@ class WAMStage1Trainer:
                 self.step += 1
                 history.append(float(loss.detach()))
 
+                if metrics_callback is not None:
+                    metrics_callback(self.step, {
+                        "train/loss": float(loss.detach()),
+                        "train/perception": float(losses["perception"].detach()),
+                        "train/traj": float(losses["traj"].detach()),
+                    })
                 if self.config.log_interval and self.step % self.config.log_interval == 0:
                     msg = (
                         f"[wam-stage1] step={self.step} L={float(loss.detach()):.4f} "
                         f"perc={float(losses['perception']):.4f} traj={float(losses['traj']):.4f}"
                     )
                     (logger.info(msg) if logger is not None else print(msg, flush=True))
+                if (metrics_callback is not None and val_dataset is not None
+                        and self.config.val_interval and self.step % self.config.val_interval == 0):
+                    metrics_callback(self.step, self.evaluate(val_dataset))
                 if self.config.ckpt_interval and self.step % self.config.ckpt_interval == 0:
                     self.save_checkpoint()
                 if self.step >= self.config.max_steps:
@@ -302,7 +315,10 @@ class WAMStage1Trainer:
         self.save_checkpoint()
         out = {"final_loss": history[-1] if history else float("nan"), "steps": float(self.step)}
         if val_dataset is not None:
-            out.update(self.evaluate(val_dataset))
+            val_metrics = self.evaluate(val_dataset)
+            out.update(val_metrics)
+            if metrics_callback is not None:
+                metrics_callback(self.step, dict(val_metrics))
         return out
 
     @torch.no_grad()
