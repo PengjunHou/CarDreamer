@@ -372,6 +372,46 @@ class RenderAndWriteTest(unittest.TestCase):
             self.assertIn('id="panels"', text)  # container for separate images
             self.assertIn("for (const b64 of FRAMES", text)  # each policy rendered as its own <img>
 
+    def test_uncertainty_panel_adds_bottom_axis_with_values(self):
+        import matplotlib
+
+        from car_dreamer.toolkit.wam.graph_timeline_viz import build_episode_uncertainty_series
+
+        recs = self._records()
+        for i, r in enumerate(recs):
+            r["extra"] = {"episode": 0, "uncertainty": {
+                "motion_uncertainty": 0.1 * (i + 1),
+                "coverage_uncertainty": 0.2,
+                "total_uncertainty": 0.1 * (i + 1) + 0.2,
+            }}
+        series = build_episode_uncertainty_series(recs)
+        self.assertEqual([d["step"] for d in series[0]], [0, 1, 2])
+        self.assertAlmostEqual(series[0][2]["motion"], 0.3)
+
+        # with unc_series -> a 3rd (bottom) axis carrying the value text; without -> unchanged 2 axes
+        fig = render_graph_matplotlib(recs[1], unc_series=series[0], cur_step=1)
+        self.assertEqual(len(fig.axes), 3)
+        unc_text = " ".join(t.get_text() for ax in fig.axes for t in [ax.title])
+        self.assertIn("step 1", unc_text)
+        self.assertIn("motion=", unc_text)
+        matplotlib.pyplot.close(fig)
+
+        fig2 = render_graph_matplotlib(recs[1])  # back-compat: no uncertainty -> 2 axes
+        self.assertEqual(len(fig2.axes), 2)
+        matplotlib.pyplot.close(fig2)
+
+    def test_writers_embed_uncertainty_when_present(self):
+        recs = self._records()
+        for i, r in enumerate(recs):
+            r["extra"] = {"episode": 0, "uncertainty": {
+                "motion_uncertainty": 0.1 * i, "coverage_uncertainty": 0.2, "total_uncertainty": 0.1 * i + 0.2}}
+        with tempfile.TemporaryDirectory() as d:
+            pngs = write_graph_frames_png(recs, Path(d) / "frames")
+            self.assertEqual(len(pngs), 3)
+            self.assertTrue(all(p.stat().st_size > 0 for p in pngs))
+            html = write_graph_timeline_html(recs, Path(d) / "t.html")
+            self.assertGreater(html.stat().st_size, 0)
+
     def test_jsonl_roundtrip(self):
         records = self._records()
         with tempfile.TemporaryDirectory() as d:

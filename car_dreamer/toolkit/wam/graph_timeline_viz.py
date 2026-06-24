@@ -69,6 +69,10 @@ FIG_HEIGHT = 5.6
 TOPO_WIDTH = 8.0
 BEV_WIDTH = 5.6
 BEV_FALLBACK_RANGE_M = 50.0  # scatter-BEV half-range (m) when no birdeye image is available
+UNC_HEIGHT = 2.0             # height (in) of the optional bottom uncertainty-vs-step panel
+UNC_MOTION_COLOR = "#1f77b4"
+UNC_COVERAGE_COLOR = "#2ca02c"
+UNC_TOTAL_COLOR = "#d62728"
 
 
 @dataclass
@@ -1256,20 +1260,109 @@ def _draw_bev_on_ax(ax, record: Mapping[str, Any], *, bev: Optional[BevOptions] 
     _draw_generated_bev_on_ax(ax, record, bev=bev)
 
 
+def build_episode_uncertainty_series(
+    records: Sequence[Mapping[str, Any]],
+) -> Dict[int, List[Dict[str, float]]]:
+    """Per-episode ``{episode: [{step, motion, coverage, total}, ...]}`` from ``extra.uncertainty``.
+
+    The uncertainty breakdown is the ego's runtime value for the active policy, so the first record
+    seen per ``(episode, step)`` wins. Episodes whose records carry no ``uncertainty`` are absent.
+    """
+    by_ep: Dict[int, Dict[int, Dict[str, float]]] = {}
+    for rec in records:
+        extra = rec.get("extra") or {}
+        unc = extra.get("uncertainty") if isinstance(extra, Mapping) else None
+        if not isinstance(unc, Mapping):
+            continue
+        ep = int(extra.get("episode", 0))
+        step = int(rec.get("step", 0))
+        per_step = by_ep.setdefault(ep, {})
+        if step in per_step:
+            continue
+        per_step[step] = {
+            "step": step,
+            "motion": float(unc.get("motion_uncertainty", 0.0)),
+            "coverage": float(unc.get("coverage_uncertainty", 0.0)),
+            "total": float(unc.get("total_uncertainty", 0.0)),
+        }
+    return {ep: [per_step[s] for s in sorted(per_step)] for ep, per_step in by_ep.items()}
+
+
+def _draw_uncertainty_panel(ax, series: Sequence[Mapping[str, float]], cur_step: Optional[int] = None) -> None:
+    """Plot motion / coverage / total uncertainty vs step with a marker at ``cur_step``."""
+    if not series:
+        ax.axis("off")
+        return
+    steps = [d["step"] for d in series]
+    for key, color, lw, label in (
+        ("motion", UNC_MOTION_COLOR, 1.4, "motion"),
+        ("coverage", UNC_COVERAGE_COLOR, 1.4, "coverage"),
+        ("total", UNC_TOTAL_COLOR, 1.8, "total"),
+    ):
+        ax.plot(steps, [d[key] for d in series], color=color, lw=lw, label=label)
+    cur = None
+    if cur_step is not None:
+        ax.axvline(float(cur_step), color="#888888", ls="--", lw=1.0)
+        cur = next((d for d in series if int(d["step"]) == int(cur_step)), None)
+        if cur is not None:
+            for key, color in (("motion", UNC_MOTION_COLOR), ("coverage", UNC_COVERAGE_COLOR), ("total", UNC_TOTAL_COLOR)):
+                ax.plot([cur_step], [cur[key]], marker="o", ms=4.5, color=color)
+    if cur is not None:
+        ax.set_title(
+            f"uncertainty @ step {int(cur_step)}:   motion={cur['motion']:.3f}    "
+            f"coverage={cur['coverage']:.3f}    total={cur['total']:.3f}",
+            fontsize=8,
+        )
+    ax.set_xlabel("step", fontsize=8)
+    ax.set_ylabel("uncertainty", fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(bottom=0.0)
+    ax.legend(loc="upper right", fontsize=7, ncol=3, framealpha=0.6)
+
+
 def render_graph_matplotlib(
     record: Mapping[str, Any], *, with_bev: bool = True, bev: Optional[BevOptions] = None,
     figsize: Optional[Tuple[float, float]] = None,
+    unc_series: Optional[Sequence[Mapping[str, float]]] = None,
+    cur_step: Optional[int] = None,
 ):
     """Render a record at a FIXED size: topology (left) + (optional) BEV (right).
 
     The size is constant across frames (independent of object count) so the HTML slider does not
     jitter. The BEV uses the real CARLA birdeye + policy overlay when ``bev`` resolves an image for
-    this ego/step, otherwise a labelled ego-centric scatter.
+    this ego/step, otherwise a labelled ego-centric scatter. When ``unc_series`` (the episode's
+    motion/coverage/total uncertainty series) is given, a bottom panel plots it vs step with a marker
+    at ``cur_step``; without it the layout is unchanged (no extra axis).
     """
+    has_unc = bool(unc_series)
     if not with_bev:
+        if has_unc:
+            fig = plt.figure(figsize=figsize or (TOPO_WIDTH, FIG_HEIGHT + UNC_HEIGHT))
+            gs = fig.add_gridspec(2, 1, height_ratios=[FIG_HEIGHT, UNC_HEIGHT], hspace=0.4)
+            ax = fig.add_subplot(gs[0, 0])
+            ax_unc = fig.add_subplot(gs[1, 0])
+            _draw_on_ax(ax, record)
+            _draw_uncertainty_panel(ax_unc, unc_series, cur_step)
+            fig.subplots_adjust(left=0.08, right=0.96, top=0.93, bottom=0.10)
+            return fig
         fig, ax = plt.subplots(figsize=figsize or (TOPO_WIDTH, FIG_HEIGHT))
         _draw_on_ax(ax, record)
         fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.05)
+        return fig
+    if has_unc:
+        fig = plt.figure(figsize=figsize or (TOPO_WIDTH + BEV_WIDTH, FIG_HEIGHT + UNC_HEIGHT))
+        gs = fig.add_gridspec(
+            2, 2, height_ratios=[FIG_HEIGHT, UNC_HEIGHT], width_ratios=[TOPO_WIDTH, BEV_WIDTH],
+            hspace=0.4, wspace=0.08,
+        )
+        ax_topo = fig.add_subplot(gs[0, 0])
+        ax_bev = fig.add_subplot(gs[0, 1])
+        ax_unc = fig.add_subplot(gs[1, :])
+        _draw_on_ax(ax_topo, record)
+        _draw_bev_on_ax(ax_bev, record, bev=bev)
+        _draw_uncertainty_panel(ax_unc, unc_series, cur_step)
+        fig.subplots_adjust(left=0.04, right=0.97, top=0.93, bottom=0.09)
         return fig
     fig, (ax_topo, ax_bev) = plt.subplots(
         1, 2, figsize=figsize or (TOPO_WIDTH + BEV_WIDTH, FIG_HEIGHT),
@@ -1316,11 +1409,16 @@ def _fig_to_png_bytes(fig, *, dpi: int = 110) -> bytes:
     return buf.getvalue()
 
 
-def _policy_png_list(frame: Mapping[str, Any], *, dpi: int = 110, bev: Optional[BevOptions] = None) -> List[bytes]:
+def _policy_png_list(
+    frame: Mapping[str, Any], *, dpi: int = 110, bev: Optional[BevOptions] = None,
+    unc_series: Optional[Sequence[Mapping[str, float]]] = None,
+) -> List[bytes]:
     """Render each policy of a frame to its own fixed-size PNG (independent images)."""
     out: List[bytes] = []
     for label in frame["panels"]:
-        fig = render_graph_matplotlib(frame["panels"][label], bev=bev)
+        fig = render_graph_matplotlib(
+            frame["panels"][label], bev=bev, unc_series=unc_series, cur_step=frame.get("step"),
+        )
         out.append(_fig_to_png_bytes(fig, dpi=dpi))
     return out
 
@@ -1339,11 +1437,14 @@ def _stack_vertical(images: List) -> "Any":
     return canvas
 
 
-def _frame_png_bytes(frame: Mapping[str, Any], *, dpi: int = 110, bev: Optional[BevOptions] = None) -> bytes:
+def _frame_png_bytes(
+    frame: Mapping[str, Any], *, dpi: int = 110, bev: Optional[BevOptions] = None,
+    unc_series: Optional[Sequence[Mapping[str, float]]] = None,
+) -> bytes:
     """Render a frame as ONE image: each policy its own figure, stacked vertically (for PNG/GIF)."""
     from PIL import Image
 
-    pngs = _policy_png_list(frame, dpi=dpi, bev=bev)
+    pngs = _policy_png_list(frame, dpi=dpi, bev=bev, unc_series=unc_series)
     images = [Image.open(io.BytesIO(p)).convert("RGB") for p in pngs]
     composite = images[0] if len(images) == 1 else _stack_vertical(images)
     buf = io.BytesIO()
@@ -1368,32 +1469,36 @@ def _bev_with_context(records: Sequence[Mapping[str, Any]], bev: Optional[BevOpt
 
 
 def write_graph_frames_png(
-    records: Sequence[Mapping[str, Any]], out_dir: PathLike, *, dpi: int = 110, bev: Optional[BevOptions] = None
+    records: Sequence[Mapping[str, Any]], out_dir: PathLike, *, dpi: int = 110, bev: Optional[BevOptions] = None,
+    show_uncertainty: bool = True,
 ) -> List[Path]:
     """Write one PNG per time-step frame; returns the written paths."""
     bev = _bev_with_context(records, bev)
+    unc_by_ep = build_episode_uncertainty_series(records) if show_uncertainty else {}
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: List[Path] = []
     for i, frame in enumerate(group_records_to_frames(records)):
         path = out_dir / f"frame_{i:04d}_step{frame['step']:04d}.png"
-        path.write_bytes(_frame_png_bytes(frame, dpi=dpi, bev=bev))
+        path.write_bytes(_frame_png_bytes(frame, dpi=dpi, bev=bev, unc_series=unc_by_ep.get(frame["episode"])))
         paths.append(path)
     return paths
 
 
 def write_graph_timeline_gif(
     records: Sequence[Mapping[str, Any]], out_gif: PathLike, *, fps: float = 2.0, dpi: int = 110,
-    bev: Optional[BevOptions] = None,
+    bev: Optional[BevOptions] = None, show_uncertainty: bool = True,
 ) -> Path:
     """Render frames and assemble an animated GIF (via PIL)."""
     from PIL import Image
 
     bev = _bev_with_context(records, bev)
+    unc_by_ep = build_episode_uncertainty_series(records) if show_uncertainty else {}
     frames = group_records_to_frames(records)
     images: List["Image.Image"] = []
     for frame in frames:
-        images.append(Image.open(io.BytesIO(_frame_png_bytes(frame, dpi=dpi, bev=bev))).convert("RGB"))
+        png = _frame_png_bytes(frame, dpi=dpi, bev=bev, unc_series=unc_by_ep.get(frame["episode"]))
+        images.append(Image.open(io.BytesIO(png)).convert("RGB"))
     out_gif = Path(out_gif)
     out_gif.parent.mkdir(parents=True, exist_ok=True)
     if not images:
@@ -1466,6 +1571,7 @@ def write_graph_timeline_html(
     fps: float = 2.0,
     dpi: int = 110,
     bev: Optional[BevOptions] = None,
+    show_uncertainty: bool = True,
 ) -> Path:
     """Write a self-contained interactive HTML: a time-step slider over per-step frames.
 
@@ -1473,13 +1579,14 @@ def write_graph_timeline_html(
     not a single composite image, so policy panels stay separate and fixed-size.
     """
     bev = _bev_with_context(records, bev)
+    unc_by_ep = build_episode_uncertainty_series(records) if show_uncertainty else {}
     frames = group_records_to_frames(records)
     if not frames:
         raise ValueError("no records to render into HTML")
     frame_images: List[List[str]] = []
     captions: List[str] = []
     for frame in frames:
-        pngs = _policy_png_list(frame, dpi=dpi, bev=bev)
+        pngs = _policy_png_list(frame, dpi=dpi, bev=bev, unc_series=unc_by_ep.get(frame["episode"]))
         frame_images.append([base64.b64encode(p).decode("ascii") for p in pngs])
         panels = frame["panels"]
         policy_text = " | ".join(

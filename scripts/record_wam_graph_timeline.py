@@ -201,6 +201,10 @@ def record_step(sim, out_path: Path, *, map_background: Optional[Dict[str, objec
         return False
     label, policy_id = active_policy_label(sim)
     extra = {"episode": int(getattr(sim, "_episode_count", 0) or 0)}
+    breakdown = getattr(sim, "_wam_uncertainty_breakdown", None)
+    if isinstance(breakdown, dict):
+        # Per-step motion / coverage / total uncertainty for the timeline's bottom panel.
+        extra["uncertainty"] = {k: float(v) for k, v in breakdown.items() if isinstance(v, (int, float))}
     extra.update(_timeline_world_extra(sim, graph, map_background=map_background))
     record = hetero_graph_to_record(
         graph,

@@ -78,6 +78,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=2.0)
     parser.add_argument("--dpi", type=int, default=110)
     parser.add_argument("--title", default="WAM cooperative graph timeline")
+    parser.add_argument("--no-uncertainty", dest="uncertainty", action="store_false", default=True,
+                        help="hide the bottom motion/coverage/total uncertainty-vs-step panel")
     return parser.parse_args()
 
 
@@ -110,14 +112,16 @@ def main() -> int:
         margin_m=args.bev_margin_m,
         show_candidates=not bool(args.hide_candidates),
     )
+    unc = bool(args.uncertainty)
     if args.html:
-        out = write_graph_timeline_html(records, args.html, title=args.title, fps=args.fps, dpi=args.dpi, bev=bev)
+        out = write_graph_timeline_html(records, args.html, title=args.title, fps=args.fps, dpi=args.dpi, bev=bev,
+                                        show_uncertainty=unc)
         print(f"HTML  -> {out}", flush=True)
     if args.gif:
-        out = write_graph_timeline_gif(records, args.gif, fps=args.fps, dpi=args.dpi, bev=bev)
+        out = write_graph_timeline_gif(records, args.gif, fps=args.fps, dpi=args.dpi, bev=bev, show_uncertainty=unc)
         print(f"GIF   -> {out}", flush=True)
     if args.png_dir:
-        paths = write_graph_frames_png(records, args.png_dir, dpi=args.dpi, bev=bev)
+        paths = write_graph_frames_png(records, args.png_dir, dpi=args.dpi, bev=bev, show_uncertainty=unc)
         print(f"PNG   -> {len(paths)} frames in {args.png_dir}", flush=True)
     return 0
 
