@@ -878,8 +878,10 @@ class V2VCommMixin:
         beta = float(getattr(self, "_wam_uncertainty_beta_coverage", 1.0))
         coverage_uncertainty = float(coverage.get("coverage_uncertainty", 0.0))
         total = alpha * float(motion_uncertainty) + beta * coverage_uncertainty
-        # [0,1]-normalized view (same saturation as the offline evaluator); reported only -- the coop
-        # threshold below still uses the raw ``total`` so its tuning is unchanged.
+        # [0,1]-normalized view: same saturation 1-exp(-./tau) as the offline evaluator, but applied to
+        # the online (union, notable_prob-weighted) motion uncertainty -- online has no GT so it cannot
+        # restrict to the fixed GT-notable set the offline ``*_norm_notable`` columns use. Hence these
+        # keep the plain ``_norm`` name. Reported only; the coop threshold below still uses raw ``total``.
         tau = max(float(getattr(self, "_wam_uncertainty_sigma_scale", 4.0)), 1e-6)
         a_norm = float(min(max(getattr(self, "_wam_uncertainty_alpha_norm", 0.5), 0.0), 1.0))
         motion_norm = 1.0 - math.exp(-max(float(motion_uncertainty), 0.0) / tau)

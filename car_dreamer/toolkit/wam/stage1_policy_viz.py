@@ -29,10 +29,10 @@ NOTABLE_METRICS = (
     "ade_notable",
     "fde_notable",
 )
-# [0, 1]-normalized (saturated) uncertainty variants.
+# [0, 1]-normalized (saturated) notable-task-set uncertainty variants.
 NORM_METRICS = (
-    "motion_uncertainty_norm",
-    "total_uncertainty_norm",
+    "motion_uncertainty_norm_notable",
+    "total_uncertainty_norm_notable",
 )
 METRICS = (
     "uncertainty",

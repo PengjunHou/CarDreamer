@@ -1015,13 +1015,13 @@ def evaluate_stage1_uncertainty_rows(
 ) -> List[Dict[str, object]]:
     """Run a Stage-1 model over samples and return CSV-ready uncertainty rows.
 
-    Also emits [0, 1]-normalized columns. ``motion_uncertainty_norm`` is the mean over the GT-notable
-    set (``metadata['notable_object_ids']``) of ``1 - exp(-TrΣ_o / τ)``, with un-observed notable objects
-    counted as 1 (blind-spot penalty); a step with no notable objects -> 0 (it is NOT averaged over the
-    union -- that union fallback applies only to legacy samples lacking the ``notable_object_ids`` field).
-    ``total_uncertainty_norm`` = ``alpha * motion_norm + (1-alpha) * coverage_uncertainty`` (convex, so in
-    [0, 1]). ``sigma_scale`` (τ, m²) sets the saturation scale; if ``None`` it is the median observed
-    ``TrΣ_o`` across all samples (so the values spread across [0, 1]).
+    Also emits [0, 1]-normalized columns. ``motion_uncertainty_norm_notable`` is the mean over the
+    GT-notable set (``metadata['notable_object_ids']``) of ``1 - exp(-TrΣ_o / τ)``, with un-observed
+    notable objects counted as 1 (blind-spot penalty); a step with no notable objects -> 0 (it is NOT
+    averaged over the union -- that union fallback applies only to legacy samples lacking the
+    ``notable_object_ids`` field). ``total_uncertainty_norm_notable`` =
+    ``alpha * motion_norm + (1-alpha) * coverage_uncertainty`` (convex, so in [0, 1]). ``sigma_scale``
+    (τ, m²) sets the saturation scale; if ``None`` it is the median observed ``TrΣ_o`` across all samples.
     """
     device = torch.device(device)
     model.to(device)
@@ -1129,8 +1129,8 @@ def evaluate_stage1_uncertainty_rows(
             u_vals = []
         motion_norm = float(sum(u_vals) / len(u_vals)) if u_vals else 0.0
         cov01 = min(max(float(row.get("coverage_uncertainty", 0.0)), 0.0), 1.0)
-        row["motion_uncertainty_norm"] = motion_norm
-        row["total_uncertainty_norm"] = a * motion_norm + (1.0 - a) * cov01
+        row["motion_uncertainty_norm_notable"] = motion_norm
+        row["total_uncertainty_norm_notable"] = a * motion_norm + (1.0 - a) * cov01
         row["sigma_scale"] = float(tau)
 
     if was_training:

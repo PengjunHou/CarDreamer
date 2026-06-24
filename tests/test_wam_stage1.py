@@ -568,7 +568,7 @@ class PolicyAugmentedStage1Test(unittest.TestCase):
         rows = evaluate_stage1_uncertainty_rows(WAMPerceptionModel(cfg), [sample], device="cpu",
                                                 sigma_scale=4.0, alpha=0.5)
         row = rows[0]
-        for key in ("motion_uncertainty_norm", "total_uncertainty_norm"):
+        for key in ("motion_uncertainty_norm_notable", "total_uncertainty_norm_notable"):
             self.assertIn(key, row)
             self.assertGreaterEqual(float(row[key]), 0.0)
             self.assertLessEqual(float(row[key]), 1.0)
