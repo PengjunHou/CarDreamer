@@ -37,6 +37,7 @@ class CoverageConfig:
     coverage_distance_scale_m: float = 20.0
     route_risk_distance_scale_m: float = 20.0
     u_prior: float = 1.0
+    freshness_gamma: float = 5.0  # decay rate for message-age coverage discount (exp(-gamma * age_s))
 
 
 def _world_to_ego(x: float, y: float, ego_pose: EgoPose) -> Point2D:
@@ -190,10 +191,20 @@ def _observer_quality(
     fov: float,
     sight_range: float,
     distance_scale_m: float,
+    freshness: float = 1.0,
 ) -> np.ndarray:
+    """Per-cell coverage quality of one observer, scaled by ``freshness`` in [0, 1].
+
+    ``freshness`` discounts a stale observation (e.g. an old V2V snapshot): a region that was seen a
+    while ago is less trustworthy now, so it contributes less coverage. ``freshness=1`` is a current
+    (ego / zero-latency) observation.
+    """
     out = np.zeros(route_mask.shape, dtype=np.float32)
     obs_id, ox, oy, _ = observer_pose
     scale = max(float(distance_scale_m), 1e-6)
+    fresh = float(max(min(freshness, 1.0), 0.0))
+    if fresh <= 0.0:
+        return out
     rows, cols = np.nonzero(route_mask > 0.5)
     for r, c in zip(rows, cols):
         point = (float(centers[r, c, 0]), float(centers[r, c, 1]))
@@ -202,7 +213,7 @@ def _observer_quality(
         if not _line_of_sight_clear((float(ox), float(oy)), point, actor_polygons, ignore_ids=(int(obs_id),)):
             continue
         dist = math.hypot(point[0] - float(ox), point[1] - float(oy))
-        out[r, c] = 1.0 / (1.0 + dist / scale)
+        out[r, c] = fresh / (1.0 + dist / scale)
     return out
 
 
@@ -220,7 +231,10 @@ def build_coverage_raster(
     collaborator_sight_range: float,
     config: CoverageConfig = CoverageConfig(),
     spec: BevSpec = BevSpec(),
+    collaborator_freshness: Optional[Sequence[float]] = None,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
+    """``collaborator_freshness`` (parallel to ``collaborator_observers``) discounts each collaborator's
+    coverage by message freshness in [0, 1]; omitted / ``None`` means 1.0 (fresh, e.g. zero-latency)."""
     centers = _cell_centers_world(ego_pose, spec)
     corridor = route_corridor_polyline(
         ego_pose,
@@ -253,7 +267,10 @@ def build_coverage_raster(
         distance_scale_m=float(config.coverage_distance_scale_m),
     )
     collab_quality = np.zeros_like(route_mask)
-    for obs in collaborator_observers:
+    for i, obs in enumerate(collaborator_observers):
+        freshness = 1.0
+        if collaborator_freshness is not None and i < len(collaborator_freshness):
+            freshness = float(collaborator_freshness[i])
         q = _observer_quality(
             centers,
             route_mask,
@@ -262,6 +279,7 @@ def build_coverage_raster(
             fov=float(collaborator_fov),
             sight_range=float(collaborator_sight_range),
             distance_scale_m=float(config.coverage_distance_scale_m),
+            freshness=freshness,
         )
         collab_quality = np.maximum(collab_quality, q)
 

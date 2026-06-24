@@ -24,7 +24,8 @@ def cell_for(x, y, spec=SPEC):
     return max(0, min(spec.size - 1, row)), max(0, min(spec.size - 1, col))
 
 
-def raster(*, route=((30.0, 0.0),), past=((-10.0, 0.0),), collabs=(), polygons=None, ego_fov=120.0):
+def raster(*, route=((30.0, 0.0),), past=((-10.0, 0.0),), collabs=(), collab_freshness=None,
+           polygons=None, ego_fov=120.0, ego_range=35.0):
     out, metrics = build_coverage_raster(
         ego_pose=(0.0, 0.0, 0.0),
         route_xy=route,
@@ -33,11 +34,12 @@ def raster(*, route=((30.0, 0.0),), past=((-10.0, 0.0),), collabs=(), polygons=N
         collaborator_observers=collabs,
         actor_polygons=polygons or {},
         ego_fov=ego_fov,
-        ego_sight_range=35.0,
+        ego_sight_range=ego_range,
         collaborator_fov=120.0,
         collaborator_sight_range=35.0,
         config=CFG,
         spec=SPEC,
+        collaborator_freshness=collab_freshness,
     )
     return out, metrics
 
@@ -68,6 +70,20 @@ class CoverageRasterTest(unittest.TestCase):
         self.assertGreater(float(collab[3][cell_for(27.0, 0.0)]), 0.0)
         self.assertGreater(float(collab[4][cell_for(27.0, 0.0)]), float(ego_only[4][cell_for(27.0, 0.0)]))
         self.assertLess(collab_metrics["coverage_uncertainty"], ego_metrics["coverage_uncertainty"])
+
+    def test_stale_collaborator_improves_coverage_less(self):
+        # ego can't reach the far route cells (short range); only the collaborator covers them, and its
+        # contribution is discounted by message freshness -> staler snapshot improves coverage less.
+        ego_only, ego_m = raster(ego_range=15.0)
+        fresh, fresh_m = raster(ego_range=15.0, collabs=((2, 25.0, 0.0, 0.0),), collab_freshness=(1.0,))
+        stale, stale_m = raster(ego_range=15.0, collabs=((2, 25.0, 0.0, 0.0),), collab_freshness=(0.2,))
+        far = cell_for(26.0, 0.0)
+        # the collaborator coverage at the far cell shrinks with staleness but stays positive
+        self.assertGreater(float(fresh[3][far]), float(stale[3][far]))
+        self.assertGreater(float(stale[3][far]), 0.0)
+        # coverage_uncertainty is monotone in freshness: fresh < stale < ego_only
+        self.assertLess(fresh_m["coverage_uncertainty"], stale_m["coverage_uncertainty"])
+        self.assertLess(stale_m["coverage_uncertainty"], ego_m["coverage_uncertainty"])
 
     def test_metrics_are_finite_for_empty_route(self):
         cov, _ = build_coverage_raster(

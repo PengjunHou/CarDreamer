@@ -269,6 +269,7 @@ class V2VCommMixin:
             coverage_distance_scale_m=float(getattr(coverage_cfg, "coverage_distance_scale_m", 20.0)),
             route_risk_distance_scale_m=float(getattr(coverage_cfg, "route_risk_distance_scale_m", 20.0)),
             u_prior=float(getattr(coverage_cfg, "u_prior", 1.0)),
+            freshness_gamma=float(getattr(coverage_cfg, "freshness_gamma", getattr(self, "_wam_graph_gamma_freshness", 5.0))),
         )
         self._wam_uncertainty_alpha_motion = float(getattr(coverage_cfg, "alpha_motion", 1.0))
         self._wam_uncertainty_beta_coverage = float(getattr(coverage_cfg, "beta_coverage", 1.0))
@@ -828,7 +829,11 @@ class V2VCommMixin:
         ego_pose = (float(ego_tf.location.x), float(ego_tf.location.y), float(ego_tf.rotation.yaw))
         messages = self._available_wam_messages(int(step))
         latest = self._latest_wam_messages_by_sender(messages)
+        cfg = getattr(self, "_wam_coverage_config", CoverageConfig())
+        gamma = float(getattr(cfg, "freshness_gamma", 5.0))
+        dt = float(self._comm_config.dt)
         collaborators = []
+        collaborator_freshness = []
         for sender_id, message in sorted(latest.items()):
             pose = message.data.get("pose", {})
             collaborators.append(
@@ -839,6 +844,8 @@ class V2VCommMixin:
                     float(pose.get("yaw", 0.0)),
                 )
             )
+            age_s = max(float(int(step) - int(getattr(message, "t_sense", step))) * dt, 0.0)
+            collaborator_freshness.append(math.exp(-gamma * age_s))
         raster, metrics = build_coverage_raster(
             ego_pose=ego_pose,
             route_xy=self._wam_route_xy(),
@@ -850,8 +857,9 @@ class V2VCommMixin:
             ego_sight_range=float(self._wam_local_sight_range),
             collaborator_fov=float(self._wam_collaborator_sight_fov),
             collaborator_sight_range=float(self._wam_collaborator_sight_range),
-            config=getattr(self, "_wam_coverage_config", CoverageConfig()),
+            config=cfg,
             spec=getattr(self, "_wam_bev_spec", BevSpec()),
+            collaborator_freshness=tuple(collaborator_freshness),
         )
         self._wam_coverage_raster = raster
         self._wam_coverage_step = int(step)
@@ -1608,13 +1616,20 @@ class V2VCommMixin:
         return graph
 
     def _build_wam_coverage_for_stage1_slot(self, state, messages, prediction_step: int):
-        """Rebuild one Stage-1 coverage raster using only messages selected by the recorder."""
-        del prediction_step
+        """Rebuild one Stage-1 coverage raster using only messages selected by the recorder.
+
+        Each collaborator's coverage is discounted by its message freshness ``exp(-gamma * age_s)``,
+        ``age_s = (prediction_step - t_sense) * dt`` -- a stale snapshot covers a region less reliably.
+        """
         if not bool(getattr(self, "_wam_coverage_enabled", False)):
             return None
         ego_pose = tuple(state["ego_pose"])
+        cfg = getattr(self, "_wam_coverage_config", CoverageConfig())
+        gamma = float(getattr(cfg, "freshness_gamma", 5.0))
+        dt = float(self._comm_config.dt)
         latest = self._latest_wam_messages_by_sender(messages)
         collaborators = []
+        collaborator_freshness = []
         for sender_id, message in sorted(latest.items()):
             pose = message.data.get("pose", {})
             collaborators.append(
@@ -1625,6 +1640,8 @@ class V2VCommMixin:
                     float(pose.get("yaw", 0.0)),
                 )
             )
+            age_s = max(float(int(prediction_step) - int(getattr(message, "t_sense", prediction_step))) * dt, 0.0)
+            collaborator_freshness.append(math.exp(-gamma * age_s))
         raster, _ = build_coverage_raster(
             ego_pose=ego_pose,
             route_xy=tuple(state.get("route_xy", ())),
@@ -1636,8 +1653,9 @@ class V2VCommMixin:
             ego_sight_range=float(self._wam_local_sight_range),
             collaborator_fov=float(self._wam_collaborator_sight_fov),
             collaborator_sight_range=float(self._wam_collaborator_sight_range),
-            config=getattr(self, "_wam_coverage_config", CoverageConfig()),
+            config=cfg,
             spec=getattr(self, "_wam_bev_spec", BevSpec()),
+            collaborator_freshness=tuple(collaborator_freshness),
         )
         return raster
 
