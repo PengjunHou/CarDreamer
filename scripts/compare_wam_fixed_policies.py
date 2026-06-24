@@ -79,6 +79,24 @@ def _candidate_ids(sim) -> List[int]:
     return sorted(int(actor.id) for actor in getattr(sim, "group_vehs", []) if actor is not None)
 
 
+def _nearest_candidate_id(sim, candidate_ids: Sequence[int]) -> Optional[int]:
+    """The candidate actor id nearest to ego (by current world distance), or None."""
+    ego = getattr(sim, "ego", None)
+    if ego is None or not candidate_ids:
+        return None
+    el = ego.get_transform().location
+    actors = {int(a.id): a for a in getattr(sim, "group_vehs", []) if a is not None}
+
+    def _d2(vid: int) -> float:
+        a = actors.get(int(vid))
+        if a is None:
+            return float("inf")
+        loc = a.get_transform().location
+        return (loc.x - el.x) ** 2 + (loc.y - el.y) ** 2
+
+    return min((int(v) for v in candidate_ids), key=_d2)
+
+
 def _modalities_for_policy(policy_type: str) -> Tuple[str, ...]:
     return tuple(POLICY_MODALITIES.get(str(policy_type), ()))
 
@@ -249,7 +267,9 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/wam_fixed_policy_compare"))
     parser.add_argument("--policies", default=",".join(DEFAULT_POLICIES))
-    parser.add_argument("--single-candidates", choices=("all", "first"), default="all")
+    parser.add_argument("--single-candidates", choices=("all", "first", "nearest"), default="all",
+                        help="single_candidate_* policies: one episode per candidate (all), the "
+                             "lowest-id candidate (first), or the candidate nearest to ego (nearest)")
     parser.add_argument("--bandwidth-ratio", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--print-every", type=int, default=50)
@@ -344,9 +364,13 @@ def main() -> int:
                 plans.append((policy_type, None, ()))
             elif policy_type.startswith("single_candidate_"):
                 modalities = _modalities_for_policy(policy_type)
-                count = len(discovered_candidates) if args.single_candidates == "all" else min(1, len(discovered_candidates))
-                for candidate_index in range(count):
-                    plans.append((policy_type, candidate_index, modalities))
+                if args.single_candidates == "nearest":
+                    if discovered_candidates:
+                        plans.append((policy_type, "nearest", modalities))
+                else:
+                    count = len(discovered_candidates) if args.single_candidates == "all" else min(1, len(discovered_candidates))
+                    for candidate_index in range(count):
+                        plans.append((policy_type, candidate_index, modalities))
             elif policy_type.startswith("all_candidates_"):
                 modalities = _modalities_for_policy(policy_type)
                 plans.append((policy_type, "all", modalities))
@@ -358,6 +382,12 @@ def main() -> int:
             candidates = _candidate_ids(sim)
             if candidate_selector == "all":
                 selected = tuple(candidates)
+            elif candidate_selector == "nearest":
+                nid = _nearest_candidate_id(sim, candidates)
+                if nid is None:
+                    print(f"skip {policy_type}[nearest]: no candidate after reset", flush=True)
+                    continue
+                selected = (int(nid),)
             elif isinstance(candidate_selector, int):
                 if candidate_selector >= len(candidates):
                     print(f"skip {policy_type}[candidate#{candidate_selector}]: not enough candidates after reset", flush=True)
