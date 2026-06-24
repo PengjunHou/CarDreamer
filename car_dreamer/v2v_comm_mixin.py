@@ -1261,7 +1261,7 @@ class V2VCommMixin:
         }
 
     def _wam_graph_object_visibility_sets(self, graph) -> Dict[str, set]:
-        if graph is None or OBJECT not in graph.node_types:
+        if graph is None or not hasattr(graph, "node_types") or OBJECT not in graph.node_types:
             return {"all": set(), "ego_visible": set(), "collab_only": set()}
         obj = graph[OBJECT]
         node_id = getattr(obj, "node_id", None)
@@ -1283,7 +1283,7 @@ class V2VCommMixin:
         }
 
     def _wam_graph_has_v2v_vehicle(self, graph) -> bool:
-        if graph is None or VEHICLE not in graph.node_types:
+        if graph is None or not hasattr(graph, "node_types") or VEHICLE not in graph.node_types:
             return False
         veh = graph[VEHICLE]
         node_id = getattr(veh, "node_id", None)
