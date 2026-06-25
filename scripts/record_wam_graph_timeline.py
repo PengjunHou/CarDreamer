@@ -253,12 +253,20 @@ def _cf_uncertainty(model, window, sim, state, policy, device):
         with torch.no_grad():
             out = model([g.to(device) for g in window])
         if int(out["object_node_ids"].numel()) > 0:
-            # Weight by the GT-notable label (the counterfactual graph carries notable_ids), NOT the
-            # model's soft notable_prob: a step with no notable object -> motion 0 (matches the BEV).
-            weight = out.get("labels", {}).get("notable")
-            if weight is None:
-                weight = out["notable_prob"]
-            weight = weight.detach()
+            # Weight by the t-time GT notable set (``state["notable_ids"]``) aligned to the window-union
+            # query ids -- NOT the model's soft notable_prob, and NOT heads' best-effort newest-frame
+            # label. An object that was notable but has since left the latest frame lingers in the window
+            # union with a stale ``notable=1`` (and a GRU-inflated extrapolated variance), which would
+            # keep motion non-zero (even growing) for ``history_window`` steps after it is gone. Weighting
+            # by the t-time GT set drops it, so "no notable object at t -> motion 0" -- matching the BEV /
+            # topology, which render only the latest frame. Mirrors the offline recorders'
+            # ``perception_labels_at_t`` semantics.
+            notable_set = {int(i) for i in (state.get("notable_ids", ()) or ())}
+            qids = [int(v) for v in out["object_node_ids"].detach().cpu().tolist()]
+            weight = torch.tensor(
+                [1.0 if q in notable_set else 0.0 for q in qids],
+                device=out["traj_log_var"].device,
+            )
             denom = float(weight.sum())
             if denom > 1e-6:
                 trace = torch.exp(out["traj_log_var"].detach()).sum(dim=-1).mean(dim=-1)  # [Q]
