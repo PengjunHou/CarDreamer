@@ -253,9 +253,16 @@ def _cf_uncertainty(model, window, sim, state, policy, device):
         with torch.no_grad():
             out = model([g.to(device) for g in window])
         if int(out["object_node_ids"].numel()) > 0:
-            notable_prob = out["notable_prob"].detach()
-            trace = torch.exp(out["traj_log_var"].detach()).sum(dim=-1).mean(dim=-1)  # [Q]
-            motion = float((notable_prob * trace).sum() / notable_prob.sum().clamp_min(1e-6))
+            # Weight by the GT-notable label (the counterfactual graph carries notable_ids), NOT the
+            # model's soft notable_prob: a step with no notable object -> motion 0 (matches the BEV).
+            weight = out.get("labels", {}).get("notable")
+            if weight is None:
+                weight = out["notable_prob"]
+            weight = weight.detach()
+            denom = float(weight.sum())
+            if denom > 1e-6:
+                trace = torch.exp(out["traj_log_var"].detach()).sum(dim=-1).mean(dim=-1)  # [Q]
+                motion = float((weight * trace).sum() / weight.sum().clamp_min(1e-6))
     coverage = 0.0
     cov_fn = getattr(sim, "_build_wam_coverage_for_stage1_policy", None)
     if cov_fn is not None:
