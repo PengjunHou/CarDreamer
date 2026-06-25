@@ -118,6 +118,12 @@ def parse_args() -> argparse.Namespace:
                         help="merge per-step motion/coverage/total uncertainty from this CSV "
                              "(columns episode_index, step, *_uncertainty) into the records, e.g. the "
                              "fixed_policy_uncertainty.csv from compare_wam_fixed_policies.py")
+    parser.add_argument("--unc-metric", choices=("raw", "norm"), default="raw",
+                        help="bottom panel: raw motion/coverage/total, or the [0,1]-saturated *_norm")
+    parser.add_argument("--unc-sigma-scale", type=float, default=4.0,
+                        help="tau for norm motion = 1-exp(-motion/tau) when *_norm is not in the data")
+    parser.add_argument("--unc-alpha", type=float, default=0.5,
+                        help="convex weight motion vs coverage for norm total when not in the data")
     return parser.parse_args()
 
 
@@ -154,15 +160,17 @@ def main() -> int:
         show_candidates=not bool(args.hide_candidates),
     )
     unc = bool(args.uncertainty)
+    unc_kw = dict(show_uncertainty=unc, unc_mode=args.unc_metric,
+                  unc_sigma_scale=args.unc_sigma_scale, unc_alpha=args.unc_alpha)
     if args.html:
         out = write_graph_timeline_html(records, args.html, title=args.title, fps=args.fps, dpi=args.dpi, bev=bev,
-                                        show_uncertainty=unc)
+                                        **unc_kw)
         print(f"HTML  -> {out}", flush=True)
     if args.gif:
-        out = write_graph_timeline_gif(records, args.gif, fps=args.fps, dpi=args.dpi, bev=bev, show_uncertainty=unc)
+        out = write_graph_timeline_gif(records, args.gif, fps=args.fps, dpi=args.dpi, bev=bev, **unc_kw)
         print(f"GIF   -> {out}", flush=True)
     if args.png_dir:
-        paths = write_graph_frames_png(records, args.png_dir, dpi=args.dpi, bev=bev, show_uncertainty=unc)
+        paths = write_graph_frames_png(records, args.png_dir, dpi=args.dpi, bev=bev, **unc_kw)
         print(f"PNG   -> {len(paths)} frames in {args.png_dir}", flush=True)
     return 0
 
