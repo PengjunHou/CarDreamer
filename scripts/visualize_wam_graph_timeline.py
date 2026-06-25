@@ -47,6 +47,40 @@ def _policy_matches(record, keep) -> bool:
     return bool(keep & {label, base, policy_type})
 
 
+def _merge_uncertainty_csv(records: List[dict], csv_path: Path) -> None:
+    """Inject per-step motion/coverage/total uncertainty from a CSV into ``record.extra.uncertainty``.
+
+    Matches on ``(episode_index, step)`` -> ``(extra.episode, step)`` so the timeline's bottom panel
+    can show uncertainty even when the JSONL itself does not carry it (e.g. the graph timeline written
+    by compare_wam_fixed_policies.py, whose uncertainty lives in a sibling CSV).
+    """
+    import csv as _csv
+
+    by_key = {}
+    with Path(csv_path).open(newline="", encoding="utf-8") as f:
+        for row in _csv.DictReader(f):
+            try:
+                key = (int(float(row["episode_index"])), int(float(row["step"])))
+            except (KeyError, ValueError):
+                continue
+            by_key[key] = {
+                "motion_uncertainty": float(row.get("motion_uncertainty", 0.0) or 0.0),
+                "coverage_uncertainty": float(row.get("coverage_uncertainty", 0.0) or 0.0),
+                "total_uncertainty": float(row.get("total_uncertainty", 0.0) or 0.0),
+            }
+    matched = 0
+    for rec in records:
+        extra = rec.get("extra")
+        if not isinstance(extra, dict):
+            extra = {}
+            rec["extra"] = extra
+        key = (int(extra.get("episode", 0)), int(rec.get("step", 0)))
+        if key in by_key:
+            extra["uncertainty"] = by_key[key]
+            matched += 1
+    print(f"merged uncertainty from {csv_path}: {matched}/{len(records)} records matched", flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render a recorded WAM graph timeline (JSONL).")
     parser.add_argument("--jsonl", required=True, help="input timeline JSONL")
@@ -80,6 +114,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--title", default="WAM cooperative graph timeline")
     parser.add_argument("--no-uncertainty", dest="uncertainty", action="store_false", default=True,
                         help="hide the bottom motion/coverage/total uncertainty-vs-step panel")
+    parser.add_argument("--uncertainty-csv", default=None,
+                        help="merge per-step motion/coverage/total uncertainty from this CSV "
+                             "(columns episode_index, step, *_uncertainty) into the records, e.g. the "
+                             "fixed_policy_uncertainty.csv from compare_wam_fixed_policies.py")
     return parser.parse_args()
 
 
@@ -99,6 +137,9 @@ def main() -> int:
         records = [r for r in records if _policy_matches(r, keep)]
     if not records:
         raise SystemExit(f"no records to render from {args.jsonl} (after --policies filter)")
+
+    if args.uncertainty_csv:
+        _merge_uncertainty_csv(records, Path(args.uncertainty_csv))
 
     if not (args.html or args.gif or args.png_dir):
         args.html = str(Path(args.jsonl).with_suffix(".html"))  # sensible default

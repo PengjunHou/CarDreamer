@@ -416,6 +416,7 @@ def main() -> int:
                 graph = getattr(sim, "_wam_graph", None)
                 if graph is not None:
                     stats = hetero_graph_stats(graph)
+                    breakdown = getattr(sim, "_wam_uncertainty_breakdown", None)
                     extra = {
                         "episode": int(episode_index),
                         "policy_type": str(policy_type),
@@ -423,6 +424,9 @@ def main() -> int:
                         "selected_vehicle_ids": [int(v) for v in selected],
                         "modality_by_vehicle": {str(int(k)): list(v) for k, v in policy.modalities_by_vehicle.items()},
                     }
+                    if isinstance(breakdown, dict):
+                        # Carry per-step uncertainty so the graph timeline's bottom panel renders directly.
+                        extra["uncertainty"] = {k: float(v) for k, v in breakdown.items() if isinstance(v, (int, float))}
                     record = hetero_graph_to_record(
                         graph,
                         step=step,
