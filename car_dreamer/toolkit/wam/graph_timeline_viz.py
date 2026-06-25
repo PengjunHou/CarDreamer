@@ -1299,6 +1299,7 @@ def build_episode_uncertainty_series(
 
 def _draw_uncertainty_panel(
     ax, series: Sequence[Mapping[str, float]], cur_step: Optional[int] = None, *, mode: str = "raw",
+    label: str = "",
 ) -> None:
     """Plot motion / coverage / total uncertainty vs step with a marker at ``cur_step``.
 
@@ -1321,11 +1322,14 @@ def _draw_uncertainty_panel(
             for key, color in zip(keys, colors):
                 ax.plot([cur_step], [cur[key]], marker="o", ms=4.5, color=color)
     if cur is not None:
+        prefix = f"{label} — " if label else ""
         ax.set_title(
-            f"uncertainty{' (norm)' if norm else ''} @ step {int(cur_step)}:   "
+            f"{prefix}uncertainty{' (norm)' if norm else ''} @ step {int(cur_step)}:   "
             f"motion={cur[keys[0]]:.3f}    coverage={cur[keys[1]]:.3f}    total={cur[keys[2]]:.3f}",
             fontsize=8,
         )
+    elif label:
+        ax.set_title(label, fontsize=8)
     ax.set_xlabel("step", fontsize=8)
     ax.set_ylabel("uncertainty (norm)" if norm else "uncertainty", fontsize=8)
     ax.tick_params(labelsize=7)
@@ -1338,53 +1342,60 @@ def render_graph_matplotlib(
     record: Mapping[str, Any], *, with_bev: bool = True, bev: Optional[BevOptions] = None,
     figsize: Optional[Tuple[float, float]] = None,
     unc_series: Optional[Sequence[Mapping[str, float]]] = None,
+    unc_panels: Optional[Sequence[Tuple[str, Sequence[Mapping[str, float]]]]] = None,
     cur_step: Optional[int] = None,
     unc_mode: str = "raw",
 ):
     """Render a record at a FIXED size: topology (left) + (optional) BEV (right).
 
     The size is constant across frames (independent of object count) so the HTML slider does not
-    jitter. The BEV uses the real CARLA birdeye + policy overlay when ``bev`` resolves an image for
-    this ego/step, otherwise a labelled ego-centric scatter. When ``unc_series`` (the episode's
-    motion/coverage/total uncertainty series) is given, a bottom panel plots it vs step with a marker
-    at ``cur_step``; without it the layout is unchanged (no extra axis).
+    jitter. ``unc_series`` adds one bottom uncertainty panel; ``unc_panels`` (a list of
+    ``(label, series)``) adds one stacked panel per entry -- e.g. one per policy compared on the same
+    episode. Without either, the layout is unchanged (no extra axis).
     """
-    has_unc = bool(unc_series)
-    if not with_bev:
-        if has_unc:
-            fig = plt.figure(figsize=figsize or (TOPO_WIDTH, FIG_HEIGHT + UNC_HEIGHT))
-            gs = fig.add_gridspec(2, 1, height_ratios=[FIG_HEIGHT, UNC_HEIGHT], hspace=0.4)
-            ax = fig.add_subplot(gs[0, 0])
-            ax_unc = fig.add_subplot(gs[1, 0])
+    panels: List[Tuple[str, Sequence[Mapping[str, float]]]]
+    if unc_panels:
+        panels = [(str(lbl), ser) for lbl, ser in unc_panels if ser]
+    elif unc_series:
+        panels = [("", unc_series)]
+    else:
+        panels = []
+    n = len(panels)
+
+    if n == 0:  # original layouts (kept byte-for-byte so existing callers/axes are unchanged)
+        if not with_bev:
+            fig, ax = plt.subplots(figsize=figsize or (TOPO_WIDTH, FIG_HEIGHT))
             _draw_on_ax(ax, record)
-            _draw_uncertainty_panel(ax_unc, unc_series, cur_step, mode=unc_mode)
-            fig.subplots_adjust(left=0.08, right=0.96, top=0.93, bottom=0.10)
+            fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.05)
             return fig
-        fig, ax = plt.subplots(figsize=figsize or (TOPO_WIDTH, FIG_HEIGHT))
-        _draw_on_ax(ax, record)
-        fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.05)
-        return fig
-    if has_unc:
-        fig = plt.figure(figsize=figsize or (TOPO_WIDTH + BEV_WIDTH, FIG_HEIGHT + UNC_HEIGHT))
-        gs = fig.add_gridspec(
-            2, 2, height_ratios=[FIG_HEIGHT, UNC_HEIGHT], width_ratios=[TOPO_WIDTH, BEV_WIDTH],
-            hspace=0.4, wspace=0.08,
+        fig, (ax_topo, ax_bev) = plt.subplots(
+            1, 2, figsize=figsize or (TOPO_WIDTH + BEV_WIDTH, FIG_HEIGHT),
+            gridspec_kw={"width_ratios": [TOPO_WIDTH, BEV_WIDTH]},
         )
-        ax_topo = fig.add_subplot(gs[0, 0])
-        ax_bev = fig.add_subplot(gs[0, 1])
-        ax_unc = fig.add_subplot(gs[1, :])
         _draw_on_ax(ax_topo, record)
         _draw_bev_on_ax(ax_bev, record, bev=bev)
-        _draw_uncertainty_panel(ax_unc, unc_series, cur_step, mode=unc_mode)
-        fig.subplots_adjust(left=0.04, right=0.97, top=0.93, bottom=0.09)
+        fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.06, wspace=0.08)
         return fig
-    fig, (ax_topo, ax_bev) = plt.subplots(
-        1, 2, figsize=figsize or (TOPO_WIDTH + BEV_WIDTH, FIG_HEIGHT),
-        gridspec_kw={"width_ratios": [TOPO_WIDTH, BEV_WIDTH]},
+
+    height_ratios = [FIG_HEIGHT] + [UNC_HEIGHT] * n
+    total_h = FIG_HEIGHT + n * UNC_HEIGHT
+    if not with_bev:
+        fig = plt.figure(figsize=figsize or (TOPO_WIDTH, total_h))
+        gs = fig.add_gridspec(1 + n, 1, height_ratios=height_ratios, hspace=0.5)
+        _draw_on_ax(fig.add_subplot(gs[0, 0]), record)
+        for i, (lbl, ser) in enumerate(panels):
+            _draw_uncertainty_panel(fig.add_subplot(gs[1 + i, 0]), ser, cur_step, mode=unc_mode, label=lbl)
+        fig.subplots_adjust(left=0.08, right=0.96, top=0.94, bottom=0.07)
+        return fig
+    fig = plt.figure(figsize=figsize or (TOPO_WIDTH + BEV_WIDTH, total_h))
+    gs = fig.add_gridspec(
+        1 + n, 2, height_ratios=height_ratios, width_ratios=[TOPO_WIDTH, BEV_WIDTH], hspace=0.5, wspace=0.08,
     )
-    _draw_on_ax(ax_topo, record)
-    _draw_bev_on_ax(ax_bev, record, bev=bev)
-    fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.06, wspace=0.08)
+    _draw_on_ax(fig.add_subplot(gs[0, 0]), record)
+    _draw_bev_on_ax(fig.add_subplot(gs[0, 1]), record, bev=bev)
+    for i, (lbl, ser) in enumerate(panels):
+        _draw_uncertainty_panel(fig.add_subplot(gs[1 + i, :]), ser, cur_step, mode=unc_mode, label=lbl)
+    fig.subplots_adjust(left=0.04, right=0.97, top=0.94, bottom=0.06)
     return fig
 
 
@@ -1426,13 +1437,14 @@ def _fig_to_png_bytes(fig, *, dpi: int = 110) -> bytes:
 def _policy_png_list(
     frame: Mapping[str, Any], *, dpi: int = 110, bev: Optional[BevOptions] = None,
     unc_series: Optional[Sequence[Mapping[str, float]]] = None, unc_mode: str = "raw",
+    unc_panels: Optional[Sequence[Tuple[str, Sequence[Mapping[str, float]]]]] = None,
 ) -> List[bytes]:
     """Render each policy of a frame to its own fixed-size PNG (independent images)."""
     out: List[bytes] = []
     for label in frame["panels"]:
         fig = render_graph_matplotlib(
-            frame["panels"][label], bev=bev, unc_series=unc_series, cur_step=frame.get("step"),
-            unc_mode=unc_mode,
+            frame["panels"][label], bev=bev, unc_series=unc_series, unc_panels=unc_panels,
+            cur_step=frame.get("step"), unc_mode=unc_mode,
         )
         out.append(_fig_to_png_bytes(fig, dpi=dpi))
     return out
@@ -1455,11 +1467,12 @@ def _stack_vertical(images: List) -> "Any":
 def _frame_png_bytes(
     frame: Mapping[str, Any], *, dpi: int = 110, bev: Optional[BevOptions] = None,
     unc_series: Optional[Sequence[Mapping[str, float]]] = None, unc_mode: str = "raw",
+    unc_panels: Optional[Sequence[Tuple[str, Sequence[Mapping[str, float]]]]] = None,
 ) -> bytes:
     """Render a frame as ONE image: each policy its own figure, stacked vertically (for PNG/GIF)."""
     from PIL import Image
 
-    pngs = _policy_png_list(frame, dpi=dpi, bev=bev, unc_series=unc_series, unc_mode=unc_mode)
+    pngs = _policy_png_list(frame, dpi=dpi, bev=bev, unc_series=unc_series, unc_mode=unc_mode, unc_panels=unc_panels)
     images = [Image.open(io.BytesIO(p)).convert("RGB") for p in pngs]
     composite = images[0] if len(images) == 1 else _stack_vertical(images)
     buf = io.BytesIO()
@@ -1486,16 +1499,18 @@ def _bev_with_context(records: Sequence[Mapping[str, Any]], bev: Optional[BevOpt
 def write_graph_frames_png(
     records: Sequence[Mapping[str, Any]], out_dir: PathLike, *, dpi: int = 110, bev: Optional[BevOptions] = None,
     show_uncertainty: bool = True, unc_mode: str = "raw", unc_sigma_scale: float = 4.0, unc_alpha: float = 0.5,
+    unc_panels: Optional[Sequence[Tuple[str, Sequence[Mapping[str, float]]]]] = None,
 ) -> List[Path]:
     """Write one PNG per time-step frame; returns the written paths."""
     bev = _bev_with_context(records, bev)
-    unc_by_ep = build_episode_uncertainty_series(records, sigma_scale=unc_sigma_scale, alpha=unc_alpha) if show_uncertainty else {}
+    unc_by_ep = {} if (unc_panels or not show_uncertainty) else build_episode_uncertainty_series(records, sigma_scale=unc_sigma_scale, alpha=unc_alpha)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: List[Path] = []
     for i, frame in enumerate(group_records_to_frames(records)):
         path = out_dir / f"frame_{i:04d}_step{frame['step']:04d}.png"
-        path.write_bytes(_frame_png_bytes(frame, dpi=dpi, bev=bev, unc_series=unc_by_ep.get(frame["episode"]), unc_mode=unc_mode))
+        path.write_bytes(_frame_png_bytes(frame, dpi=dpi, bev=bev, unc_series=unc_by_ep.get(frame["episode"]),
+                                          unc_mode=unc_mode, unc_panels=unc_panels))
         paths.append(path)
     return paths
 
@@ -1504,16 +1519,18 @@ def write_graph_timeline_gif(
     records: Sequence[Mapping[str, Any]], out_gif: PathLike, *, fps: float = 2.0, dpi: int = 110,
     bev: Optional[BevOptions] = None, show_uncertainty: bool = True, unc_mode: str = "raw",
     unc_sigma_scale: float = 4.0, unc_alpha: float = 0.5,
+    unc_panels: Optional[Sequence[Tuple[str, Sequence[Mapping[str, float]]]]] = None,
 ) -> Path:
     """Render frames and assemble an animated GIF (via PIL)."""
     from PIL import Image
 
     bev = _bev_with_context(records, bev)
-    unc_by_ep = build_episode_uncertainty_series(records, sigma_scale=unc_sigma_scale, alpha=unc_alpha) if show_uncertainty else {}
+    unc_by_ep = {} if (unc_panels or not show_uncertainty) else build_episode_uncertainty_series(records, sigma_scale=unc_sigma_scale, alpha=unc_alpha)
     frames = group_records_to_frames(records)
     images: List["Image.Image"] = []
     for frame in frames:
-        png = _frame_png_bytes(frame, dpi=dpi, bev=bev, unc_series=unc_by_ep.get(frame["episode"]), unc_mode=unc_mode)
+        png = _frame_png_bytes(frame, dpi=dpi, bev=bev, unc_series=unc_by_ep.get(frame["episode"]),
+                               unc_mode=unc_mode, unc_panels=unc_panels)
         images.append(Image.open(io.BytesIO(png)).convert("RGB"))
     out_gif = Path(out_gif)
     out_gif.parent.mkdir(parents=True, exist_ok=True)
@@ -1591,6 +1608,7 @@ def write_graph_timeline_html(
     unc_mode: str = "raw",
     unc_sigma_scale: float = 4.0,
     unc_alpha: float = 0.5,
+    unc_panels: Optional[Sequence[Tuple[str, Sequence[Mapping[str, float]]]]] = None,
 ) -> Path:
     """Write a self-contained interactive HTML: a time-step slider over per-step frames.
 
@@ -1598,14 +1616,15 @@ def write_graph_timeline_html(
     not a single composite image, so policy panels stay separate and fixed-size.
     """
     bev = _bev_with_context(records, bev)
-    unc_by_ep = build_episode_uncertainty_series(records, sigma_scale=unc_sigma_scale, alpha=unc_alpha) if show_uncertainty else {}
+    unc_by_ep = {} if (unc_panels or not show_uncertainty) else build_episode_uncertainty_series(records, sigma_scale=unc_sigma_scale, alpha=unc_alpha)
     frames = group_records_to_frames(records)
     if not frames:
         raise ValueError("no records to render into HTML")
     frame_images: List[List[str]] = []
     captions: List[str] = []
     for frame in frames:
-        pngs = _policy_png_list(frame, dpi=dpi, bev=bev, unc_series=unc_by_ep.get(frame["episode"]), unc_mode=unc_mode)
+        pngs = _policy_png_list(frame, dpi=dpi, bev=bev, unc_series=unc_by_ep.get(frame["episode"]),
+                                unc_mode=unc_mode, unc_panels=unc_panels)
         frame_images.append([base64.b64encode(p).decode("ascii") for p in pngs])
         panels = frame["panels"]
         policy_text = " | ".join(

@@ -81,6 +81,36 @@ def _merge_uncertainty_csv(records: List[dict], csv_path: Path) -> None:
     print(f"merged uncertainty from {csv_path}: {matched}/{len(records)} records matched", flush=True)
 
 
+def _policy_series_from_csv(csv_path: Path, token: str, *, sigma_scale: float, alpha: float) -> list:
+    """Per-step uncertainty series for one policy (matched by policy_type / label / label-prefix)."""
+    import csv as _csv
+    import math
+
+    tau = max(float(sigma_scale), 1e-6)
+    a = float(min(max(alpha, 0.0), 1.0))
+    by_step = {}
+    with Path(csv_path).open(newline="", encoding="utf-8") as f:
+        for row in _csv.DictReader(f):
+            label = str(row.get("policy_label", ""))
+            if token not in {str(row.get("policy_type", "")), label, label.split("[", 1)[0]}:
+                continue
+            try:
+                step = int(float(row["step"]))
+            except (KeyError, ValueError):
+                continue
+            if step in by_step:
+                continue
+            motion = float(row.get("motion_uncertainty", 0.0) or 0.0)
+            coverage = float(row.get("coverage_uncertainty", 0.0) or 0.0)
+            total = float(row.get("total_uncertainty", motion + coverage) or 0.0)
+            cov01 = min(max(coverage, 0.0), 1.0)
+            motion_norm = float(row.get("motion_uncertainty_norm", 1.0 - math.exp(-max(motion, 0.0) / tau)) or 0.0)
+            total_norm = float(row.get("total_uncertainty_norm", a * motion_norm + (1.0 - a) * cov01) or 0.0)
+            by_step[step] = {"step": step, "motion": motion, "coverage": coverage, "total": total,
+                             "motion_norm": motion_norm, "coverage_norm": cov01, "total_norm": total_norm}
+    return [by_step[s] for s in sorted(by_step)]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render a recorded WAM graph timeline (JSONL).")
     parser.add_argument("--jsonl", required=True, help="input timeline JSONL")
@@ -120,6 +150,10 @@ def parse_args() -> argparse.Namespace:
                              "fixed_policy_uncertainty.csv from compare_wam_fixed_policies.py")
     parser.add_argument("--unc-metric", choices=("raw", "norm"), default="raw",
                         help="bottom panel: raw motion/coverage/total, or the [0,1]-saturated *_norm")
+    parser.add_argument("--compare-policies", default=None,
+                        help="comma-separated policy types/labels to draw as STACKED bottom panels "
+                             "(one per policy, matched by step) from --uncertainty-csv, e.g. "
+                             "single_candidate_objlist,ego_only. Requires --uncertainty-csv.")
     parser.add_argument("--unc-sigma-scale", type=float, default=4.0,
                         help="tau for norm motion = 1-exp(-motion/tau) when *_norm is not in the data")
     parser.add_argument("--unc-alpha", type=float, default=0.5,
@@ -144,7 +178,21 @@ def main() -> int:
     if not records:
         raise SystemExit(f"no records to render from {args.jsonl} (after --policies filter)")
 
-    if args.uncertainty_csv:
+    unc_panels = None
+    if args.compare_policies:
+        if not args.uncertainty_csv:
+            raise SystemExit("--compare-policies requires --uncertainty-csv")
+        tokens = [t.strip() for t in args.compare_policies.split(",") if t.strip()]
+        unc_panels = []
+        for tok in tokens:
+            series = _policy_series_from_csv(Path(args.uncertainty_csv), tok,
+                                             sigma_scale=args.unc_sigma_scale, alpha=args.unc_alpha)
+            if series:
+                unc_panels.append((tok, series))
+            else:
+                print(f"warning: no rows for policy {tok!r} in {args.uncertainty_csv}", flush=True)
+        print(f"compare panels: {[lbl for lbl, _ in unc_panels]}", flush=True)
+    elif args.uncertainty_csv:
         _merge_uncertainty_csv(records, Path(args.uncertainty_csv))
 
     if not (args.html or args.gif or args.png_dir):
@@ -161,7 +209,7 @@ def main() -> int:
     )
     unc = bool(args.uncertainty)
     unc_kw = dict(show_uncertainty=unc, unc_mode=args.unc_metric,
-                  unc_sigma_scale=args.unc_sigma_scale, unc_alpha=args.unc_alpha)
+                  unc_sigma_scale=args.unc_sigma_scale, unc_alpha=args.unc_alpha, unc_panels=unc_panels)
     if args.html:
         out = write_graph_timeline_html(records, args.html, title=args.title, fps=args.fps, dpi=args.dpi, bev=bev,
                                         **unc_kw)

@@ -400,6 +400,20 @@ class RenderAndWriteTest(unittest.TestCase):
         self.assertEqual(len(fig2.axes), 2)
         matplotlib.pyplot.close(fig2)
 
+    def test_unc_panels_stacks_one_axis_per_policy(self):
+        import matplotlib
+
+        rec = self._records()[2]
+        ser = [{"step": s, "motion": 0.1 * s, "coverage": 0.2, "total": 0.1 * s + 0.2,
+                "motion_norm": 1 - 2.718 ** (-0.1 * s), "coverage_norm": 0.2, "total_norm": 0.3} for s in range(5)]
+        fig = render_graph_matplotlib(rec, unc_panels=[("nearest", ser), ("ego_only", ser)], cur_step=2,
+                                      unc_mode="norm")
+        self.assertEqual(len(fig.axes), 4)  # topo + bev + 2 stacked uncertainty panels
+        titles = " ".join(ax.get_title() for ax in fig.axes)
+        self.assertIn("nearest", titles)
+        self.assertIn("ego_only", titles)
+        matplotlib.pyplot.close(fig)
+
     def test_writers_embed_uncertainty_when_present(self):
         recs = self._records()
         for i, r in enumerate(recs):
