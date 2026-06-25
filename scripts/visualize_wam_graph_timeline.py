@@ -81,6 +81,35 @@ def _merge_uncertainty_csv(records: List[dict], csv_path: Path) -> None:
     print(f"merged uncertainty from {csv_path}: {matched}/{len(records)} records matched", flush=True)
 
 
+def _policy_series_from_records(records: List[dict], token: str, *, sigma_scale: float, alpha: float) -> list:
+    """Per-step uncertainty series for one policy from records' ``extra.uncertainty`` (counterfactual JSONL)."""
+    import math
+
+    tau = max(float(sigma_scale), 1e-6)
+    a = float(min(max(alpha, 0.0), 1.0))
+    by_step = {}
+    for rec in records:
+        label = str(rec.get("policy_label", ""))
+        if token not in {label, label.split("[", 1)[0]}:
+            continue
+        extra = rec.get("extra") or {}
+        unc = extra.get("uncertainty") if isinstance(extra, dict) else None
+        if not isinstance(unc, dict):
+            continue
+        step = int(rec.get("step", 0))
+        if step in by_step:
+            continue
+        motion = float(unc.get("motion_uncertainty", 0.0))
+        coverage = float(unc.get("coverage_uncertainty", 0.0))
+        total = float(unc.get("total_uncertainty", motion + coverage))
+        cov01 = min(max(coverage, 0.0), 1.0)
+        motion_norm = float(unc.get("motion_uncertainty_norm", 1.0 - math.exp(-max(motion, 0.0) / tau)))
+        total_norm = float(unc.get("total_uncertainty_norm", a * motion_norm + (1.0 - a) * cov01))
+        by_step[step] = {"step": step, "motion": motion, "coverage": coverage, "total": total,
+                         "motion_norm": motion_norm, "coverage_norm": cov01, "total_norm": total_norm}
+    return [by_step[s] for s in sorted(by_step)]
+
+
 def _policy_series_from_csv(csv_path: Path, token: str, *, sigma_scale: float, alpha: float) -> list:
     """Per-step uncertainty series for one policy (matched by policy_type / label / label-prefix)."""
     import csv as _csv
@@ -171,28 +200,35 @@ def main() -> int:
         write_graph_timeline_html,
     )
 
-    records = load_records_jsonl(args.jsonl)
+    all_records = load_records_jsonl(args.jsonl)
+
+    # Stacked per-policy bottom panels are built from the FULL record set (or a CSV), before the
+    # --policies frame filter, so the topology/BEV can show one policy while the panels show several.
+    unc_panels = None
+    if args.compare_policies:
+        tokens = [t.strip() for t in args.compare_policies.split(",") if t.strip()]
+        unc_panels = []
+        for tok in tokens:
+            if args.uncertainty_csv:
+                series = _policy_series_from_csv(Path(args.uncertainty_csv), tok,
+                                                 sigma_scale=args.unc_sigma_scale, alpha=args.unc_alpha)
+            else:  # counterfactual JSONL: uncertainty rides in each policy record's extra
+                series = _policy_series_from_records(all_records, tok,
+                                                     sigma_scale=args.unc_sigma_scale, alpha=args.unc_alpha)
+            if series:
+                unc_panels.append((tok, series))
+            else:
+                print(f"warning: no uncertainty rows for policy {tok!r}", flush=True)
+        print(f"compare panels: {[lbl for lbl, _ in unc_panels]}", flush=True)
+
+    records = all_records
     if args.policies:
         keep = {p.strip() for p in args.policies.split(",") if p.strip()}
         records = [r for r in records if _policy_matches(r, keep)]
     if not records:
         raise SystemExit(f"no records to render from {args.jsonl} (after --policies filter)")
 
-    unc_panels = None
-    if args.compare_policies:
-        if not args.uncertainty_csv:
-            raise SystemExit("--compare-policies requires --uncertainty-csv")
-        tokens = [t.strip() for t in args.compare_policies.split(",") if t.strip()]
-        unc_panels = []
-        for tok in tokens:
-            series = _policy_series_from_csv(Path(args.uncertainty_csv), tok,
-                                             sigma_scale=args.unc_sigma_scale, alpha=args.unc_alpha)
-            if series:
-                unc_panels.append((tok, series))
-            else:
-                print(f"warning: no rows for policy {tok!r} in {args.uncertainty_csv}", flush=True)
-        print(f"compare panels: {[lbl for lbl, _ in unc_panels]}", flush=True)
-    elif args.uncertainty_csv:
+    if args.uncertainty_csv and not args.compare_policies:
         _merge_uncertainty_csv(records, Path(args.uncertainty_csv))
 
     if not (args.html or args.gif or args.png_dir):

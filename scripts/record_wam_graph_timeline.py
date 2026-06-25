@@ -217,6 +217,111 @@ def record_step(sim, out_path: Path, *, map_background: Optional[Dict[str, objec
     return True
 
 
+def _cf_policy_specs(state, tokens):
+    """Return ``[(label, WAMPolicy), ...]`` for the requested counterfactual policies."""
+    from car_dreamer.toolkit.wam import WAMPolicy
+
+    ego = state["ego"]
+    collabs = list(state.get("collaborators", ()))
+    specs = []
+    for tok in tokens:
+        tok = str(tok).strip()
+        if tok == "ego_only":
+            specs.append(("ego_only", WAMPolicy((), {}, {}, 5, "cf")))
+        elif tok in ("nearest_single", "single_nearest"):
+            if collabs:
+                nearest = min(collabs, key=lambda c: (float(c.x) - float(ego.x)) ** 2 + (float(c.y) - float(ego.y)) ** 2)
+                nid = int(nearest.actor_id)
+                specs.append((f"single_nearest[{nid}]", WAMPolicy((nid,), {nid: "objlist"}, {nid: 1.0}, 5, "cf")))
+        elif tok == "all_candidates":
+            ids = tuple(int(c.actor_id) for c in collabs)
+            if ids:
+                specs.append(("all_candidates", WAMPolicy(ids, {i: "objlist" for i in ids}, {i: 1.0 for i in ids}, 5, "cf")))
+    return specs
+
+
+def _cf_uncertainty(model, window, sim, state, policy, device):
+    """Per-policy motion (model) + coverage uncertainty (+ [0,1] norm) for one counterfactual graph window."""
+    import math
+
+    import torch
+
+    from car_dreamer.toolkit.wam import coverage_metrics
+
+    motion = 0.0
+    if window:
+        with torch.no_grad():
+            out = model([g.to(device) for g in window])
+        if int(out["object_node_ids"].numel()) > 0:
+            notable_prob = out["notable_prob"].detach()
+            trace = torch.exp(out["traj_log_var"].detach()).sum(dim=-1).mean(dim=-1)  # [Q]
+            motion = float((notable_prob * trace).sum() / notable_prob.sum().clamp_min(1e-6))
+    coverage = 0.0
+    cov_fn = getattr(sim, "_build_wam_coverage_for_stage1_policy", None)
+    if cov_fn is not None:
+        raster = cov_fn(state, policy)
+        if raster is not None:
+            coverage = float(coverage_metrics(raster).get("coverage_uncertainty", 0.0))
+    tau, a = 4.0, 0.5
+    motion_norm = 1.0 - math.exp(-max(motion, 0.0) / tau)
+    cov01 = min(max(coverage, 0.0), 1.0)
+    return {
+        "motion_uncertainty": motion,
+        "coverage_uncertainty": coverage,
+        "total_uncertainty": motion + coverage,
+        "motion_uncertainty_norm": motion_norm,
+        "total_uncertainty_norm": a * motion_norm + (1.0 - a) * cov01,
+    }
+
+
+def record_counterfactual_step(sim, model, windows, out_path, *, tokens, history_window, device,
+                               map_background=None):
+    """One rollout step: build + record a per-policy graph and uncertainty for each counterfactual policy."""
+    from collections import deque
+
+    from car_dreamer.toolkit.wam import (
+        BevSpec,
+        GraphBuildSpec,
+        append_record_jsonl,
+        build_stage1_policy_graph,
+        hetero_graph_to_record,
+    )
+
+    state_fn = getattr(sim, "_wam_stage1_slot_state", None)
+    if state_fn is None:
+        return False
+    step = int(getattr(sim, "_time_step", 0))
+    state = state_fn(step)
+    spec = GraphBuildSpec(
+        route_waypoints=int(getattr(sim, "_wam_graph_route_waypoints", 16)),
+        max_object_nodes=int(getattr(sim, "_wam_graph_max_object_nodes", 32)),
+    )
+    bev_spec = getattr(sim, "_wam_bev_spec", BevSpec())
+    world_extra = _timeline_world_extra(sim, getattr(sim, "_wam_graph", None), map_background=map_background)
+    episode = int(getattr(sim, "_episode_count", 0) or 0)
+    wrote = False
+    for label, policy in _cf_policy_specs(state, tokens):
+        graph = build_stage1_policy_graph(
+            ego=state["ego"], collaborators=tuple(state.get("collaborators", ())),
+            objects=tuple(state.get("live_states", ())), policy=policy, spec=spec,
+            notable_ids=state.get("notable_ids", ()), latency_by_vehicle={}, bev_spec=bev_spec,
+            bev_payload_mode=str(getattr(sim, "_wam_bev_payload_mode", "feature")),
+            bev_feature_dim=int(getattr(sim, "_wam_bev_feature_dim", 256)),
+            bev_feature_dtype_bytes=int(getattr(sim, "_wam_bev_feature_dtype_bytes", 4)),
+            gamma_freshness=float(getattr(sim, "_wam_graph_gamma_freshness", 5.0)),
+            overhead_bytes=int(getattr(sim, "_comm_overhead_bytes", 64)),
+        )
+        win = windows.setdefault(label.split("[", 1)[0], deque(maxlen=int(history_window) + 1))
+        win.append(graph)
+        unc = _cf_uncertainty(model, list(win), sim, state, policy, device)
+        extra = {"episode": episode, "uncertainty": unc, "counterfactual": True}
+        extra.update(world_extra)
+        rec = hetero_graph_to_record(graph, step=step, policy_label=label, extra=extra)
+        append_record_jsonl(rec, out_path)
+        wrote = True
+    return wrote
+
+
 def parse_args() -> Tuple[argparse.Namespace, List[str]]:
     parser = argparse.ArgumentParser(description="Record the per-step WAM cooperative graph to JSONL.")
     parser.add_argument("--task", default="carla_group_right_turn_auto")
@@ -235,6 +340,12 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
     parser.add_argument("--map-background-ppm", type=float, default=4.0,
                         help="pixels per meter for the generated global map background.")
     parser.add_argument("--no-display", dest="display", action="store_false", default=False)
+    parser.add_argument("--counterfactual", action="store_true", default=False,
+                        help="record, in ONE rollout, a per-step graph + uncertainty for EACH --cf-policies "
+                             "on the same scene (counterfactual). Needs env.wam.predictor_mode=checkpoint.")
+    parser.add_argument("--cf-policies", default="ego_only,nearest_single",
+                        help="counterfactual policies to record per step: any of ego_only, nearest_single, "
+                             "all_candidates (comma-separated)")
     known, passthrough = parser.parse_known_args()
     passthrough = [arg for arg in passthrough if arg != "--"]
     return known, passthrough
@@ -258,12 +369,31 @@ def main() -> int:
 
     env.reset(seed=known.seed)
     map_background = _write_map_background(sim, out_path, pixels_per_meter=known.map_background_ppm) if known.map_background else None
+
+    cf_model = cf_windows = cf_device = cf_tokens = cf_history = None
+    if known.counterfactual:
+        loader = getattr(sim, "_load_wam_predictor", None)
+        if loader is None:
+            raise SystemExit("--counterfactual needs a checkpoint predictor; pass "
+                             "--env.wam.predictor_mode=checkpoint --env.wam.predictor_checkpoint=<path>")
+        cf_model = loader()
+        cf_device = getattr(sim, "_wam_predictor_device_resolved", None) or sim._resolve_wam_predictor_device()
+        cf_history = int(getattr(sim, "_wam_predictor_history_window", 4))
+        cf_tokens = [t.strip() for t in str(known.cf_policies).split(",") if t.strip()]
+        cf_windows = {}
+        print(f"counterfactual recording: policies={cf_tokens} history_window={cf_history}", flush=True)
+
     recorded = 0
     try:
         # Single-episode recording: run until the episode ends (or the --steps cap), then stop.
         for step in range(known.steps):
             _, _, terminated, truncated, _ = env.step(env.action_space.sample())
-            if record_step(sim, out_path, map_background=map_background):
+            if known.counterfactual:
+                if record_counterfactual_step(sim, cf_model, cf_windows, out_path, tokens=cf_tokens,
+                                              history_window=cf_history, device=cf_device,
+                                              map_background=map_background):
+                    recorded += 1
+            elif record_step(sim, out_path, map_background=map_background):
                 recorded += 1
             if step % known.print_every == 0:
                 label, pid = active_policy_label(sim)
