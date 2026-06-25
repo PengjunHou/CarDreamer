@@ -171,6 +171,16 @@ class LossAndUncertaintyTest(unittest.TestCase):
         u_gated = float(policy_uncertainty(p, log_var, gate_k=12.0))
         self.assertLess(u_gated, u_raw)
 
+    def test_mass_floor_drops_uncertainty_when_no_confident_notable(self):
+        import math
+
+        p = torch.tensor([0.1, 0.1])                       # nothing confidently notable
+        log_var = torch.full((2, 1, 2), math.log(5.0))     # TrSigma = 5 + 5 = 10 per object
+        u = float(policy_uncertainty(p, log_var, gate_k=12.0))                    # no floor -> ~mean trace (gate cancels)
+        u_floor = float(policy_uncertainty(p, log_var, gate_k=12.0, mass_floor=1.0))
+        self.assertGreater(u, 8.0)                          # ~10
+        self.assertLess(u_floor, 0.3 * u)                  # floor strongly suppresses with no notable mass
+
     def test_policy_uncertainty_matches_manual_formula(self):
         notable_prob = torch.tensor([1.0, 0.0])
         log_var = torch.zeros(2, 2, 2)  # trace = exp(0)+exp(0) = 2 per step

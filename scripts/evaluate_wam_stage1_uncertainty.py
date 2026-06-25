@@ -36,6 +36,9 @@ def parse_args() -> argparse.Namespace:
                         help="soft-gate the notable_prob weight w=sigmoid(k*(p-0.5)) for the soft "
                              "motion_uncertainty column; 0=off. Pass the same k as the online run "
                              "(env.wam.coverage.notable_gate_k, default 8) to match it.")
+    parser.add_argument("--notable-mass-floor", type=float, default=0.0,
+                        help="denominator floor c in U=Sum(w*Tr)/(Sum(w)+c) (units: objects); no "
+                             "confident notable -> ~0 instead of mean trace. 0=off. Online default 1.")
     return parser.parse_args()
 
 
@@ -70,6 +73,7 @@ def main() -> int:
     rows = evaluate_stage1_uncertainty_rows(
         model, dataset, device=args.device, limit=args.limit,
         sigma_scale=args.sigma_scale, alpha=args.alpha, notable_gate_k=args.notable_gate_k,
+        notable_mass_floor=args.notable_mass_floor,
     )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)

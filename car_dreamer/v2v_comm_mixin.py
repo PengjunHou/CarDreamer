@@ -280,6 +280,9 @@ class V2VCommMixin:
         # Soft-gate the (no-GT) notable_prob weight: w = sigmoid(k*(p - tau)). k=0 disables (raw prob).
         self._wam_uncertainty_notable_gate_k = float(getattr(coverage_cfg, "notable_gate_k", 8.0))
         self._wam_uncertainty_notable_gate_threshold = float(getattr(coverage_cfg, "notable_gate_threshold", 0.5))
+        # Denominator floor (units: notable objects): no confident notable -> motion ~0 instead of the
+        # gate-cancelling mean trace. 0 disables (plain weighted mean).
+        self._wam_uncertainty_notable_mass_floor = float(getattr(coverage_cfg, "notable_mass_floor", 1.0))
         seed = getattr(random_policy_cfg, "seed", None)
         self._wam_policy_rng = np.random.default_rng(None if seed is None else int(seed))
 
@@ -1388,10 +1391,11 @@ class V2VCommMixin:
         gate_k = float(getattr(self, "_wam_uncertainty_notable_gate_k", 0.0))
         gate_thr = float(getattr(self, "_wam_uncertainty_notable_gate_threshold", 0.5))
         weight = torch.sigmoid(gate_k * (notable_prob - gate_thr)) if gate_k > 0 else notable_prob
+        mass_floor = float(getattr(self, "_wam_uncertainty_notable_mass_floor", 0.0))
         trace = torch.exp(out["traj_log_var"].detach()).sum(dim=-1)  # [Q, H]
         uncertainty = trace.mean(dim=-1)
         motion_uncertainty = float(
-            (weight * uncertainty).sum() / weight.sum().clamp_min(1e-6)
+            (weight * uncertainty).sum() / (weight.sum() + mass_floor).clamp_min(1e-6)
         )
         source = str(getattr(self, "_wam_predictor_uncertainty_source", "notable_weighted_trace"))
         score = weight * uncertainty if source == "notable_weighted_trace" else uncertainty

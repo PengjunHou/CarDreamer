@@ -332,22 +332,24 @@ def policy_uncertainty(
     valid_mask: Optional[torch.Tensor] = None,
     gate_k: Optional[float] = None,
     gate_threshold: float = 0.5,
+    mass_floor: float = 0.0,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """§11.2 policy-evaluation uncertainty ``U^π_e(t)`` = notable-weighted mean of ``Tr(Σ)``.
 
-    When ``gate_k`` is given (and > 0) the soft weight is ``σ(gate_k·(notable_prob − gate_threshold))``
-    instead of the raw ``notable_prob``, sharpening the average toward confidently-notable objects.
+    Per object: ``w_o = notable_prob_o`` (or ``σ(gate_k·(p−gate_threshold))`` when ``gate_k>0``), then
+    ``U = Σ_o w_o·TrΣ_o / (Σ_o w_o + mass_floor)``. ``mass_floor`` (units: objects) keeps the denominator
+    from collapsing: with no confident-notable object (``Σw ≪ mass_floor``) the value -> ~0 instead of
+    the (gate-cancelling) mean trace; with enough notable mass (``Σw ≫ mass_floor``) it is the usual
+    weighted average. ``mass_floor=0`` is the plain weighted mean.
     """
     if log_var.numel() == 0:
         return log_var.new_zeros(())
-    trace = torch.exp(log_var).sum(dim=-1)  # [Q, H]
-    gated = notable_soft_gate(notable_prob, gate_k, gate_threshold) if (gate_k and gate_k > 0) else notable_prob
-    weight = gated.unsqueeze(-1)
-    if valid_mask is not None:
-        weight = weight * valid_mask
-    weight = weight.expand_as(trace)
-    return (weight * trace).sum() / weight.sum().clamp_min(eps)
+    trace_o = per_object_trace(log_var, valid_mask=valid_mask)  # [Q] mean over (valid) horizon
+    w = notable_soft_gate(notable_prob, gate_k, gate_threshold) if (gate_k and gate_k > 0) else notable_prob
+    if valid_mask is not None:  # drop objects with no valid future step (as the old weight*mask did)
+        w = w * (valid_mask.to(w.dtype).sum(dim=-1) > 0).to(w.dtype)
+    return (w * trace_o).sum() / (w.sum() + float(mass_floor)).clamp_min(eps)
 
 
 def per_object_trace(log_var: torch.Tensor, *, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
