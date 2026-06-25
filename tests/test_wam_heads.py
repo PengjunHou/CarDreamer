@@ -157,6 +157,20 @@ class LossAndUncertaintyTest(unittest.TestCase):
         nll = gaussian_trajectory_nll(mu, log_var, target, notable_weight=notable, valid_mask=valid)
         self.assertAlmostEqual(float(nll), 0.0, places=5)
 
+    def test_notable_soft_gate_suppresses_unsure_objects(self):
+        from car_dreamer.toolkit.wam.heads import notable_soft_gate
+
+        p = torch.tensor([0.1, 0.9])
+        g = notable_soft_gate(p, gate_k=12.0)
+        self.assertLess(float(g[0]), 0.05)   # below 0.5 -> ~0
+        self.assertGreater(float(g[1]), 0.95)  # above 0.5 -> ~1
+        # object 0 has a huge predicted variance but low notable_prob -> the gate downweights it
+        log_var = torch.zeros(2, 1, 2)
+        log_var[0] = 3.0
+        u_raw = float(policy_uncertainty(p, log_var))
+        u_gated = float(policy_uncertainty(p, log_var, gate_k=12.0))
+        self.assertLess(u_gated, u_raw)
+
     def test_policy_uncertainty_matches_manual_formula(self):
         notable_prob = torch.tensor([1.0, 0.0])
         log_var = torch.zeros(2, 2, 2)  # trace = exp(0)+exp(0) = 2 per step

@@ -1012,6 +1012,7 @@ def evaluate_stage1_uncertainty_rows(
     limit: Optional[int] = None,
     sigma_scale: Optional[float] = None,
     alpha: float = 0.5,
+    notable_gate_k: float = 0.0,
 ) -> List[Dict[str, object]]:
     """Run a Stage-1 model over samples and return CSV-ready uncertainty rows.
 
@@ -1053,7 +1054,8 @@ def evaluate_stage1_uncertainty_rows(
                 sample["target_xy"].to(device),
                 sample["valid"].to(device),
             )
-            uncertainty = float(policy_uncertainty(out["notable_prob"], out["traj_log_var"], valid_mask=val))
+            uncertainty = float(policy_uncertainty(out["notable_prob"], out["traj_log_var"], valid_mask=val,
+                                                    gate_k=notable_gate_k))
             rec_labels = sample.get("perception_labels")
             if rec_labels is not None:
                 notable = _align_labels(out["object_node_ids"], sample["object_node_ids"], rec_labels, device).get("notable")

@@ -315,18 +315,35 @@ def gaussian_trajectory_nll(
     return weighted.sum() / weight.sum().clamp_min(eps)
 
 
+def notable_soft_gate(notable_prob: torch.Tensor, gate_k: float, threshold: float = 0.5) -> torch.Tensor:
+    """Differentiable soft threshold ``σ(k·(p − τ))`` -- a smooth 0/1 gate on the notable probability.
+
+    A temperature sigmoid: ``p < τ`` -> ~0, ``p > τ`` -> ~1, smooth everywhere (so it is safe for
+    Stage-2 diffusion gradients, unlike a hard ``p > τ`` step). Larger ``gate_k`` is sharper. Used to
+    suppress objects the model is unsure about before the notable-weighted uncertainty average.
+    """
+    return torch.sigmoid(float(gate_k) * (notable_prob - float(threshold)))
+
+
 def policy_uncertainty(
     notable_prob: torch.Tensor,
     log_var: torch.Tensor,
     *,
     valid_mask: Optional[torch.Tensor] = None,
+    gate_k: Optional[float] = None,
+    gate_threshold: float = 0.5,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """§11.2 policy-evaluation uncertainty ``U^π_e(t)`` = notable-weighted mean of ``Tr(Σ)``."""
+    """§11.2 policy-evaluation uncertainty ``U^π_e(t)`` = notable-weighted mean of ``Tr(Σ)``.
+
+    When ``gate_k`` is given (and > 0) the soft weight is ``σ(gate_k·(notable_prob − gate_threshold))``
+    instead of the raw ``notable_prob``, sharpening the average toward confidently-notable objects.
+    """
     if log_var.numel() == 0:
         return log_var.new_zeros(())
     trace = torch.exp(log_var).sum(dim=-1)  # [Q, H]
-    weight = notable_prob.unsqueeze(-1)
+    gated = notable_soft_gate(notable_prob, gate_k, gate_threshold) if (gate_k and gate_k > 0) else notable_prob
+    weight = gated.unsqueeze(-1)
     if valid_mask is not None:
         weight = weight * valid_mask
     weight = weight.expand_as(trace)

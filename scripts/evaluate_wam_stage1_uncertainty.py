@@ -32,6 +32,10 @@ def parse_args() -> argparse.Namespace:
                         help="tau (m^2) for the [0,1] saturation 1-exp(-TrSigma/tau); default=auto (median TrSigma)")
     parser.add_argument("--alpha", type=float, default=0.5,
                         help="convex weight on motion vs coverage for total_uncertainty_norm (in [0,1])")
+    parser.add_argument("--notable-gate-k", type=float, default=0.0,
+                        help="soft-gate the notable_prob weight w=sigmoid(k*(p-0.5)) for the soft "
+                             "motion_uncertainty column; 0=off. Pass the same k as the online run "
+                             "(env.wam.coverage.notable_gate_k, default 8) to match it.")
     return parser.parse_args()
 
 
@@ -65,7 +69,7 @@ def main() -> int:
     dataset = WAMStage1Dataset(args.data_dir)
     rows = evaluate_stage1_uncertainty_rows(
         model, dataset, device=args.device, limit=args.limit,
-        sigma_scale=args.sigma_scale, alpha=args.alpha,
+        sigma_scale=args.sigma_scale, alpha=args.alpha, notable_gate_k=args.notable_gate_k,
     )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
