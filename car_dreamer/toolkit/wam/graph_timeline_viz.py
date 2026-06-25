@@ -1312,8 +1312,8 @@ def _draw_uncertainty_panel(
     keys = ("motion_norm", "coverage_norm", "total_norm") if norm else ("motion", "coverage", "total")
     colors = (UNC_MOTION_COLOR, UNC_COVERAGE_COLOR, UNC_TOTAL_COLOR)
     steps = [d["step"] for d in series]
-    for key, color, lw, label in zip(keys, colors, (1.4, 1.4, 1.8), ("motion", "coverage", "total")):
-        ax.plot(steps, [d[key] for d in series], color=color, lw=lw, label=label)
+    for key, color, lw, series_label in zip(keys, colors, (1.4, 1.4, 1.8), ("motion", "coverage", "total")):
+        ax.plot(steps, [d[key] for d in series], color=color, lw=lw, label=series_label)
     cur = None
     if cur_step is not None:
         ax.axvline(float(cur_step), color="#888888", ls="--", lw=1.0)
