@@ -197,6 +197,12 @@ carla_group_right_turn_auto:
   env.wam.stage1.steps: 2000
   env.wam.stage1.lambda_perc: 1.0
   env.wam.stage1.lambda_traj: 1.0
+  # Per-object weight in the trajectory NLL: notable objects vs the rest. Default (1.0, 0.0) supervises
+  # only notable objects (original behavior). Set traj_weight_nonnotable>0 (e.g. 0.1, or 1.0 for equal
+  # weight) to also calibrate the variance head on non-notable objects -- so the live notable_prob-
+  # weighted U^pi does not weight an untrained (OOD) variance for them.
+  env.wam.stage1.traj_weight_notable: 1.0
+  env.wam.stage1.traj_weight_nonnotable: 0.0
   env.wam.stage1.lambda_vis: 1.0
   env.wam.stage1.lambda_inv: 1.0
   env.wam.stage1.grad_clip: 1.0

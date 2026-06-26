@@ -33,6 +33,7 @@ from car_dreamer.toolkit.wam import (
     collate_stage1_samples,
     enumerate_stage1_policies,
     evaluate_stage1_uncertainty_rows,
+    gaussian_trajectory_nll,
     init_encoder_from_stage1,
     make_stage1_policy_metadata,
     make_stage1_sample,
@@ -43,6 +44,7 @@ from car_dreamer.toolkit.wam import (
     valid_object_ids,
     visible_object_ids_by_vehicle,
 )
+from car_dreamer.toolkit.wam.stage1 import _align_target
 
 ROUTE_WAYPOINTS = 2
 
@@ -722,6 +724,55 @@ class WarmStartTest(unittest.TestCase):
         s2 = stage2.context_encoder.graph_net.state_dict()
         self.assertEqual(set(s1), set(s2))
         self.assertTrue(all(torch.equal(s1[k], s2[k]) for k in s1))
+
+
+class TrajWeightTest(unittest.TestCase):
+    """traj_weight_notable / traj_weight_nonnotable control the per-object trajectory-NLL weight."""
+
+    def _traj_loss(self, model, sample, *, w_notable, w_nonnotable):
+        trainer = WAMStage1Trainer(
+            model,
+            WAMStage1Config(traj_weight_notable=w_notable, traj_weight_nonnotable=w_nonnotable),
+        )
+        return float(trainer._sample_loss(sample)["traj"].detach())
+
+    def test_default_is_notable_only_and_nonnotable_weight_changes_loss(self):
+        torch.manual_seed(0)
+        cfg = perc_config()
+        # window has a notable object (100, the first) + a non-notable one (101); random nonzero targets
+        # so both objects carry trajectory error.
+        sample = synthetic_sample(cfg, objs=((100, 8.0, 1.0), (101, 5.0, 2.0)))
+        model = WAMPerceptionModel(cfg)
+        model.eval()  # deterministic forward (no dropout layers, but be explicit)
+
+        l_default = self._traj_loss(model, sample, w_notable=1.0, w_nonnotable=0.0)
+        l_equal = self._traj_loss(model, sample, w_notable=1.0, w_nonnotable=1.0)
+        # turning on the non-notable weight pulls object 101's error into the loss -> value moves
+        self.assertNotAlmostEqual(l_default, l_equal, places=5)
+
+        # the (1.0, 0.0) default reproduces the original notable-only NLL exactly
+        window = [g for g in sample["window"]]
+        out = model(window)
+        tgt, val = _align_target(
+            out["object_node_ids"], sample["object_node_ids"], sample["target_xy"], sample["valid"]
+        )
+        notable = out["labels"]["notable"]
+        ref = float(
+            gaussian_trajectory_nll(
+                out["traj_mu"], out["traj_log_var"], tgt, notable_weight=notable, valid_mask=val
+            ).detach()
+        )
+        self.assertAlmostEqual(l_default, ref, places=5)
+
+    def test_config_plumbed_from_env(self):
+        from car_dreamer.toolkit.wam import wam_stage1_configs_from_env
+
+        config = SimpleNamespace(
+            env=SimpleNamespace(wam=SimpleNamespace(stage1=SimpleNamespace(traj_weight_nonnotable=0.25)))
+        )
+        _, stage1_cfg = wam_stage1_configs_from_env(config)
+        self.assertAlmostEqual(stage1_cfg.traj_weight_nonnotable, 0.25, places=6)
+        self.assertAlmostEqual(stage1_cfg.traj_weight_notable, 1.0, places=6)  # default kept
 
 
 if __name__ == "__main__":

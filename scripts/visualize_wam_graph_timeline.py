@@ -81,12 +81,34 @@ def _merge_uncertainty_csv(records: List[dict], csv_path: Path) -> None:
     print(f"merged uncertainty from {csv_path}: {matched}/{len(records)} records matched", flush=True)
 
 
-def _policy_series_from_records(records: List[dict], token: str, *, sigma_scale: float, alpha: float) -> list:
-    """Per-step uncertainty series for one policy from records' ``extra.uncertainty`` (counterfactual JSONL)."""
+def _unc_field_names(source: str, *, csv: bool = False):
+    """Map an uncertainty口径 (``gt`` GT-notable | ``prob`` model notable_prob) to field names.
+
+    The counterfactual JSONL stores GT-notable under the unsuffixed names and the online口径 under
+    ``*_prob``; the offline evaluator CSV is the reverse (unsuffixed = notable_prob, ``*_notable`` = GT).
+    Returns ``(motion, total, motion_norm, total_norm)`` keys for that source.
+    """
+    prob = str(source).lower() == "prob"
+    if csv:
+        suffix = "" if prob else "_notable"
+        return (f"motion_uncertainty{suffix}", f"total_uncertainty{suffix}",
+                f"motion_uncertainty_norm{suffix}", f"total_uncertainty_norm{suffix}")
+    suffix = "_prob" if prob else ""
+    return (f"motion_uncertainty{suffix}", f"total_uncertainty{suffix}",
+            f"motion_uncertainty{suffix}_norm", f"total_uncertainty{suffix}_norm")
+
+
+def _policy_series_from_records(records: List[dict], token: str, *, sigma_scale: float, alpha: float,
+                               source: str = "gt") -> list:
+    """Per-step uncertainty series for one policy from records' ``extra.uncertainty`` (counterfactual JSONL).
+
+    ``source`` selects the口径: ``gt`` (GT-notable, default) or ``prob`` (model notable_prob, online-style).
+    """
     import math
 
     tau = max(float(sigma_scale), 1e-6)
     a = float(min(max(alpha, 0.0), 1.0))
+    mkey, tkey, mnkey, tnkey = _unc_field_names(source)
     by_step = {}
     for rec in records:
         label = str(rec.get("policy_label", ""))
@@ -99,24 +121,30 @@ def _policy_series_from_records(records: List[dict], token: str, *, sigma_scale:
         step = int(rec.get("step", 0))
         if step in by_step:
             continue
-        motion = float(unc.get("motion_uncertainty", 0.0))
+        motion = float(unc.get(mkey, 0.0))
         coverage = float(unc.get("coverage_uncertainty", 0.0))
-        total = float(unc.get("total_uncertainty", motion + coverage))
+        total = float(unc.get(tkey, motion + coverage))
         cov01 = min(max(coverage, 0.0), 1.0)
-        motion_norm = float(unc.get("motion_uncertainty_norm", 1.0 - math.exp(-max(motion, 0.0) / tau)))
-        total_norm = float(unc.get("total_uncertainty_norm", a * motion_norm + (1.0 - a) * cov01))
+        motion_norm = float(unc.get(mnkey, 1.0 - math.exp(-max(motion, 0.0) / tau)))
+        total_norm = float(unc.get(tnkey, a * motion_norm + (1.0 - a) * cov01))
         by_step[step] = {"step": step, "motion": motion, "coverage": coverage, "total": total,
                          "motion_norm": motion_norm, "coverage_norm": cov01, "total_norm": total_norm}
     return [by_step[s] for s in sorted(by_step)]
 
 
-def _policy_series_from_csv(csv_path: Path, token: str, *, sigma_scale: float, alpha: float) -> list:
-    """Per-step uncertainty series for one policy (matched by policy_type / label / label-prefix)."""
+def _policy_series_from_csv(csv_path: Path, token: str, *, sigma_scale: float, alpha: float,
+                            source: str = "gt") -> list:
+    """Per-step uncertainty series for one policy (matched by policy_type / label / label-prefix).
+
+    ``source`` selects the口径: ``gt`` (GT-notable; the evaluator's ``*_notable`` columns) or ``prob``
+    (model notable_prob; the evaluator's unsuffixed columns).
+    """
     import csv as _csv
     import math
 
     tau = max(float(sigma_scale), 1e-6)
     a = float(min(max(alpha, 0.0), 1.0))
+    mkey, tkey, mnkey, tnkey = _unc_field_names(source, csv=True)
     by_step = {}
     with Path(csv_path).open(newline="", encoding="utf-8") as f:
         for row in _csv.DictReader(f):
@@ -129,12 +157,12 @@ def _policy_series_from_csv(csv_path: Path, token: str, *, sigma_scale: float, a
                 continue
             if step in by_step:
                 continue
-            motion = float(row.get("motion_uncertainty", 0.0) or 0.0)
+            motion = float(row.get(mkey, 0.0) or 0.0)
             coverage = float(row.get("coverage_uncertainty", 0.0) or 0.0)
-            total = float(row.get("total_uncertainty", motion + coverage) or 0.0)
+            total = float(row.get(tkey, motion + coverage) or 0.0)
             cov01 = min(max(coverage, 0.0), 1.0)
-            motion_norm = float(row.get("motion_uncertainty_norm", 1.0 - math.exp(-max(motion, 0.0) / tau)) or 0.0)
-            total_norm = float(row.get("total_uncertainty_norm", a * motion_norm + (1.0 - a) * cov01) or 0.0)
+            motion_norm = float(row.get(mnkey, 1.0 - math.exp(-max(motion, 0.0) / tau)) or 0.0)
+            total_norm = float(row.get(tnkey, a * motion_norm + (1.0 - a) * cov01) or 0.0)
             by_step[step] = {"step": step, "motion": motion, "coverage": coverage, "total": total,
                              "motion_norm": motion_norm, "coverage_norm": cov01, "total_norm": total_norm}
     return [by_step[s] for s in sorted(by_step)]
@@ -179,6 +207,10 @@ def parse_args() -> argparse.Namespace:
                              "fixed_policy_uncertainty.csv from compare_wam_fixed_policies.py")
     parser.add_argument("--unc-metric", choices=("raw", "norm"), default="raw",
                         help="bottom panel: raw motion/coverage/total, or the [0,1]-saturated *_norm")
+    parser.add_argument("--unc-source", choices=("gt", "prob"), default="gt",
+                        help="motion口径 for the compare panels: gt = GT-notable (default), "
+                             "prob = model notable_prob (online-style; needs *_prob fields in the JSONL "
+                             "or the evaluator's unsuffixed columns in --uncertainty-csv)")
     parser.add_argument("--compare-policies", default=None,
                         help="comma-separated policy types/labels to draw as STACKED bottom panels "
                              "(one per policy, matched by step) from --uncertainty-csv, e.g. "
@@ -211,10 +243,12 @@ def main() -> int:
         for tok in tokens:
             if args.uncertainty_csv:
                 series = _policy_series_from_csv(Path(args.uncertainty_csv), tok,
-                                                 sigma_scale=args.unc_sigma_scale, alpha=args.unc_alpha)
+                                                 sigma_scale=args.unc_sigma_scale, alpha=args.unc_alpha,
+                                                 source=args.unc_source)
             else:  # counterfactual JSONL: uncertainty rides in each policy record's extra
                 series = _policy_series_from_records(all_records, tok,
-                                                     sigma_scale=args.unc_sigma_scale, alpha=args.unc_alpha)
+                                                     sigma_scale=args.unc_sigma_scale, alpha=args.unc_alpha,
+                                                     source=args.unc_source)
             if series:
                 unc_panels.append((tok, series))
             else:

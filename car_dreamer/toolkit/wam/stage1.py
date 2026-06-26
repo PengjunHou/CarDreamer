@@ -121,6 +121,8 @@ class WAMStage1Config:
     max_steps: int = 2000
     lambda_perc: float = 1.0
     lambda_traj: float = 1.0
+    traj_weight_notable: float = 1.0
+    traj_weight_nonnotable: float = 0.0
     lambda_vis: float = 1.0
     lambda_inv: float = 1.0
     grad_clip: float = 1.0
@@ -232,9 +234,18 @@ class WAMStage1Trainer:
         notable_weight = gt_labels.get("notable")
         if notable_weight is None:
             notable_weight = torch.ones(out["object_node_ids"].shape[0], device=self.device)
+        notable_weight = notable_weight.to(self.device)
+        # Per-object trajectory-NLL weight: notable objects at ``traj_weight_notable`` (default 1), other
+        # objects at ``traj_weight_nonnotable`` (default 0 = supervise notable only, the original
+        # behavior). A small non-zero value calibrates the variance head on non-notable objects too, so
+        # the live ``notable_prob``-weighted U^π no longer weights an untrained (OOD) variance for them.
+        traj_weight = (
+            self.config.traj_weight_notable * notable_weight
+            + self.config.traj_weight_nonnotable * (1.0 - notable_weight)
+        )
         nll = gaussian_trajectory_nll(
             out["traj_mu"], out["traj_log_var"], target_xy,
-            notable_weight=notable_weight.to(self.device), valid_mask=valid,
+            notable_weight=traj_weight, valid_mask=valid,
         )
         total = self.config.lambda_perc * perc["total"] + self.config.lambda_traj * nll
         return {"total": total, "perception": perc["total"], "traj": nll}
@@ -300,7 +311,7 @@ class WAMStage1Trainer:
                 if self.config.log_interval and self.step % self.config.log_interval == 0:
                     msg = (
                         f"[wam-stage1] step={self.step} L={float(loss.detach()):.4f} "
-                        f"perc={float(losses['perception']):.4f} traj={float(losses['traj']):.4f}"
+                        f"perc={float(losses['perception'].detach()):.4f} traj={float(losses['traj'].detach()):.4f}"
                     )
                     (logger.info(msg) if logger is not None else print(msg, flush=True))
                 if (metrics_callback is not None and val_dataset is not None
@@ -438,6 +449,8 @@ def wam_stage1_configs_from_env(config) -> Tuple[WAMPerceptionConfig, WAMStage1C
         max_steps=int(_cfg_get(stage1, "steps", _cfg_get(stage1, "max_steps", 2000))),
         lambda_perc=float(_cfg_get(stage1, "lambda_perc", 1.0)),
         lambda_traj=float(_cfg_get(stage1, "lambda_traj", 1.0)),
+        traj_weight_notable=float(_cfg_get(stage1, "traj_weight_notable", 1.0)),
+        traj_weight_nonnotable=float(_cfg_get(stage1, "traj_weight_nonnotable", 0.0)),
         lambda_vis=float(_cfg_get(stage1, "lambda_vis", 1.0)),
         lambda_inv=float(_cfg_get(stage1, "lambda_inv", 1.0)),
         grad_clip=float(_cfg_get(stage1, "grad_clip", 1.0)),

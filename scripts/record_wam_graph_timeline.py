@@ -240,57 +240,93 @@ def _cf_policy_specs(state, tokens):
     return specs
 
 
-def _cf_uncertainty(model, window, sim, state, policy, device):
-    """Per-policy motion (model) + coverage uncertainty (+ [0,1] norm) for one counterfactual graph window."""
+def _cf_uncertainty(model, window, sim, state, policy, device, debug=False):
+    """Per-policy motion + coverage uncertainty (+ [0,1] norm) for one counterfactual graph window.
+
+    Emits two motion口径 that share the same predicted ``TrSigma`` and coverage, differing only in the
+    per-object weight: ``motion_uncertainty*`` is GT-notable hard-weighted (the original), and
+    ``motion_uncertainty_prob*`` is the online ``notable_prob``-weighted one (soft-gate + mass_floor +
+    sigma_scale/alpha_norm read from ``sim``), matching the live ``_predict_wam_with_checkpoint`` path.
+    """
     import math
 
     import torch
 
     from car_dreamer.toolkit.wam import coverage_metrics
 
-    motion = 0.0
+    motion = 0.0       # GT-notable hard-weighted (the original口径)
+    motion_prob = 0.0  # online notable_prob-weighted (mirrors _predict_wam_with_checkpoint)
+    per_object = []    # debug breakdown: per-object notable_prob / TrSigma / w_p / gt_notable
     if window:
         with torch.no_grad():
             out = model([g.to(device) for g in window])
         if int(out["object_node_ids"].numel()) > 0:
-            # Weight by the t-time GT notable set (``state["notable_ids"]``) aligned to the window-union
-            # query ids -- NOT the model's soft notable_prob, and NOT heads' best-effort newest-frame
-            # label. An object that was notable but has since left the latest frame lingers in the window
-            # union with a stale ``notable=1`` (and a GRU-inflated extrapolated variance), which would
-            # keep motion non-zero (even growing) for ``history_window`` steps after it is gone. Weighting
-            # by the t-time GT set drops it, so "no notable object at t -> motion 0" -- matching the BEV /
-            # topology, which render only the latest frame. Mirrors the offline recorders'
-            # ``perception_labels_at_t`` semantics.
-            notable_set = {int(i) for i in (state.get("notable_ids", ()) or ())}
+            trace = torch.exp(out["traj_log_var"].detach()).sum(dim=-1).mean(dim=-1)  # [Q] TrSigma_o
             qids = [int(v) for v in out["object_node_ids"].detach().cpu().tolist()]
-            weight = torch.tensor(
-                [1.0 if q in notable_set else 0.0 for q in qids],
-                device=out["traj_log_var"].device,
-            )
-            denom = float(weight.sum())
-            if denom > 1e-6:
-                trace = torch.exp(out["traj_log_var"].detach()).sum(dim=-1).mean(dim=-1)  # [Q]
-                motion = float((weight * trace).sum() / weight.sum().clamp_min(1e-6))
+            # GT-notable口径: weight by the t-time GT notable set (``state["notable_ids"]``) aligned to the
+            # window-union query ids -- NOT the model's soft notable_prob, and NOT heads' best-effort
+            # newest-frame label. An object that was notable but has since left the latest frame lingers in
+            # the window union with a stale ``notable=1`` (and a GRU-inflated extrapolated variance), which
+            # would keep motion non-zero (even growing) for ``history_window`` steps after it is gone.
+            # Weighting by the t-time GT set drops it, so "no notable object at t -> motion 0" -- matching
+            # the BEV / topology (latest frame only) and the offline ``perception_labels_at_t`` semantics.
+            notable_set = {int(i) for i in (state.get("notable_ids", ()) or ())}
+            w_gt = torch.tensor([1.0 if q in notable_set else 0.0 for q in qids], device=trace.device)
+            if float(w_gt.sum()) > 1e-6:
+                motion = float((w_gt * trace).sum() / w_gt.sum().clamp_min(1e-6))
+            # online口径: same formula as the live checkpoint predictor -- soft-gate the model's notable_prob
+            # then notable-weighted mean of TrSigma with a denominator mass_floor. gate_k / threshold /
+            # mass_floor come from the env (``--env.wam.coverage.*``) so this matches the online run.
+            p = out["notable_prob"].detach()
+            gate_k = float(getattr(sim, "_wam_uncertainty_notable_gate_k", 8.0))
+            gate_thr = float(getattr(sim, "_wam_uncertainty_notable_gate_threshold", 0.5))
+            mass_floor = float(getattr(sim, "_wam_uncertainty_notable_mass_floor", 1.0))
+            w_p = torch.sigmoid(gate_k * (p - gate_thr)) if gate_k > 0 else p
+            motion_prob = float((w_p * trace).sum() / (w_p.sum() + mass_floor).clamp_min(1e-6))
+            if debug:
+                p_l = [float(x) for x in p.detach().cpu().reshape(-1).tolist()]
+                tr_l = [float(x) for x in trace.detach().cpu().reshape(-1).tolist()]
+                wp_l = [float(x) for x in w_p.detach().cpu().reshape(-1).tolist()]
+                per_object = [
+                    {"node_id": qids[i], "gt_notable": int(qids[i] in notable_set),
+                     "notable_prob": p_l[i], "trace": tr_l[i], "w_p": wp_l[i]}
+                    for i in range(len(qids))
+                ]
     coverage = 0.0
     cov_fn = getattr(sim, "_build_wam_coverage_for_stage1_policy", None)
     if cov_fn is not None:
         raster = cov_fn(state, policy)
         if raster is not None:
             coverage = float(coverage_metrics(raster).get("coverage_uncertainty", 0.0))
-    tau, a = 4.0, 0.5
-    motion_norm = 1.0 - math.exp(-max(motion, 0.0) / tau)
     cov01 = min(max(coverage, 0.0), 1.0)
-    return {
+    # GT-notable norm keeps the original fixed tau/alpha; the online口径 uses the env's sigma_scale /
+    # alpha_norm so its [0,1] view matches the live ``_update_wam_uncertainty_breakdown``.
+    tau_gt, a_gt = 4.0, 0.5
+    tau_p = max(float(getattr(sim, "_wam_uncertainty_sigma_scale", 4.0)), 1e-6)
+    a_p = float(min(max(getattr(sim, "_wam_uncertainty_alpha_norm", 0.5), 0.0), 1.0))
+    motion_norm = 1.0 - math.exp(-max(motion, 0.0) / tau_gt)
+    motion_prob_norm = 1.0 - math.exp(-max(motion_prob, 0.0) / tau_p)
+    result = {
         "motion_uncertainty": motion,
         "coverage_uncertainty": coverage,
         "total_uncertainty": motion + coverage,
         "motion_uncertainty_norm": motion_norm,
-        "total_uncertainty_norm": a * motion_norm + (1.0 - a) * cov01,
+        "total_uncertainty_norm": a_gt * motion_norm + (1.0 - a_gt) * cov01,
+        # online notable_prob口径 (same coverage; differs only in the per-object motion weight)
+        "motion_uncertainty_prob": motion_prob,
+        "total_uncertainty_prob": motion_prob + coverage,
+        "motion_uncertainty_prob_norm": motion_prob_norm,
+        "total_uncertainty_prob_norm": a_p * motion_prob_norm + (1.0 - a_p) * cov01,
     }
+    if debug:
+        # per-object breakdown so A (mis-classified -> high notable_prob) vs B (low prob + large TrSigma,
+        # passed by mass_floor) can be told apart offline from the JSONL.
+        result["per_object"] = per_object
+    return result
 
 
 def record_counterfactual_step(sim, model, windows, out_path, *, tokens, history_window, device,
-                               map_background=None):
+                               map_background=None, debug=False):
     """One rollout step: build + record a per-policy graph and uncertainty for each counterfactual policy."""
     from collections import deque
 
@@ -328,7 +364,7 @@ def record_counterfactual_step(sim, model, windows, out_path, *, tokens, history
         )
         win = windows.setdefault(label.split("[", 1)[0], deque(maxlen=int(history_window) + 1))
         win.append(graph)
-        unc = _cf_uncertainty(model, list(win), sim, state, policy, device)
+        unc = _cf_uncertainty(model, list(win), sim, state, policy, device, debug=debug)
         extra = {"episode": episode, "uncertainty": unc, "counterfactual": True}
         extra.update(world_extra)
         rec = hetero_graph_to_record(graph, step=step, policy_label=label, extra=extra)
@@ -361,6 +397,10 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
     parser.add_argument("--cf-policies", default="ego_only,nearest_single",
                         help="counterfactual policies to record per step: any of ego_only, nearest_single, "
                              "all_candidates (comma-separated)")
+    parser.add_argument("--cf-debug", action="store_true", default=False,
+                        help="dump per-object notable_prob / TrSigma / w_p / gt_notable into each "
+                             "counterfactual record's extra.uncertainty.per_object (for diagnosing "
+                             "why the prob口径 motion is large)")
     known, passthrough = parser.parse_known_args()
     passthrough = [arg for arg in passthrough if arg != "--"]
     return known, passthrough
@@ -406,7 +446,7 @@ def main() -> int:
             if known.counterfactual:
                 if record_counterfactual_step(sim, cf_model, cf_windows, out_path, tokens=cf_tokens,
                                               history_window=cf_history, device=cf_device,
-                                              map_background=map_background):
+                                              map_background=map_background, debug=known.cf_debug):
                     recorded += 1
             elif record_step(sim, out_path, map_background=map_background):
                 recorded += 1

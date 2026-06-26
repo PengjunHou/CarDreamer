@@ -29,6 +29,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=None, help="override env.wam.stage1.steps")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--traj-weight-notable", type=float, default=None,
+                        help="override env.wam.stage1.traj_weight_notable (trajectory-NLL weight on notable objects)")
+    parser.add_argument("--traj-weight-nonnotable", type=float, default=None,
+                        help="override env.wam.stage1.traj_weight_nonnotable (weight on non-notable objects; "
+                             "0=notable-only/original, 1=equal weight)")
     parser.add_argument("--ckpt-dir", default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--val-fraction", type=float, default=0.0)
@@ -65,6 +70,10 @@ def main() -> int:
         stage1_cfg.batch_size = args.batch_size
     if args.lr is not None:
         stage1_cfg.lr = args.lr
+    if args.traj_weight_notable is not None:
+        stage1_cfg.traj_weight_notable = args.traj_weight_notable
+    if args.traj_weight_nonnotable is not None:
+        stage1_cfg.traj_weight_nonnotable = args.traj_weight_nonnotable
     if args.ckpt_dir is not None:
         stage1_cfg.ckpt_dir = args.ckpt_dir
     if args.log_interval is not None:
@@ -87,6 +96,7 @@ def main() -> int:
         f"[wam-stage1] samples={len(dataset)} device={stage1_cfg.device} hidden={perc_cfg.hidden_dim} "
         f"steps={stage1_cfg.max_steps} bs={stage1_cfg.batch_size} lr={stage1_cfg.lr} "
         f"history_window={stage1_cfg.history_window} sample_period_s={stage1_cfg.sample_period_s} "
+        f"traj_w=({stage1_cfg.traj_weight_notable},{stage1_cfg.traj_weight_nonnotable}) "
         f"ckpt_dir={stage1_cfg.ckpt_dir}",
         flush=True,
     )
