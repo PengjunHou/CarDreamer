@@ -240,7 +240,7 @@ def _cf_policy_specs(state, tokens):
     return specs
 
 
-def _cf_uncertainty(model, window, sim, state, policy, device, debug=False):
+def _cf_uncertainty(model, window, sim, state, policy, device, debug=False, coverage_override=None):
     """Per-policy motion + coverage uncertainty (+ [0,1] norm) for one counterfactual graph window.
 
     Emits two motion口径 that share the same predicted ``TrSigma`` and coverage, differing only in the
@@ -293,11 +293,16 @@ def _cf_uncertainty(model, window, sim, state, policy, device, debug=False):
                     for i in range(len(qids))
                 ]
     coverage = 0.0
-    cov_fn = getattr(sim, "_build_wam_coverage_for_stage1_policy", None)
-    if cov_fn is not None:
-        raster = cov_fn(state, policy)
-        if raster is not None:
-            coverage = float(coverage_metrics(raster).get("coverage_uncertainty", 0.0))
+    if coverage_override is not None:
+        # comm-replay passes the real-latency coverage (built from delivered messages); otherwise fall
+        # back to the 0-latency policy coverage from current visibility.
+        coverage = float(coverage_override)
+    else:
+        cov_fn = getattr(sim, "_build_wam_coverage_for_stage1_policy", None)
+        if cov_fn is not None:
+            raster = cov_fn(state, policy)
+            if raster is not None:
+                coverage = float(coverage_metrics(raster).get("coverage_uncertainty", 0.0))
     cov01 = min(max(coverage, 0.0), 1.0)
     # GT-notable norm keeps the original fixed tau/alpha; the online口径 uses the env's sigma_scale /
     # alpha_norm so its [0,1] view matches the live ``_update_wam_uncertainty_breakdown``.
@@ -373,6 +378,60 @@ def record_counterfactual_step(sim, model, windows, out_path, *, tokens, history
     return wrote
 
 
+def record_counterfactual_comm_step(sim, model, comm_recorder, slot_window, out_path, *,
+                                    history_window, sample_period_steps, device,
+                                    map_background=None, debug=False):
+    """One rollout step for the COMMUNICATION-REPLAY counterfactual timeline.
+
+    Reuses the proven comm-replay machinery (one :class:`CommunicationProcess` per policy in the stable
+    family ``ego_only / single_candidate_* / all_candidates_*``) so each policy's graph window is built
+    from messages that have *actually arrived* under that policy's bandwidth/latency -- matching the
+    online perception conditions, unlike the 0-latency :func:`record_counterfactual_step`. Windows are
+    sampled at the training/online cadence (``sample_period_steps``) and only scored once full, mirroring
+    ``_checkpoint_graph_window_ready``.
+    """
+    from car_dreamer.toolkit.wam import append_record_jsonl, coverage_metrics, hetero_graph_to_record
+
+    state_fn = getattr(sim, "_wam_stage1_slot_state", None)
+    if state_fn is None:
+        return False
+    step = int(getattr(sim, "_time_step", 0))
+    state = state_fn(step)
+    # build per-policy comm runtimes once (stable family), advance the comm queues EVERY step
+    comm_recorder._ensure_runtimes(state, start_step=0)
+    comm_recorder._advance_communication(step, state)
+    # sample windows at the training/online cadence; only score once the window is full (in-distribution)
+    if int(step) % int(max(sample_period_steps, 1)) != 0:
+        return False
+    slot_window.append((int(step), dict(state)))
+    if len(slot_window) < int(history_window) + 1:
+        return False
+    payload = {"window_steps": [s for s, _ in slot_window], "source_window": [st for _, st in slot_window]}
+    world_extra = _timeline_world_extra(sim, getattr(sim, "_wam_graph", None), map_background=map_background)
+    episode = int(getattr(sim, "_episode_count", 0) or 0)
+    wrote = False
+    for key in comm_recorder._policy_order:
+        runtime = comm_recorder._runtimes[key]
+        graphs, coverage_tensor = comm_recorder._build_window(runtime, step, payload)
+        if not graphs:
+            continue
+        cov_override = None
+        if coverage_tensor is not None and len(coverage_tensor) > 0:
+            arr = coverage_tensor[-1]
+            arr = arr.detach().cpu().numpy() if hasattr(arr, "detach") else arr
+            cov_override = float(coverage_metrics(arr).get("coverage_uncertainty", 0.0))
+        unc = _cf_uncertainty(model, graphs, sim, state, runtime.policy, device,
+                              debug=debug, coverage_override=cov_override)
+        sel = ",".join(str(int(v)) for v in runtime.policy.selected_vehicle_ids)
+        label = runtime.policy_type if not sel else f"{runtime.policy_type}[{sel}]"
+        extra = {"episode": episode, "uncertainty": unc, "counterfactual": True, "comm_replay": True}
+        extra.update(world_extra)
+        rec = hetero_graph_to_record(graphs[-1], step=step, policy_label=label, extra=extra)
+        append_record_jsonl(rec, out_path)
+        wrote = True
+    return wrote
+
+
 def parse_args() -> Tuple[argparse.Namespace, List[str]]:
     parser = argparse.ArgumentParser(description="Record the per-step WAM cooperative graph to JSONL.")
     parser.add_argument("--task", default="carla_group_right_turn_auto")
@@ -401,6 +460,11 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
                         help="dump per-object notable_prob / TrSigma / w_p / gt_notable into each "
                              "counterfactual record's extra.uncertainty.per_object (for diagnosing "
                              "why the prob口径 motion is large)")
+    parser.add_argument("--cf-comm-replay", action="store_true", default=False,
+                        help="counterfactual with REAL V2V latency: replay a per-policy CommunicationProcess "
+                             "and build each policy's graph from delivered messages (stable family "
+                             "ego_only/single_candidate_*/all_candidates_*). Default is 0-latency. "
+                             "--cf-policies is ignored in this mode.")
     known, passthrough = parser.parse_known_args()
     passthrough = [arg for arg in passthrough if arg != "--"]
     return known, passthrough
@@ -426,6 +490,7 @@ def main() -> int:
     map_background = _write_map_background(sim, out_path, pixels_per_meter=known.map_background_ppm) if known.map_background else None
 
     cf_model = cf_windows = cf_device = cf_tokens = cf_history = None
+    cf_comm_recorder = cf_slot_window = cf_sample_period = None
     if known.counterfactual:
         loader = getattr(sim, "_load_wam_predictor", None)
         if loader is None:
@@ -436,14 +501,45 @@ def main() -> int:
         cf_history = int(getattr(sim, "_wam_predictor_history_window", 4))
         cf_tokens = [t.strip() for t in str(known.cf_policies).split(",") if t.strip()]
         cf_windows = {}
-        print(f"counterfactual recording: policies={cf_tokens} history_window={cf_history}", flush=True)
+        if known.cf_comm_replay:
+            from collections import deque
+
+            from car_dreamer.toolkit.wam import BevSpec, WAMStage1CommunicationPolicyDataRecorder
+
+            cf_sample_period = max(1, int(getattr(sim, "_wam_predictor_sample_period_steps", 1)))
+            cf_comm_recorder = WAMStage1CommunicationPolicyDataRecorder(
+                out_path.parent / "cf_comm_runtime",
+                fixed_dt=float(sim._comm_config.dt),
+                comm_config=sim._comm_config,
+                link_rate_bps=sim._link_rate_bps,
+                graph_builder=sim._build_wam_graph_for_stage1_slot,
+                coverage_builder=getattr(sim, "_build_wam_coverage_for_stage1_slot", None),
+                history_window=cf_history,
+                bandwidth_ratio=float(getattr(sim, "_comm_bandwidth_ratio", 1.0)),
+                bev_spec=getattr(sim, "_wam_bev_spec", None) or BevSpec(),
+                bev_payload_mode=str(getattr(sim, "_wam_bev_payload_mode", "feature")),
+                bev_feature_dim=int(getattr(sim, "_wam_bev_feature_dim", 256)),
+                bev_feature_dtype_bytes=int(getattr(sim, "_wam_bev_feature_dtype_bytes", 4)),
+                overhead_bytes=int(getattr(sim, "_comm_overhead_bytes", 64)),
+            )
+            cf_slot_window = deque(maxlen=cf_history + 1)
+            print(f"counterfactual COMM-REPLAY: stable policy family, history_window={cf_history} "
+                  f"sample_period_steps={cf_sample_period} (--cf-policies ignored)", flush=True)
+        else:
+            print(f"counterfactual recording (0-latency): policies={cf_tokens} history_window={cf_history}", flush=True)
 
     recorded = 0
     try:
         # Single-episode recording: run until the episode ends (or the --steps cap), then stop.
         for step in range(known.steps):
             _, _, terminated, truncated, _ = env.step(env.action_space.sample())
-            if known.counterfactual:
+            if known.counterfactual and known.cf_comm_replay:
+                if record_counterfactual_comm_step(sim, cf_model, cf_comm_recorder, cf_slot_window, out_path,
+                                                   history_window=cf_history, sample_period_steps=cf_sample_period,
+                                                   device=cf_device, map_background=map_background,
+                                                   debug=known.cf_debug):
+                    recorded += 1
+            elif known.counterfactual:
                 if record_counterfactual_step(sim, cf_model, cf_windows, out_path, tokens=cf_tokens,
                                               history_window=cf_history, device=cf_device,
                                               map_background=map_background, debug=known.cf_debug):
