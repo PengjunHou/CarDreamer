@@ -105,10 +105,48 @@ from .stage2 import (
     WAMStage2Config,
     WAMStage2Trainer,
     collate_flow_samples,
+    decode_chunk_to_wampolicy,
+    load_wam_uwm,
     make_flow_sample,
     wam_configs_from_env,
 )
 from .flow_recorder import WAMFlowDataRecorder
+from .action_chunk import (
+    ActionChunk,
+    SubAction,
+    action_chunk_to_comm_segments,
+    enumerate_candidate_chunks,
+    local_only_chunk,
+    sub_action_to_comm_policy,
+)
+from .lyapunov import (
+    BudgetVirtualQueue,
+    CostRateBreakdown,
+    LinkQueue,
+    LyapunovConfig,
+    LyapunovState,
+    action_cost_rate,
+)
+from .risk_controller import (
+    ControlDecision,
+    RiskControlConfig,
+    TrackedObject,
+    advance_pose_along_route,
+    cumulative_lengths,
+    object_future_positions,
+    point_at_arclength,
+    risk_of_accel,
+    select_accel,
+)
+from .rollout_scorer import RolloutContext, RolloutResult, WorldActionScorer
+from .lyapunov_scheduler import (
+    LyapunovScheduler,
+    ReferenceTrajectory,
+    SchedulerConfig,
+    candidate_chunks,
+    next_epoch_step,
+    select_action_chunk,
+)
 from .stage1 import (
     WAMStage1Config,
     WAMStage1Dataset,
@@ -253,8 +291,45 @@ __all__ = [
     "WAMStage2Config",
     "WAMStage2Trainer",
     "collate_flow_samples",
+    "decode_chunk_to_wampolicy",
+    "load_wam_uwm",
     "make_flow_sample",
     "wam_configs_from_env",
+    # action-chunk data model + heuristic candidates + CommPolicy segmentation (V2X paper Sec I.B)
+    "ActionChunk",
+    "SubAction",
+    "action_chunk_to_comm_segments",
+    "enumerate_candidate_chunks",
+    "local_only_chunk",
+    "sub_action_to_comm_policy",
+    # Lyapunov queues (Q_m eq27, Z eq35) + per-frame cost-rate (eq41/42)
+    "BudgetVirtualQueue",
+    "CostRateBreakdown",
+    "LinkQueue",
+    "LyapunovConfig",
+    "LyapunovState",
+    "action_cost_rate",
+    # risk-aware speed controller (Sec I.E, eqs 29-32)
+    "ControlDecision",
+    "RiskControlConfig",
+    "TrackedObject",
+    "advance_pose_along_route",
+    "cumulative_lengths",
+    "object_future_positions",
+    "point_at_arclength",
+    "risk_of_accel",
+    "select_accel",
+    # world-action rollout scorer (Sec III): per-slot Ũ + predicted comm load
+    "RolloutContext",
+    "RolloutResult",
+    "WorldActionScorer",
+    # Lyapunov-guided policy search (Sec IV, Algorithm 1): P2 solver + event-driven replan
+    "LyapunovScheduler",
+    "ReferenceTrajectory",
+    "SchedulerConfig",
+    "candidate_chunks",
+    "next_epoch_step",
+    "select_action_chunk",
     # stage-1 training pipeline (§16.1) + warm-start
     "WAMStage1Config",
     "WAMStage1Dataset",

@@ -239,7 +239,28 @@ env:
     predictor_device: auto     # auto | cpu | cuda
     predictor_uncertainty_source: notable_weighted_trace
     predictor_history_window: 10
-    policy_sampler_mode: request_all  # request_all | random_duration
+    policy_sampler_mode: request_all  # request_all | random_duration | stage2 | lyapunov
+    uwm_checkpoint: null       # Stage-2 UWM checkpoint when policy_sampler_mode=stage2
+    uwm_candidates: 4          # propose_policies n_candidates for the stage2 sampler
+    # Lyapunov-guided world-action policy search (policy_sampler_mode="lyapunov", V2X paper Sec IV).
+    # The BS solves the per-frame program (P2) over heuristic action chunks a=(S,B,D,n), scoring each by a
+    # Stage-1 U_phi rollout (predictor_checkpoint below; rule fallback if null). Online wiring is written but
+    # NOT live-verified (CARLA); the offline pipeline (scripts/run_wam_lyapunov_offline.py) is the validation.
+    lyapunov:
+      lam: 1.0                 # Λ  (utility/backlog knob; Prop 1)
+      c0: 0.5                  # amortized re-planning penalty (uncertainty units)
+      budget_bandwidth_ratio: 0.4   # B̄_bgt  (per-slot allocated-bandwidth budget)
+      F_max_slots: 20          # F_max (eq 7)
+      n_min_slots: 5           # n_min (eq 2)
+      B_max_ratio: 1.0         # Σ B ≤ B_max (per sub-action)
+      bandwidth_grid: [0.2, 0.5, 0.8, 1.0]   # heuristic candidate bandwidth ratios
+      duration_grid: [5, 10, 20]             # heuristic candidate sub-action durations
+      j_max: 2                 # chunk length cap (J≥1)
+      eps_gap: 0.15            # ε_gap (eq 8 mismatch tolerance)
+      t_min_slots: 3           # T_min (eq 8)
+      T_a_slots: 5             # Ta (eq 8 monitoring cadence)
+      alpha: 0.5               # α in U = αU^mot + (1−α)U^cov
+      predictor_checkpoint: null  # Stage-1 U_phi; null -> rule fallback (NO Stage-2 UWM)
     random_policy:
       local_prob: 0.2
       collaborator_counts: ["1", "2", all]

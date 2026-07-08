@@ -30,8 +30,10 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .bev import BEV_NUM_CHANNELS, bev_reconstruction_loss
-from .flow_matching import WAMFlowMatchingConfig, WAMUnifiedWorldModel
+from .flow_matching import WAMFlowMatchingConfig, WAMUnifiedWorldModel, decode_policy_vector
+from .graph import MODALITIES
 from .graph_model import WAMGraphModelConfig
+from .runtime import WAMPolicy
 
 
 # =====================================================================
@@ -412,3 +414,64 @@ def wam_configs_from_env(config) -> Tuple[WAMGraphModelConfig, WAMFlowMatchingCo
         ckpt_interval=int(_cfg_get(stage2, "ckpt_interval", 500)),
     )
     return graph_cfg, flow_cfg, stage2_cfg
+
+
+# =====================================================================
+# Inference utilities: load a trained UWM + decode a generated policy
+# =====================================================================
+
+
+def load_wam_uwm(ckpt: Union[str, Path, Dict[str, object]], device: Union[str, torch.device] = "cpu") -> WAMUnifiedWorldModel:
+    """Rebuild a :class:`WAMUnifiedWorldModel` from a Stage-2 checkpoint and load its weights.
+
+    The Stage-2 checkpoint (written by :meth:`WAMStage2Trainer.save_checkpoint`) stores ``graph_config``
+    and ``flow_config``, so the model can be reconstructed without the env config. Returns an ``eval()``
+    model on ``device``.
+    """
+    device = torch.device(device)
+    ck = torch.load(ckpt, map_location=device, weights_only=False) if isinstance(ckpt, (str, Path)) else ckpt
+    if "graph_config" not in ck or "flow_config" not in ck:
+        raise ValueError("checkpoint missing graph_config/flow_config; not a Stage-2 UWM checkpoint")
+    model = WAMUnifiedWorldModel(ck["graph_config"], ck["flow_config"])
+    model.load_state_dict(ck.get("model", ck))
+    model.to(device).eval()
+    return model
+
+
+def decode_chunk_to_wampolicy(
+    policy_chunk: torch.Tensor,
+    candidate_ids: Sequence[int],
+    *,
+    num_formats: int,
+    step: int = 0,
+    sel_threshold: float = 0.5,
+    frequency_steps: int = 5,
+) -> WAMPolicy:
+    """Decode a generated policy chunk into an interpretable :class:`WAMPolicy` (request-vehicle view).
+
+    ``policy_chunk`` is ``[H, M, P]`` (a generated chunk) or ``[M, P]`` (a single step); member slot ``m``
+    maps to ``candidate_ids[m]``. A member is **selected** when ``sigmoid(sel) > sel_threshold``; its
+    modality is ``argmax`` over the format one-hot and its bandwidth is the clamped ``bw`` scalar. Slots
+    beyond ``len(candidate_ids)`` are ignored. Uses ``decode_policy_vector`` for the §12.1 ranges.
+    """
+    vec = policy_chunk[int(step)] if policy_chunk.dim() == 3 else policy_chunk  # [M, P]
+    dec = decode_policy_vector(vec, num_formats=int(num_formats))
+    cand = [int(c) for c in candidate_ids]
+    selected: List[int] = []
+    modality: Dict[int, str] = {}
+    bandwidth: Dict[int, float] = {}
+    for m, cid in enumerate(cand):
+        if m >= int(vec.shape[0]):
+            break
+        if float(dec["sel"][m]) > float(sel_threshold):
+            selected.append(cid)
+            fmt_idx = int(torch.argmax(dec["fmt"][m])) if int(dec["fmt"].shape[-1]) > 0 else 0
+            modality[cid] = MODALITIES[fmt_idx] if fmt_idx < len(MODALITIES) else MODALITIES[0]
+            bandwidth[cid] = float(min(max(float(dec["bw"][m]), 0.0), 1.0))
+    return WAMPolicy(
+        selected_vehicle_ids=tuple(selected),
+        modality_by_vehicle=modality,
+        bandwidth_by_vehicle=bandwidth,
+        frequency_steps=int(frequency_steps),
+        reason="stage2_generated",
+    )

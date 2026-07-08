@@ -245,6 +245,19 @@ class V2VCommMixin:
         self._wam_predictor_model = None
         self._wam_predictor_loaded_path = None
         self._wam_predictor_device_resolved = None
+        # Stage-2 UWM policy sampler (policy_sampler_mode="stage2"): the BS proposes the collaboration
+        # policy from the trained Unified World Model each Td instead of rule/random sampling.
+        self._wam_uwm_checkpoint = getattr(wam_cfg, "uwm_checkpoint", None)
+        self._wam_uwm_candidates = int(getattr(wam_cfg, "uwm_candidates", 4))
+        self._wam_uwm_model = None
+        self._wam_uwm_loaded_path = None
+        # Lyapunov world-action policy sampler (policy_sampler_mode="lyapunov", V2X paper Sec IV). Written but
+        # NOT live-verified (CARLA); the offline pipeline (scripts/run_wam_lyapunov_offline.py) is validated.
+        self._wam_lyap_config_node = getattr(wam_cfg, "lyapunov", None)
+        self._wam_lyapunov_scheduler = None
+        self._wam_lyap_pending_segments = []
+        self._wam_lyap_reference = None
+        self._wam_lyap_last_ctx = None
         random_policy_cfg = getattr(wam_cfg, "random_policy", None)
         self._wam_policy_sampler_mode = str(getattr(wam_cfg, "policy_sampler_mode", "request_all")).lower()
         self._wam_random_policy_local_prob = float(getattr(random_policy_cfg, "local_prob", 0.2))
@@ -278,7 +291,7 @@ class V2VCommMixin:
         self._wam_uncertainty_sigma_scale = float(getattr(coverage_cfg, "sigma_scale", 4.0))
         self._wam_uncertainty_alpha_norm = float(getattr(coverage_cfg, "alpha_norm", 0.5))
         # Soft-gate the (no-GT) notable_prob weight: w = sigmoid(k*(p - tau)). k=0 disables (raw prob).
-        self._wam_uncertainty_notable_gate_k = float(getattr(coverage_cfg, "notable_gate_k", 8.0))
+        self._wam_uncertainty_notable_gate_k = float(getattr(coverage_cfg, "notable_gate_k", 20.0))
         self._wam_uncertainty_notable_gate_threshold = float(getattr(coverage_cfg, "notable_gate_threshold", 0.5))
         # Denominator floor (units: notable objects): no confident notable -> motion ~0 instead of the
         # gate-cancelling mean trace. 0 disables (plain weighted mean).
@@ -573,6 +586,191 @@ class V2VCommMixin:
             reason="random_duration",
         )
 
+    def _load_wam_uwm(self):
+        """Load (and cache) the Stage-2 UWM for ``policy_sampler_mode=stage2``."""
+        ckpt = getattr(self, "_wam_uwm_checkpoint", None)
+        if ckpt in (None, "", "null"):
+            raise RuntimeError("wam.policy_sampler_mode=stage2 requires wam.uwm_checkpoint")
+        path = Path(str(ckpt)).expanduser()
+        if self._wam_uwm_model is not None and self._wam_uwm_loaded_path == str(path):
+            return self._wam_uwm_model
+        from .toolkit.wam import load_wam_uwm
+
+        device = self._wam_predictor_device_resolved or self._resolve_wam_predictor_device()
+        self._wam_predictor_device_resolved = device
+        self._wam_uwm_model = load_wam_uwm(path, device=device)
+        self._wam_uwm_loaded_path = str(path)
+        V2V_LOGGER.info("WAM Stage-2 UWM loaded from %s (device=%s)", path, device)
+        return self._wam_uwm_model
+
+    def _wampolicy_to_commpolicy(self, step: int, wam_policy) -> CommPolicy:
+        """Turn a generated :class:`WAMPolicy` into an installable :class:`CommPolicy`.
+
+        Empty selection -> a local-only policy (the BS chooses not to cooperate this Td)."""
+        selected = tuple(int(v) for v in getattr(wam_policy, "selected_vehicle_ids", ()))
+        if not selected:
+            return make_local_policy(
+                policy_id=self._next_policy_id(), request_vehicle_id=int(self.ego.id),
+                start_step=int(step), duration_steps=int(self._comm_config.policy_duration_steps),
+            )
+        modalities = {
+            int(v): (str(wam_policy.modality_by_vehicle.get(int(v), "objlist")),) for v in selected
+        }
+        bandwidth = {
+            int(v): float(wam_policy.bandwidth_by_vehicle.get(int(v), self._comm_bandwidth_ratio)) for v in selected
+        }
+        return CommPolicy(
+            policy_id=self._next_policy_id(), request_vehicle_id=int(self.ego.id),
+            start_step=int(step), duration_steps=int(self._comm_config.policy_duration_steps),
+            selected_collaborators=selected, modalities_by_vehicle=modalities,
+            bandwidth_by_vehicle=bandwidth, reason="stage2_uwm",
+        )
+
+    def _sample_stage2_comm_policy(self, step: int, candidates: List[int]) -> CommPolicy:
+        """Propose the collaboration policy from the Stage-2 UWM, conditioned on the current request graph.
+
+        Builds C^BS from ``self._wam_graph`` + the notable objects, runs ``propose_policies``, decodes the
+        first candidate -> :class:`WAMPolicy` -> :class:`CommPolicy`. (Hybrid Stage-1-U^pi scoring across
+        the k candidates is a future refinement; it would need a Stage-1 model loaded alongside.)"""
+        candidates = sorted(int(c) for c in candidates)
+        graph = getattr(self, "_wam_graph", None)
+        if not candidates or graph is None:
+            return make_local_policy(
+                policy_id=self._next_policy_id(), request_vehicle_id=int(self.ego.id),
+                start_step=int(step), duration_steps=int(self._comm_config.policy_duration_steps),
+            )
+        uwm = self._load_wam_uwm()
+        device = self._wam_predictor_device_resolved or self._resolve_wam_predictor_device()
+        notable_ids = [int(r.object_state.actor_id) for r in getattr(self, "_wam_notable_records", ())]
+        from .toolkit.wam import decode_chunk_to_wampolicy
+
+        with torch.no_grad():
+            cond, tids = uwm.condition_tokens([graph.clone().to(device)], 0, notable_ids)
+            cond = cond.unsqueeze(0); tids = tids.unsqueeze(0)
+            mask = torch.ones(1, cond.shape[1], device=cond.device)
+            m_max = int(uwm.flow.config.max_members)
+            mm = torch.zeros(1, m_max, device=cond.device)
+            mm[0, : min(len(candidates), m_max)] = 1.0
+            k = max(1, int(getattr(self, "_wam_uwm_candidates", 4)))
+            cand = uwm.flow.propose_policies(cond, tids, mask, n_candidates=k, member_mask=mm)
+        wam_policy = decode_chunk_to_wampolicy(cand[0, 0], candidates, num_formats=int(uwm.flow.config.num_formats))
+        V2V_LOGGER.info(
+            "WAM Stage-2 proposed policy step=%d selected=%s modalities=%s",
+            int(step), list(wam_policy.selected_vehicle_ids), dict(wam_policy.modality_by_vehicle),
+        )
+        return self._wampolicy_to_commpolicy(step, wam_policy)
+
+    def _load_lyapunov_scheduler(self):
+        """Load (and cache) the Lyapunov scheduler for ``policy_sampler_mode=lyapunov`` (Sec IV).
+
+        ``U_φ`` = the Stage-1 perception model when ``predictor_mode=checkpoint`` (else a rule fallback). No
+        Stage-2 UWM; candidate chunks come from the heuristic enumerator.
+        """
+        if self._wam_lyapunov_scheduler is not None:
+            return self._wam_lyapunov_scheduler
+        from .toolkit.wam import LyapunovScheduler, SchedulerConfig, WorldActionScorer
+
+        node = self._wam_lyap_config_node
+
+        def g(key, default):
+            return getattr(node, key, default) if node is not None else default
+
+        model = None
+        if str(getattr(self, "_wam_predictor_mode", "rule")).lower() == "checkpoint":
+            try:
+                model = self._load_wam_predictor()
+            except Exception as exc:  # unverified online path: fall back to the rule U_φ
+                V2V_LOGGER.warning("WAM lyapunov: Stage-1 U_φ load failed (%s); using rule fallback", exc)
+                model = None
+        cfg = SchedulerConfig(
+            lam=float(g("lam", 1.0)), c0=float(g("c0", 0.5)),
+            budget_bandwidth=float(g("budget_bandwidth_ratio", 0.4)),
+            F_max_slots=int(g("F_max_slots", 20)), n_min_slots=int(g("n_min_slots", 5)),
+            B_max_ratio=float(g("B_max_ratio", 1.0)),
+            bandwidth_grid=tuple(float(x) for x in self._as_config_list(g("bandwidth_grid", (0.2, 0.5, 0.8, 1.0)), default=(0.2, 0.5, 0.8, 1.0))),
+            duration_grid=tuple(int(x) for x in self._as_config_list(g("duration_grid", (5, 10, 20)), default=(5, 10, 20))),
+            j_max=int(g("j_max", 2)), eps_gap=float(g("eps_gap", 0.15)),
+            t_min_slots=int(g("t_min_slots", 3)), T_a_slots=int(g("T_a_slots", 5)),
+            ts_seconds=float(self._comm_config.dt),
+        )
+        device = self._wam_predictor_device_resolved or self._resolve_wam_predictor_device()
+        self._wam_predictor_device_resolved = device
+        scorer = WorldActionScorer(
+            perception_model=model, alpha=float(g("alpha", 0.5)),
+            sigma_scale=float(getattr(self, "_wam_uncertainty_sigma_scale", 4.0)),
+            freshness_gamma=float(getattr(self, "_wam_graph_gamma_freshness", 5.0)),
+            device=str(device),
+        )
+        self._wam_lyapunov_scheduler = LyapunovScheduler(cfg, scorer, request_vehicle_id=int(self.ego.id))
+        V2V_LOGGER.info("WAM lyapunov scheduler ready (U_φ=%s, Λ=%.3g, B̄_bgt=%.3g)",
+                        "checkpoint" if model is not None else "rule", cfg.lam, cfg.budget_bandwidth)
+        return self._wam_lyapunov_scheduler
+
+    def _build_rollout_context(self, step: int, candidates: List[int]):
+        """Build the ``C^BS`` :class:`RolloutContext` from the current slot state (reuses ``_wam_stage1_slot_state``)."""
+        from .toolkit.wam import GraphBuildSpec, RolloutContext
+
+        state = self._wam_stage1_slot_state(int(step))
+        ego = state["ego"]
+        cand = set(int(c) for c in candidates)
+        collaborators = tuple(c for c in state["collaborators"] if int(c.actor_id) in cand)
+        ego_v0 = math.hypot(float(ego.vx), float(ego.vy))
+        return RolloutContext(
+            ego=ego, collaborators=collaborators, objects=tuple(state["live_states"]),
+            route_xy=tuple(state["route_xy"]), notable_ids=tuple(state["notable_ids"]),
+            link_rate_fn=self._link_rate_bps,
+            graph_spec=GraphBuildSpec(route_waypoints=int(self._wam_graph_route_waypoints)),
+            bev_spec=self._wam_bev_spec, ego_v0=float(ego_v0),
+            past_route_xy=tuple(state.get("past_route_xy", ())),
+            dt_seconds=float(self._comm_config.dt),
+            sensor_period_steps=int(self._comm_config.sensor_period_steps),
+        )
+
+    def _wam_lyap_realized_uncertainty(self, step: int):
+        """Realized normalized ``U`` for the eq-8 mismatch trigger (from the uncertainty breakdown)."""
+        breakdown = getattr(self, "_wam_uncertainty_breakdown", None)
+        if not breakdown:
+            return None
+        value = breakdown.get("total_uncertainty_norm")
+        return float(value) if value is not None else None
+
+    def _wam_lyap_next_segment(self, step: int) -> Optional[CommPolicy]:
+        """Pop the next buffered chunk segment whose start has arrived (mid-chunk sub-action switch)."""
+        pending = getattr(self, "_wam_lyap_pending_segments", [])
+        if pending and int(pending[0].start_step) <= int(step):
+            return pending.pop(0)
+        return None
+
+    def _sample_lyapunov_comm_policy(self, step: int, candidates: List[int]) -> CommPolicy:
+        """Solve (P2), install the first chunk segment, buffer the rest, store the reference trajectory.
+
+        Defensive: any failure in the (unverified) online scheduler path falls back to a local-only policy."""
+        from dataclasses import replace
+
+        candidates = sorted(int(c) for c in candidates)
+        try:
+            sched = self._load_lyapunov_scheduler()
+            ctx = self._build_rollout_context(int(step), candidates)
+            self._wam_lyap_last_ctx = ctx
+            segments, _breakdown, chunk, _roll = sched.plan(ctx, int(step))
+            # re-id segments with the mixin's policy-id counter (the scheduler used its own)
+            segments = [replace(s, policy_id=self._next_policy_id()) for s in segments]
+            self._wam_lyap_reference = sched.ref
+            self._wam_lyap_pending_segments = list(segments[1:])
+            V2V_LOGGER.info(
+                "WAM lyapunov step=%d installed chunk J=%d F=%d first_selected=%s",
+                int(step), chunk.num_subepochs, chunk.horizon_slots,
+                list(segments[0].selected_collaborators),
+            )
+            return segments[0]
+        except Exception as exc:
+            V2V_LOGGER.warning("WAM lyapunov sampler failed (%s); installing local-only", exc)
+            self._wam_lyap_pending_segments = []
+            return make_local_policy(
+                policy_id=self._next_policy_id(), request_vehicle_id=int(self.ego.id),
+                start_step=int(step), duration_steps=int(self._comm_config.policy_duration_steps),
+            )
+
     def _sync_policy_views(self, policy: CommPolicy) -> None:
         """Mirror the active :class:`CommPolicy` into the WAMPolicy view used for info/graph."""
         self.selected_collaborators = set(int(c) for c in policy.selected_collaborators)
@@ -626,6 +824,33 @@ class V2VCommMixin:
                 policy = self._sample_random_comm_policy(step, candidates)
             proc.set_policy(policy, int(step))
             self._sync_policy_views(policy)
+            return
+
+        if sampler_mode == "stage2":
+            if active is not None and active.active_at(step):
+                return  # the UWM-proposed policy runs its full Td
+            policy = self._sample_stage2_comm_policy(step, candidates)
+            proc.set_policy(policy, int(step))
+            self._sync_policy_views(policy)
+            return
+
+        if sampler_mode == "lyapunov":
+            sched = self._load_lyapunov_scheduler()
+            # evolve the queues (Q_m, Z) for the just-elapsed slot using the last-planned context
+            if getattr(self, "_wam_lyap_last_ctx", None) is not None and sched.chunk is not None:
+                try:
+                    sched.observe_slot(self._wam_lyap_last_ctx, int(step))
+                except Exception:  # unverified online path
+                    pass
+            if sched.is_decision_epoch(int(step), self._wam_lyap_realized_uncertainty):
+                policy = self._sample_lyapunov_comm_policy(int(step), candidates)  # plan (P2) + install first segment
+                proc.set_policy(policy, int(step))
+                self._sync_policy_views(policy)
+            elif active is None or not active.active_at(step):
+                nxt = self._wam_lyap_next_segment(int(step))  # mid-chunk sub-action switch
+                if nxt is not None:
+                    proc.set_policy(nxt, int(step))
+                    self._sync_policy_views(nxt)
             return
 
         if active is not None and not active.is_local_only and active.active_at(step):

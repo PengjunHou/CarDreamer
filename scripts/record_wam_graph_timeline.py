@@ -240,6 +240,42 @@ def _cf_policy_specs(state, tokens):
     return specs
 
 
+def _cf_stage2_policy(uwm, sim, state, spec, bev_spec, device, n_candidates=1):
+    """Generate a request-vehicle collaboration policy from the trained Stage-2 UWM for this scene.
+
+    Builds the BS condition C^BS from the request vehicle's current perception graph (``sim._wam_graph``,
+    matching what Stage-2 trained on; falls back to an ego-only graph) + its notable objects, runs
+    ``propose_policies``, and decodes the first candidate into a :class:`WAMPolicy`. Member slots map to
+    the scene's collaborator ids (so the proposal can be turned into a real policy-conditioned graph).
+    Returns ``None`` if the scene has no collaborators or the graph is unavailable.
+    """
+    import torch
+
+    from car_dreamer.toolkit.wam import WAMPolicy, build_stage1_policy_graph, decode_chunk_to_wampolicy
+
+    collabs = list(state.get("collaborators", ()))
+    candidate_ids = [int(c.actor_id) for c in collabs]
+    if not candidate_ids:
+        return None
+    req_graph = getattr(sim, "_wam_graph", None)
+    if req_graph is None:
+        req_graph = build_stage1_policy_graph(
+            ego=state["ego"], collaborators=tuple(collabs), objects=tuple(state.get("live_states", ())),
+            policy=WAMPolicy((), {}, {}, 5, "cf"), spec=spec, notable_ids=state.get("notable_ids", ()),
+            latency_by_vehicle={}, bev_spec=bev_spec,
+        )
+    notable_ids = list(state.get("notable_ids", ()))
+    with torch.no_grad():
+        cond, tids = uwm.condition_tokens([req_graph.to(device)], 0, notable_ids)
+        cond = cond.unsqueeze(0); tids = tids.unsqueeze(0)
+        mask = torch.ones(1, cond.shape[1], device=cond.device)
+        m_max = int(uwm.flow.config.max_members)
+        mm = torch.zeros(1, m_max, device=cond.device)
+        mm[0, : min(len(candidate_ids), m_max)] = 1.0
+        cand = uwm.flow.propose_policies(cond, tids, mask, n_candidates=int(n_candidates), member_mask=mm)
+    return decode_chunk_to_wampolicy(cand[0, 0], candidate_ids, num_formats=int(uwm.flow.config.num_formats))
+
+
 def _cf_uncertainty(model, window, sim, state, policy, device, debug=False, coverage_override=None):
     """Per-policy motion + coverage uncertainty (+ [0,1] norm) for one counterfactual graph window.
 
@@ -331,8 +367,12 @@ def _cf_uncertainty(model, window, sim, state, policy, device, debug=False, cove
 
 
 def record_counterfactual_step(sim, model, windows, out_path, *, tokens, history_window, device,
-                               map_background=None, debug=False):
-    """One rollout step: build + record a per-policy graph and uncertainty for each counterfactual policy."""
+                               map_background=None, debug=False, uwm=None, uwm_candidates=1):
+    """One rollout step: build + record a per-policy graph and uncertainty for each counterfactual policy.
+
+    When ``uwm`` (a trained Stage-2 model) is given, also generates a ``stage2`` policy from it and scores
+    it with the same Stage-1 ``_cf_uncertainty`` as the fixed policies -- a direct apples-to-apples
+    "generator vs ego_only / nearest / all_candidates" comparison on the same scene (0-latency)."""
     from collections import deque
 
     from car_dreamer.toolkit.wam import (
@@ -355,8 +395,13 @@ def record_counterfactual_step(sim, model, windows, out_path, *, tokens, history
     bev_spec = getattr(sim, "_wam_bev_spec", BevSpec())
     world_extra = _timeline_world_extra(sim, getattr(sim, "_wam_graph", None), map_background=map_background)
     episode = int(getattr(sim, "_episode_count", 0) or 0)
+    specs = list(_cf_policy_specs(state, tokens))
+    if uwm is not None:
+        gen = _cf_stage2_policy(uwm, sim, state, spec, bev_spec, device, n_candidates=uwm_candidates)
+        if gen is not None:
+            specs.append(("stage2", gen))
     wrote = False
-    for label, policy in _cf_policy_specs(state, tokens):
+    for label, policy in specs:
         graph = build_stage1_policy_graph(
             ego=state["ego"], collaborators=tuple(state.get("collaborators", ())),
             objects=tuple(state.get("live_states", ())), policy=policy, spec=spec,
@@ -465,6 +510,12 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
                              "and build each policy's graph from delivered messages (stable family "
                              "ego_only/single_candidate_*/all_candidates_*). Default is 0-latency. "
                              "--cf-policies is ignored in this mode.")
+    parser.add_argument("--cf-uwm-checkpoint", default=None,
+                        help="Stage-2 UWM checkpoint; when set, also adds a 'stage2'-generated policy to the "
+                             "0-latency counterfactual set, scored by the same Stage-1 uncertainty "
+                             "(Phase-2 generator-vs-enumerated comparison). Ignored with --cf-comm-replay.")
+    parser.add_argument("--cf-uwm-candidates", type=int, default=1,
+                        help="n_candidates for propose_policies when --cf-uwm-checkpoint is set")
     known, passthrough = parser.parse_known_args()
     passthrough = [arg for arg in passthrough if arg != "--"]
     return known, passthrough
@@ -491,6 +542,7 @@ def main() -> int:
 
     cf_model = cf_windows = cf_device = cf_tokens = cf_history = None
     cf_comm_recorder = cf_slot_window = cf_sample_period = None
+    cf_uwm = None
     if known.counterfactual:
         loader = getattr(sim, "_load_wam_predictor", None)
         if loader is None:
@@ -526,6 +578,13 @@ def main() -> int:
             print(f"counterfactual COMM-REPLAY: stable policy family, history_window={cf_history} "
                   f"sample_period_steps={cf_sample_period} (--cf-policies ignored)", flush=True)
         else:
+            cf_uwm = None
+            if known.cf_uwm_checkpoint:
+                from car_dreamer.toolkit.wam import load_wam_uwm
+
+                cf_uwm = load_wam_uwm(known.cf_uwm_checkpoint, device=cf_device)
+                print(f"counterfactual + Stage-2 generator: uwm={known.cf_uwm_checkpoint} "
+                      f"candidates={known.cf_uwm_candidates}", flush=True)
             print(f"counterfactual recording (0-latency): policies={cf_tokens} history_window={cf_history}", flush=True)
 
     recorded = 0
@@ -542,7 +601,8 @@ def main() -> int:
             elif known.counterfactual:
                 if record_counterfactual_step(sim, cf_model, cf_windows, out_path, tokens=cf_tokens,
                                               history_window=cf_history, device=cf_device,
-                                              map_background=map_background, debug=known.cf_debug):
+                                              map_background=map_background, debug=known.cf_debug,
+                                              uwm=cf_uwm, uwm_candidates=known.cf_uwm_candidates):
                     recorded += 1
             elif record_step(sim, out_path, map_background=map_background):
                 recorded += 1

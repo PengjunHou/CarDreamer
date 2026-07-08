@@ -22,6 +22,8 @@ from car_dreamer.toolkit.wam import (
     WAMUnifiedWorldModel,
     build_wam_hetero_graph,
     collate_flow_samples,
+    decode_chunk_to_wampolicy,
+    load_wam_uwm,
     make_flow_sample,
     rasterize_bev,
 )
@@ -250,6 +252,39 @@ class EndToEndTest(unittest.TestCase):
             self.assertTrue(np.isfinite(result["final_loss"]))
             self.assertEqual(int(result["steps"]), 20)
             self.assertTrue(sorted(Path(tmp).glob("*.pt")))
+
+
+class Stage2InferenceUtilsTest(unittest.TestCase):
+    """load_wam_uwm round-trip + decode_chunk_to_wampolicy slot mapping."""
+
+    def test_load_wam_uwm_roundtrip(self):
+        gcfg, fcfg = graph_cfg(), small_flow_config()
+        model = WAMUnifiedWorldModel(gcfg, fcfg)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "uwm.pt"
+            torch.save({"model": model.state_dict(), "graph_config": gcfg, "flow_config": fcfg}, path)
+            loaded = load_wam_uwm(path, device="cpu")
+        self.assertEqual(int(loaded.flow.config.horizon), int(fcfg.horizon))
+        s1, s2 = model.state_dict(), loaded.state_dict()
+        self.assertEqual(set(s1), set(s2))
+        self.assertTrue(all(torch.equal(s1[k], s2[k]) for k in s1))
+        self.assertFalse(loaded.training)  # returned in eval mode
+
+    def test_decode_chunk_to_wampolicy(self):
+        F = 2
+        P = F + 3
+        chunk = torch.zeros(4, 3, P)  # [H, M, P]
+        # member0 (id 11): selected, fmt=bev(idx1), bw=0.7 ; member1: not selected ; member2 (id 13): objlist
+        chunk[0, 0, 0] = 6.0; chunk[0, 0, 1 + 1] = 6.0; chunk[0, 0, P - 1] = 0.7
+        chunk[0, 1, 0] = -6.0
+        chunk[0, 2, 0] = 6.0; chunk[0, 2, 1 + 0] = 6.0; chunk[0, 2, P - 1] = 0.4
+        pol = decode_chunk_to_wampolicy(chunk, [11, 12, 13], num_formats=F, step=0)
+        self.assertEqual(set(pol.selected_vehicle_ids), {11, 13})
+        self.assertEqual(pol.modality_by_vehicle[11], "bev")
+        self.assertEqual(pol.modality_by_vehicle[13], "objlist")
+        self.assertAlmostEqual(pol.bandwidth_by_vehicle[11], 0.7, places=4)
+        # slots beyond candidate_ids are ignored
+        self.assertTrue(set(pol.selected_vehicle_ids) <= {11, 12, 13})
 
 
 if __name__ == "__main__":
