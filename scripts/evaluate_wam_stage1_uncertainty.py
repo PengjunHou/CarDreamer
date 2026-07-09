@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--notable-gate-k", type=float, default=0.0,
                         help="soft-gate the notable_prob weight w=sigmoid(k*(p-0.5)) for the soft "
                              "motion_uncertainty column; 0=off. Pass the same k as the online run "
-                             "(env.wam.coverage.notable_gate_k, default 8) to match it.")
+                             "(env.wam.coverage.notable_gate_k, online default 20) to match it.")
     parser.add_argument("--notable-mass-floor", type=float, default=0.0,
                         help="denominator floor c in U=Sum(w*Tr)/(Sum(w)+c) (units: objects); no "
                              "confident notable -> ~0 instead of mean trace. 0=off. Online default 1.")
@@ -102,6 +102,8 @@ def main() -> int:
         "fde",
         "ade_notable",
         "fde_notable",
+        "object_window_presence_mean",
+        "object_window_presence_ego_mean",
         *COMM_REPLAY_METADATA_FIELDS,
     ]
     with out_path.open("w", newline="", encoding="utf-8") as f:

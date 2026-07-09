@@ -12,7 +12,7 @@ carla_wpt:
         destination_reached: 20.0,
       }
   terminal:
-    time_limit: 500 # maximum timesteps per episode
+    time_limit: 300 # maximum timesteps per episode
     out_lane_thres: 3 # threshold for out of lane
 
 carla_navigation:
@@ -97,7 +97,7 @@ carla_overtake:
         }
     terminal:
       out_lane_thres: 5 # threshold for out of lane
-      time_limit: 500 # maximum timesteps per episode
+      time_limit: 300 # maximum timesteps per episode
       left_lane_boundry: 3.7 # out of lane boundry
       right_lane_boundry: 17.7
       lane_width: 3.4
@@ -377,7 +377,7 @@ carla_traffic_lights:
         destination_reached: 20.0
         traffic_light_violate: 100.0
     terminal:
-      time_limit: 500 # maximum timesteps per episode
+      time_limit: 300 # maximum timesteps per episode
       out_lane_thres: 3 # threshold for out of lane
 
     lane_start_point:
@@ -435,7 +435,7 @@ carla_stop_sign:
         stop_sign: 5.0
         speed_before_stop: 1.0
     terminal:
-      time_limit: 500 # maximum timesteps per episode
+      time_limit: 300 # maximum timesteps per episode
       out_lane_thres: 3 # threshold for out of lane
 
     lane_start_point: [[179.5, -169.5, 5, 0.0]]
@@ -484,7 +484,7 @@ carla_follow:
       }
 
     terminal:
-      time_limit: 500 # maximum timesteps per episode
+      time_limit: 300 # maximum timesteps per episode
       out_lane_thres: 5 # threshold for out of lane
       terminal_dist: 30
 

@@ -48,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-min", type=int, default=5)
     p.add_argument("--alpha", type=float, default=0.5)
     p.add_argument("--ts-seconds", type=float, default=0.5)
+    p.add_argument("--max-score-candidates", type=int, default=200,
+                   help="scoring budget: local-only + all J=1 kept, J>=2 tail randomly subsampled (0 = score all)")
     p.add_argument("--out-dir", type=Path, default=Path("outputs/wam_lyapunov"))
     return p.parse_args()
 
@@ -105,9 +107,9 @@ def build_synthetic_contexts(
         ego_route = tuple((5.0 * (k + 1), 0.0) for k in range(max(int(route_waypoints), 1)))
         ego = VehicleNodeInput(actor_id=1, is_ego=True, agent_slot=0, x=0.0, y=0.0, z=0.0,
                                vx=3.0, vy=0.0, yaw=0.0, route_xy=ego_route)
-        # Collaborators sit DOWNSTREAM (facing forward) on the far part of the corridor that lies beyond the
-        # ego's own sensor range, so their shared observations fill a real coverage gap.
-        far = 0.55 * float(route_len)
+        # Collaborators sit DOWNSTREAM (facing forward) just past the ego's own sensor range (~22m), so their
+        # shared observations fill a real, still-route-weighted coverage gap.
+        far = 0.42 * float(route_len)
         members = []
         for k in range(int(n_members)):
             mx = far + 6.0 * k + 3.0 * math.sin(0.2 * t + k)
@@ -200,6 +202,7 @@ def main() -> int:
     cfg = SchedulerConfig(
         lam=args.lam, c0=args.c0, budget_bandwidth=args.budget, F_max_slots=args.f_max,
         n_min_slots=args.n_min, ts_seconds=args.ts_seconds,
+        max_score_candidates=args.max_score_candidates, candidate_seed=args.seed,
     )
     cfg._alpha = args.alpha  # passed through to the scorer
     rows, summary, paths = run_and_write(contexts, model=model, cfg=cfg, out_dir=args.out_dir)

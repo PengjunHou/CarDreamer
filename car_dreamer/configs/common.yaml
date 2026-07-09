@@ -250,25 +250,38 @@ env:
       lam: 1.0                 # Λ  (utility/backlog knob; Prop 1)
       c0: 0.5                  # amortized re-planning penalty (uncertainty units)
       budget_bandwidth_ratio: 0.4   # B̄_bgt  (per-slot allocated-bandwidth budget)
-      F_max_slots: 20          # F_max (eq 7)
-      n_min_slots: 5           # n_min (eq 2)
+      F_max_slots: 100         # F_max (eq 7); chunks with sum(n_j) > F_max are pruned
+      n_min_slots: 10          # n_min (eq 2)
       B_max_ratio: 1.0         # Σ B ≤ B_max (per sub-action)
       bandwidth_grid: [0.2, 0.5, 0.8, 1.0]   # heuristic candidate bandwidth ratios
-      duration_grid: [5, 10, 20]             # heuristic candidate sub-action durations
-      j_max: 2                 # chunk length cap (J≥1)
+      # n grid (env steps; comm slot == 1 step = 0.1s). Coarser than random_policy.duration_grid
+      # ([10..100]) because candidates grow as O(pool^j_max); values are kept on the data grid's
+      # points so data-driven (P2) cells remain comparable. Chunk horizons F(a) can still reach
+      # F_max via multi-segment combos (e.g. 50+50, 10+30+50).
+      duration_grid: [10, 30, 50]
+      j_max: 3                 # chunk length cap (J>=1)
+      # Scoring budget: local-only + all J=1 chunks are always evaluated; the J>=2 combinatorial
+      # tail is randomly subsampled (seeded, reproducible) up to this total. 0 = score everything.
+      max_score_candidates: 200
+      candidate_seed: 0
       eps_gap: 0.15            # ε_gap (eq 8 mismatch tolerance)
       t_min_slots: 3           # T_min (eq 8)
       T_a_slots: 5             # Ta (eq 8 monitoring cadence)
       alpha: 0.5               # α in U = αU^mot + (1−α)U^cov
       predictor_checkpoint: null  # Stage-1 U_phi; null -> rule fallback (NO Stage-2 UWM)
     random_policy:
-      local_prob: 0.2
-      collaborator_counts: ["1", "2", all]
+      # Sub-action a=(S,B,D,n) sampling grid (V2X paper Sec I.B). Each expired policy is replaced
+      # by a fresh uniform draw over the product grid; local-only is the "0" cell of
+      # collaborator_counts. local_prob is an EXTRA mixture weight for oversampling local-only
+      # (P(local) = p + (1-p)*P(k=0)); keep it 0.0 to avoid double counting.
+      local_prob: 0.0
+      collaborator_counts: ["0", "1"]  # |S| grid; paper constraint |S^(j)| <= 1
       modalities:
         - [objlist]
         - [bev]
         - [objlist, bev]
       bandwidth_ratios: [0.2,0.5, 0.8, 1.0]
+      duration_grid: [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]  # n grid (env steps; comm slot == 1 step = 0.1s)
       respect_request: False
     coverage:
       enabled: True

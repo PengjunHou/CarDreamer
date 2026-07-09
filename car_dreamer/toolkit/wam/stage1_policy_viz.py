@@ -14,13 +14,14 @@ COMM_METRICS = (
     "comm_window_v2v_slots",
     "comm_window_v2v_slot_rate",
     "comm_window_has_v2v_graph",
-    "comm_final_has_v2v_graph",
-    "comm_final_ego_visible_objects",
-    "comm_final_collab_only_objects",
-    "comm_final_total_objects",
-    "comm_final_collab_object_ratio",
     "comm_generated_messages",
     "comm_received_messages_by_prediction_step",
+)
+# Per-object window presence (frames per union object): total (any source) vs ego-only sensing.
+# Their gap is the extra frames-per-object cooperation contributed inside the window.
+PRESENCE_METRICS = (
+    "object_window_presence_mean",
+    "object_window_presence_ego_mean",
 )
 # Task-focused (GT-notable-only) variants emitted by evaluate_stage1_uncertainty_rows.
 NOTABLE_METRICS = (
@@ -48,6 +49,7 @@ METRICS = (
     "fde",
     *NOTABLE_METRICS,
     *NORM_METRICS,
+    *PRESENCE_METRICS,
     *COMM_METRICS,
 )
 SUMMARY_METRICS = (
@@ -60,6 +62,7 @@ SUMMARY_METRICS = (
     "fde",
     *NOTABLE_METRICS,
     *NORM_METRICS,
+    *PRESENCE_METRICS,
     *COMM_METRICS,
 )
 PLOTLY_INSTALL_HINT = (
@@ -283,7 +286,8 @@ def build_policy_uncertainty_figure(
         "coverage_uncertainty",
         "total_uncertainty",
         "comm_window_v2v_slot_rate",
-        "comm_final_collab_only_objects",
+        "object_window_presence_mean",
+        "object_window_presence_ego_mean",
         "comm_received_messages_by_prediction_step",
         "ade",
         "fde",

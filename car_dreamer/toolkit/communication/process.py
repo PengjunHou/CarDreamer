@@ -312,6 +312,7 @@ class CommunicationProcess:
                 tx_delay=float(tx_delay_s),
                 total_latency=total_latency_s,
                 distance_m=float(snap.distance_m),
+                rate_bps=float(rate_bps),
             )
             self._in_flight.append(message)
             emitted.append(message)
@@ -331,6 +332,66 @@ class CommunicationProcess:
         self._in_flight = remaining
         self.receive_queue.evict(step, self.config.prediction_window_steps)
         return delivered
+
+    # ----- per-slot queue/link primitives for the V2X (P2) evaluation -----
+    def comm_stats(
+        self,
+        step: int,
+        *,
+        link_rate_bps: Optional[LinkRateFn] = None,
+        distance_by_sender: Optional[Dict[int, float]] = None,
+    ) -> Dict[int, Dict[str, float]]:
+        """Per-selected-member queue/link primitives at env step ``step`` (V2X paper (P2) inputs).
+
+        Returns ``{sender_id: {arrival_bits, rate_bps, service_bits, backlog_bits, queue_busy_s}}``;
+        ``{}`` when the active policy is None or local-only. With the comm slot defined as one env
+        step, ``arrival_bits`` is L_m (payload bits generated this step), ``service_bits`` is
+        R_m * Ts = rate_bps * dt, and ``backlog_bits`` is the sender-queue + in-transmission backlog.
+        ``rate_bps`` is recomputed from ``link_rate_bps``/``distance_by_sender`` when given (exact:
+        the rate model is deterministic in distance and bandwidth), else read from the newest
+        message of that sender, else 0.
+        """
+        policy = self.policy
+        if policy is None or policy.is_local_only:
+            return {}
+        dt = float(self.config.dt)
+        now_s = int(step) * dt
+        distance_by_sender = {int(k): float(v) for k, v in (distance_by_sender or {}).items()}
+        stats: Dict[int, Dict[str, float]] = {}
+        for sender_id in policy.selected_collaborators:
+            m = int(sender_id)
+            arrival_bits = 8.0 * sum(
+                float(msg.payload_size)
+                for msg in (self._in_flight + self.receive_queue.messages)
+                if int(msg.sender_id) == m and int(msg.t_sense) == int(step)
+            )
+            backlog_bits = 8.0 * sum(
+                float(msg.payload_size) for msg in self._in_flight if int(msg.sender_id) == m
+            )
+            queue = self._sender_queues.get(m)
+            queue_busy_s = max(float(queue.busy_until) - now_s, 0.0) if queue is not None else 0.0
+            rate = 0.0
+            if link_rate_bps is not None and m in distance_by_sender:
+                rate = float(
+                    link_rate_bps(m, distance_by_sender[m], float(policy.bandwidth_by_vehicle.get(m, 0.0)))
+                )
+            else:
+                newest = None
+                for msg in self._in_flight + self.receive_queue.messages:
+                    if int(msg.sender_id) != m:
+                        continue
+                    if newest is None or int(msg.t_sense) > int(newest.t_sense):
+                        newest = msg
+                if newest is not None:
+                    rate = float(getattr(newest, "rate_bps", 0.0))
+            stats[m] = {
+                "arrival_bits": float(arrival_bits),
+                "rate_bps": float(rate),
+                "service_bits": float(rate) * dt,
+                "backlog_bits": float(backlog_bits),
+                "queue_busy_s": float(queue_busy_s),
+            }
+        return stats
 
     # ----- window-based selection for graph construction (§11-§14) -----
     def available_messages(self, step: int) -> List[V2VMessage]:

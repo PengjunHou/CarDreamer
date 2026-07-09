@@ -156,7 +156,7 @@ from .stage1 import (
     make_stage1_sample,
     wam_stage1_configs_from_env,
 )
-from .stage1_recorder import WAMStage1DataRecorder, perception_labels_at_t, union_object_ids, valid_object_ids
+from .stage1_recorder import WAMStage1DataRecorder, perception_labels_at_t, subaction_from_policy, union_object_ids, valid_object_ids
 from .stage1_policy import (
     COMM_REPLAY_METADATA_FIELDS,
     STAGE1_POLICY_TYPES,
@@ -342,6 +342,7 @@ __all__ = [
     "bev_payload_bytes",
     "build_stage1_policy_graph",
     "collate_stage1_samples",
+    "subaction_from_policy",
     "enumerate_stage1_policies",
     "evaluate_stage1_uncertainty_rows",
     "add_metric_delta",

@@ -40,17 +40,17 @@ EgoPose = Tuple[float, float, float]
 Point2D = Tuple[float, float]
 LinkRateFn = Callable[[int, float, float], float]
 
+# NOTE: the comm_final_* stats (last-frame visibility sets) were dropped from the CSV/summary
+# surface: under real latency the prediction frame is usually ego-only, so they read ~0 even when
+# earlier collaborator slots did reveal objects. Recorders still write them into sample metadata;
+# window-level presence is measured by the object_window_presence_* row fields instead
+# (computed at evaluation time from the stored window graphs).
 COMM_REPLAY_METADATA_FIELDS: Tuple[str, ...] = (
     "replay_mode",
     "comm_window_slots",
     "comm_window_v2v_slots",
     "comm_window_v2v_slot_rate",
     "comm_window_has_v2v_graph",
-    "comm_final_has_v2v_graph",
-    "comm_final_ego_visible_objects",
-    "comm_final_collab_only_objects",
-    "comm_final_total_objects",
-    "comm_final_collab_object_ratio",
     "comm_generated_messages",
     "comm_received_messages_by_prediction_step",
 )
@@ -1037,6 +1037,20 @@ def evaluate_stage1_uncertainty_rows(
         if limit is not None and idx >= int(limit):
             break
         window = [g.to(device) for g in sample["window"]]
+        # Per-object window presence: how many of the K+1 slots each union object appears in at all
+        # (ego OR collaborator source) vs via ego's own sensing only. Same union denominator, so
+        # (presence_mean - presence_ego_mean) is the extra frames-per-object cooperation contributed.
+        presence_slots: Dict[int, int] = {}
+        ego_presence_slots: Dict[int, int] = {}
+        for g in window:
+            slot_sets = _graph_object_visibility_sets(g)
+            for oid in slot_sets["all"]:
+                presence_slots[oid] = presence_slots.get(oid, 0) + 1
+            for oid in slot_sets["ego_visible"]:
+                ego_presence_slots[oid] = ego_presence_slots.get(oid, 0) + 1
+        n_union = len(presence_slots)
+        object_window_presence_mean = (sum(presence_slots.values()) / n_union) if n_union else 0.0
+        object_window_presence_ego_mean = (sum(ego_presence_slots.values()) / n_union) if n_union else 0.0
         out = model(window)
         trace_by_id: Dict[int, float] = {}
         if int(out["object_node_ids"].numel()) > 0:
@@ -1103,6 +1117,8 @@ def evaluate_stage1_uncertainty_rows(
             "fde": float(ade_fde["fde"]),
             "ade_notable": float(ade_fde.get("ade_notable", 0.0)),
             "fde_notable": float(ade_fde.get("fde_notable", 0.0)),
+            "object_window_presence_mean": float(object_window_presence_mean),
+            "object_window_presence_ego_mean": float(object_window_presence_ego_mean),
         }
         for field in COMM_REPLAY_METADATA_FIELDS:
             if field in metadata:

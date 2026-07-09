@@ -106,6 +106,27 @@ def perception_labels_at_t(
     }
 
 
+def subaction_from_policy(policy, *, at_step: Optional[int] = None) -> Dict[str, object]:
+    """Serialize an installed policy as the executed sub-action a=(S,B,D,n) (V2X paper Sec I.B).
+
+    Works for :class:`CommPolicy` and duck-typed fakes (attribute access via ``getattr``). With
+    ``at_step`` given, adds ``slot_offset = at_step - start_step`` (0 at the first slot of the
+    sub-action; the cold-start / latency ramp-up phase is small ``slot_offset``).
+    """
+    sub: Dict[str, object] = {
+        "policy_id": int(getattr(policy, "policy_id")),
+        "reason": str(getattr(policy, "reason", "")),
+        "S": [int(v) for v in getattr(policy, "selected_collaborators", ())],
+        "D": {int(k): [str(m) for m in v] for k, v in dict(getattr(policy, "modalities_by_vehicle", {})).items()},
+        "B": {int(k): float(v) for k, v in dict(getattr(policy, "bandwidth_by_vehicle", {})).items()},
+        "n": int(getattr(policy, "duration_steps")),
+        "start_step": int(getattr(policy, "start_step")),
+    }
+    if at_step is not None:
+        sub["slot_offset"] = int(at_step) - int(sub["start_step"])
+    return sub
+
+
 class WAMStage1DataRecorder:
     """Buffer per-step graph windows + GT futures and emit ``.pt`` Stage-1 window samples."""
 
@@ -147,6 +168,8 @@ class WAMStage1DataRecorder:
         self._history: Dict[int, Dict[int, Point2D]] = {}
         self._messages: Dict[object, object] = {}
         self._active_policy_by_step: Dict[int, Optional[int]] = {}
+        self._subaction_by_step: Dict[int, Optional[Dict[str, object]]] = {}
+        self._comm_stats_by_step: Dict[int, Dict[int, Dict[str, float]]] = {}
         self._pending: Deque[Tuple[int, Dict[str, object]]] = deque()
         self._written = 0
         self._episode_id = 0
@@ -162,6 +185,8 @@ class WAMStage1DataRecorder:
         self._history.clear()
         self._messages.clear()
         self._active_policy_by_step.clear()
+        self._subaction_by_step.clear()
+        self._comm_stats_by_step.clear()
         self._pending.clear()
         if episode_id is None:
             self._episode_id += 1
@@ -182,8 +207,29 @@ class WAMStage1DataRecorder:
         messages: Sequence[object],
         *,
         active_policy_id: Optional[int] = None,
+        active_policy: Optional[object] = None,
+        comm_stats: Optional[Mapping[int, Mapping[str, float]]] = None,
     ) -> None:
+        """Log the receive queue plus the executed sub-action / comm primitives for step ``step``.
+
+        ``active_policy`` (a :class:`CommPolicy` or a pre-serialized dict) and ``comm_stats``
+        (:meth:`CommunicationProcess.comm_stats` output) feed the ``active_subaction`` /
+        ``slot_subactions`` / ``slot_comm_stats`` sample metadata. NOTE the one-step snapshot
+        convention: the record script snapshots comm state at the top of the loop, so a policy
+        installed inside step ``t`` appears in this log at ``t+1`` (same convention as
+        ``_active_policy_by_step`` and the slot message filter); at an action boundary the logged
+        ``slot_offset`` can therefore equal ``n``.
+        """
         self._active_policy_by_step[int(step)] = None if active_policy_id is None else int(active_policy_id)
+        if active_policy is None:
+            self._subaction_by_step[int(step)] = None
+        elif isinstance(active_policy, Mapping):
+            self._subaction_by_step[int(step)] = dict(active_policy)
+        else:
+            self._subaction_by_step[int(step)] = subaction_from_policy(active_policy)
+        self._comm_stats_by_step[int(step)] = (
+            {} if comm_stats is None else {int(k): dict(v) for k, v in comm_stats.items()}
+        )
         for message in messages:
             msg_id = getattr(message, "msg_id", None)
             if msg_id is None:
@@ -313,6 +359,15 @@ class WAMStage1DataRecorder:
             ego_frame=self.ego_frame,
         )
         perception_labels = self._perception_labels_at_t(object_node_ids, last_state)
+        window_steps = [int(v) for v in payload.get("window_steps", ())]
+
+        def _with_offset(sub: Optional[Dict[str, object]], at_step: int) -> Optional[Dict[str, object]]:
+            if sub is None:
+                return None
+            out = dict(sub)
+            out["slot_offset"] = int(at_step) - int(out.get("start_step", at_step))
+            return out
+
         sample = make_stage1_sample(
             window,
             torch.from_numpy(target_xy),
@@ -322,9 +377,15 @@ class WAMStage1DataRecorder:
             metadata={
                 "step": int(step),
                 "episode_id": int(self._episode_id),
-                "window_steps": [int(v) for v in payload.get("window_steps", ())],
+                "window_steps": window_steps,
                 "slot_message_counts": [int(v) for v in slot_message_counts],
                 "slot_selected_vehicle_ids": [[int(v) for v in ids] for ids in slot_selected_vehicle_ids],
+                # Executed sub-action a=(S,B,D,n) at the prediction step / per window slot, plus
+                # per-slot per-member queue/link primitives (V2X (P2) inputs). All three are
+                # index-aligned with window_steps; None/{} where the caller logged nothing.
+                "active_subaction": _with_offset(self._subaction_by_step.get(int(step)), int(step)),
+                "slot_subactions": [_with_offset(self._subaction_by_step.get(s), s) for s in window_steps],
+                "slot_comm_stats": [dict(self._comm_stats_by_step.get(s, {})) for s in window_steps],
                 "fixed_dt": float(self.fixed_dt),
                 "sample_period_s": float(self.sample_period_s),
                 "sample_period_steps": int(self.sample_period_steps),
@@ -364,6 +425,19 @@ class WAMStage1DataRecorder:
         for step in list(self._history):
             if step < min_needed:
                 del self._history[step]
+        # Sub-action / comm-stats logs must survive as far back as the oldest pending sample's
+        # window slots (plus the receive window used by the message filter).
+        oldest_slot_step = (
+            int(min_needed)
+            - int(self.history_window) * int(self.sample_period_steps)
+            - int(self.receive_window_steps or 0)
+        )
+        for step in list(self._subaction_by_step):
+            if int(step) < oldest_slot_step:
+                del self._subaction_by_step[step]
+        for step in list(self._comm_stats_by_step):
+            if int(step) < oldest_slot_step:
+                del self._comm_stats_by_step[step]
         if self.receive_window_steps is not None:
             oldest_message_step = int(min_needed) - int(self.receive_window_steps)
             for key, message in list(self._messages.items()):

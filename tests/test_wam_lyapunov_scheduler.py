@@ -58,6 +58,33 @@ class CandidateTest(unittest.TestCase):
             self.assertTrue(all(sa.duration_slots >= 5 for sa in c.sub_actions))
             self.assertTrue(all(len(sa.selected) <= 1 for sa in c.sub_actions))
 
+    def test_scoring_budget_subsamples_multi_segment_tail(self):
+        import random as _random
+
+        # j_max=3 over two durations -> a large J>=2 tail worth capping
+        cfg = small_cfg(F_max_slots=20, duration_grid=(5, 10), j_max=3, max_score_candidates=12)
+        full = candidate_chunks(make_context(), small_cfg(F_max_slots=20, duration_grid=(5, 10), j_max=3))
+        capped = candidate_chunks(make_context(), cfg, _random.Random(0))
+        singles_full = [c for c in full if c.num_subepochs <= 1]
+        singles_capped = [c for c in capped if c.num_subepochs <= 1]
+        self.assertGreater(len(full), len(capped))
+        self.assertEqual(len(capped), max(cfg.max_score_candidates, len(singles_full)))
+        # local-only + every J=1 chunk survive the cap; only the J>=2 tail is sampled
+        self.assertEqual(len(singles_capped), len(singles_full))
+        self.assertTrue(any(all(sa.is_local_only for sa in c.sub_actions) for c in capped))
+        # reproducible for the same seed
+        again = candidate_chunks(make_context(), cfg, _random.Random(0))
+        key = lambda c: tuple((sa.selected, sa.duration_slots, tuple(sorted(sa.bandwidth_by_vehicle.items()))) for sa in c.sub_actions)
+        self.assertEqual([key(c) for c in capped], [key(c) for c in again])
+
+    def test_zero_budget_keeps_full_enumeration(self):
+        cfg_full = small_cfg(F_max_slots=20, duration_grid=(5, 10), j_max=2)
+        cfg_zero = small_cfg(F_max_slots=20, duration_grid=(5, 10), j_max=2, max_score_candidates=0)
+        self.assertEqual(
+            len(candidate_chunks(make_context(), cfg_full)),
+            len(candidate_chunks(make_context(), cfg_zero)),
+        )
+
 
 class SelectionTest(unittest.TestCase):
     def test_no_degradation(self):

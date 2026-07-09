@@ -273,6 +273,10 @@ class V2VCommMixin:
             for v in self._as_config_list(getattr(random_policy_cfg, "bandwidth_ratios", (1.0,)), default=(1.0,))
         ) or (1.0,)
         self._wam_random_policy_respect_request = bool(getattr(random_policy_cfg, "respect_request", False))
+        self._wam_random_policy_duration_grid = tuple(
+            max(1, int(v))
+            for v in self._as_config_list(getattr(random_policy_cfg, "duration_grid", None), default=())
+        ) or (int(self._comm_config.policy_duration_steps),)
         coverage_cfg = getattr(wam_cfg, "coverage", None)
         self._wam_coverage_enabled = bool(getattr(coverage_cfg, "enabled", True))
         self._wam_coverage_config = CoverageConfig(
@@ -526,7 +530,13 @@ class V2VCommMixin:
             reason="coop_request",
         )
 
+    def _sample_random_policy_duration(self) -> int:
+        """Sample the sub-action duration n (env steps; comm slot == 1 env step) from the grid."""
+        grid = tuple(getattr(self, "_wam_random_policy_duration_grid", ())) or (int(self._comm_config.policy_duration_steps),)
+        return int(grid[int(self._wam_policy_rng.integers(0, len(grid)))])
+
     def _random_policy_collaborator_count(self, n_candidates: int) -> int:
+        """Sample |S| from ``random_policy.collaborator_counts`` ("0" -> local-only, "all" -> every candidate)."""
         options = tuple(getattr(self, "_wam_random_policy_counts", (1, "all"))) or (1, "all")
         choice = options[int(self._wam_policy_rng.integers(0, len(options)))]
         if isinstance(choice, str):
@@ -540,19 +550,22 @@ class V2VCommMixin:
         return int(choice)
 
     def _sample_random_comm_policy(self, step: int, candidates: List[int]) -> CommPolicy:
-        """Sample one real policy for the next Td during data collection.
+        """Sample one real sub-action a=(S,B,D,n) and install it for its sampled duration n.
 
         This is not counterfactual enumeration: the sampled policy is installed into
         ``CommunicationProcess`` and the queues evolve under it until the policy expires.
+        n is drawn from ``random_policy.duration_grid`` (env steps); local-only sub-actions
+        ("0" in ``collaborator_counts`` or the ``local_prob`` mixture) sample n from the same grid.
         """
         candidates = sorted(int(c) for c in candidates)
+        duration = self._sample_random_policy_duration()
         local_prob = float(np.clip(float(getattr(self, "_wam_random_policy_local_prob", 0.2)), 0.0, 1.0))
         if not candidates or float(self._wam_policy_rng.random()) < local_prob:
             return make_local_policy(
                 policy_id=self._next_policy_id(),
                 request_vehicle_id=int(self.ego.id),
                 start_step=int(step),
-                duration_steps=int(self._comm_config.policy_duration_steps),
+                duration_steps=int(duration),
             )
 
         k = self._random_policy_collaborator_count(len(candidates))
@@ -562,7 +575,7 @@ class V2VCommMixin:
                 policy_id=self._next_policy_id(),
                 request_vehicle_id=int(self.ego.id),
                 start_step=int(step),
-                duration_steps=int(self._comm_config.policy_duration_steps),
+                duration_steps=int(duration),
             )
 
         selected = tuple(sorted(int(v) for v in self._wam_policy_rng.choice(candidates, size=k, replace=False)))
@@ -579,7 +592,7 @@ class V2VCommMixin:
             policy_id=self._next_policy_id(),
             request_vehicle_id=int(self.ego.id),
             start_step=int(step),
-            duration_steps=int(self._comm_config.policy_duration_steps),
+            duration_steps=int(duration),
             selected_collaborators=selected,
             modalities_by_vehicle={int(c): modalities for c in selected},
             bandwidth_by_vehicle={int(c): bandwidth_ratio for c in selected},
@@ -692,6 +705,8 @@ class V2VCommMixin:
             j_max=int(g("j_max", 2)), eps_gap=float(g("eps_gap", 0.15)),
             t_min_slots=int(g("t_min_slots", 3)), T_a_slots=int(g("T_a_slots", 5)),
             ts_seconds=float(self._comm_config.dt),
+            max_score_candidates=int(g("max_score_candidates", 200)),
+            candidate_seed=int(g("candidate_seed", 0)),
         )
         device = self._wam_predictor_device_resolved or self._resolve_wam_predictor_device()
         self._wam_predictor_device_resolved = device
@@ -818,7 +833,7 @@ class V2VCommMixin:
                     policy_id=self._next_policy_id(),
                     request_vehicle_id=int(self.ego.id),
                     start_step=int(step),
-                    duration_steps=int(self._comm_config.policy_duration_steps),
+                    duration_steps=self._sample_random_policy_duration(),
                 )
             else:
                 policy = self._sample_random_comm_policy(step, candidates)
@@ -914,6 +929,22 @@ class V2VCommMixin:
             modalities=tuple(modalities),
             data=data,
         )
+
+    def _wam_comm_slot_stats(self, step: int) -> Dict[int, Dict[str, float]]:
+        """Per-member queue/link primitives at env step ``step`` (V2X (P2) inputs; {} if local-only)."""
+        proc = self._ensure_comm_process()
+        policy = proc.policy
+        if policy is None or policy.is_local_only:
+            return {}
+        distances: Dict[int, float] = {}
+        for member_id in policy.selected_collaborators:
+            try:
+                actor = self._get_group_member_actor(int(member_id))
+            except RuntimeError:
+                actor = None
+            if actor is not None:
+                distances[int(member_id)] = float(_dist_m(actor, self.ego))
+        return proc.comm_stats(int(step), link_rate_bps=self._link_rate_bps, distance_by_sender=distances)
 
     def _deliver_comm_messages(self, step: int) -> None:
         """Deliver messages whose transmission completed by this simulation step."""

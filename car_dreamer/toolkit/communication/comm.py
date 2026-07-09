@@ -92,6 +92,7 @@ class V2VMessage:
     tx_delay: float = 0.0
     total_latency: float = 0.0
     distance_m: float = 0.0
+    rate_bps: float = 0.0  # link rate this message was scheduled at (bits/s)
 
     # ---- backward-compatible aliases (legacy graph_build / scripts) ----
     @property

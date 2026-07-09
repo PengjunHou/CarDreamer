@@ -98,7 +98,7 @@ class WorldActionScorer:
         mass_floor: float = 0.0,
         gate_k: Optional[float] = None,
         ego_fov: float = 150.0,
-        ego_sight_range: float = 40.0,
+        ego_sight_range: float = 22.0,
         collaborator_fov: float = 150.0,
         collaborator_sight_range: float = 40.0,
         bev_payload_mode: str = "feature",
@@ -112,9 +112,11 @@ class WorldActionScorer:
         self.model = perception_model
         self.risk_cfg = risk_cfg or RiskControlConfig()
         # Default corridor reaches beyond a single vehicle's sensor range, so a downstream collaborator can
-        # fill the far coverage gap that the ego alone cannot (this is where cooperation earns its cost).
+        # fill the coverage gap the ego alone cannot (this is where cooperation earns its cost). The route-risk
+        # scale is widened so the gap the collaborator fills still carries meaningful weight in U^cov (the
+        # weight ρ_r=1/(1+d/d0) otherwise down-weights far regions to near-zero).
         self.coverage_config = coverage_config or CoverageConfig(
-            freshness_gamma=freshness_gamma, future_route_distance_m=60.0
+            freshness_gamma=freshness_gamma, future_route_distance_m=50.0, route_risk_distance_scale_m=50.0
         )
         self.sigma_scale = float(sigma_scale)
         self.alpha = float(alpha)
@@ -217,15 +219,19 @@ class WorldActionScorer:
         return float(u_mot), tracked
 
     def _rule_uncertainty(
-        self, objects: Sequence[ObjectState], notable_ids: Sequence[int]
+        self, objects: Sequence[ObjectState], notable_ids: Sequence[int], selected_ids: Sequence[int] = ()
     ) -> Tuple[float, List[TrackedObject]]:
         notable = set(int(i) for i in notable_ids)
+        sel = set(int(m) for m in selected_ids)
         tracked: List[TrackedObject] = []
         traces: List[float] = []
         for o in objects:
             if int(o.actor_id) not in notable:
                 continue
-            trace = self.rule_visible_uncertainty if bool(o.visible_to_ego) else self.rule_invisible_uncertainty
+            # objects reaching here are already observed (ego or a selected collaborator); an object seen only
+            # via a collaborator is still "observed" -> low uncertainty (its V2V latency is priced in U^cov).
+            observed = bool(o.visible_to_ego) or bool(set(int(c) for c in o.visible_to_collaborators) & sel)
+            trace = self.rule_visible_uncertainty if observed else self.rule_invisible_uncertainty
             traces.append(trace)
             tracked.append(
                 TrackedObject(
@@ -298,6 +304,17 @@ class WorldActionScorer:
             objects = self._propagate_objects(ctx.objects, elapsed)
             members = [self._propagate_vehicle(collab_by_id[m], elapsed) for m in sub.selected if m in collab_by_id]
 
+            # ONLINE-FAITHFUL object visibility (no god-view): an object is knowable this slot only if the ego
+            # or a *selected* collaborator observes it. Unobserved objects (incl. ego-invisible ones with no
+            # selected observer) never enter the graph / U^mot, so cooperation's decision-time value flows
+            # through geometric coverage U^cov and causally-received partner data — never through knowing that
+            # a hidden object exists. (A learnable W_θ would instead *predict* likely blind-spot content.)
+            selected_ids = set(int(m) for m in sub.selected)
+            objects = [
+                o for o in objects
+                if bool(o.visible_to_ego) or (set(int(c) for c in o.visible_to_collaborators) & selected_ids)
+            ]
+
             # per-member latency / freshness / comm load under this sub-action
             latency_by_vehicle: Dict[int, float] = {}
             freshness: List[float] = []
@@ -333,7 +350,7 @@ class WorldActionScorer:
                     window = window[-self.history_window:]
                 u_mot, tracked = self._uphi_uncertainty(window, objects, ctx.notable_ids)
             else:
-                u_mot, tracked = self._rule_uncertainty(objects, ctx.notable_ids)
+                u_mot, tracked = self._rule_uncertainty(objects, ctx.notable_ids, selected_ids)
 
             u_cov = self._coverage_uncertainty(ctx, ego_pose, members, freshness)
             u_tau = self.alpha * u_mot + (1.0 - self.alpha) * u_cov

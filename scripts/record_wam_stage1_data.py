@@ -125,10 +125,14 @@ def _actor_snapshots(sim) -> Dict[int, object]:
 
 
 def _comm_snapshot(sim):
+    """Snapshot the receive queue, the active policy (= executed sub-action) and per-member comm stats."""
     proc = getattr(sim, "_comm_process", None)
     if proc is None:
-        return (), None
-    return tuple(getattr(proc.receive_queue, "messages", ())), proc.active_policy_id
+        return (), None, None, {}
+    step = int(getattr(sim, "_time_step", 0))
+    stats_fn = getattr(sim, "_wam_comm_slot_stats", None)
+    comm_stats = {} if stats_fn is None else stats_fn(step)
+    return tuple(getattr(proc.receive_queue, "messages", ())), proc.active_policy_id, proc.policy, comm_stats
 
 
 def _register_current_slot(sim, recorder, step: int) -> bool:
@@ -323,9 +327,15 @@ def main() -> int:
         while global_step <= last_observe_global_step:
             episode_step = int(getattr(sim, "_time_step", 0))
             recorder.observe(episode_step, _actor_snapshots(sim))
-            messages, active_policy_id = _comm_snapshot(sim)
+            messages, active_policy_id, active_policy, comm_stats = _comm_snapshot(sim)
             if hasattr(recorder, "observe_messages"):
-                recorder.observe_messages(episode_step, messages, active_policy_id=active_policy_id)
+                recorder.observe_messages(
+                    episode_step,
+                    messages,
+                    active_policy_id=active_policy_id,
+                    active_policy=active_policy,
+                    comm_stats=comm_stats,
+                )
             is_sample_step = int(episode_step) % int(sample_period_steps) == 0
             if known.policy_augmented and str(known.policy_replay_mode) == "communication":
                 state_fn = getattr(sim, "_wam_stage1_slot_state", None)

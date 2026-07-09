@@ -602,6 +602,39 @@ class PolicyAugmentedStage1Test(unittest.TestCase):
         self.assertTrue(np.isfinite(row["ade"]))
         self.assertTrue(np.isfinite(row["fde"]))
 
+    def test_object_window_presence_counts_slots_per_union_object(self):
+        cfg = perc_config()
+        # obj 100 present in all 3 slots, obj 101 only in the last 2 -> mean = (3+2)/2 = 2.5
+        window = [
+            graph_with_objects([(100, 8.0, 1.0)]),
+            graph_with_objects([(100, 8.1, 1.0), (101, 5.0, 2.0)]),
+            graph_with_objects([(100, 8.2, 1.0), (101, 5.1, 2.0)]),
+        ]
+        ids = union_object_ids(window)
+        sample = make_stage1_sample(window, torch.randn(len(ids), cfg.traj_samples, 2),
+                                    torch.ones(len(ids), cfg.traj_samples), ids)
+        row = evaluate_stage1_uncertainty_rows(WAMPerceptionModel(cfg), [sample], device="cpu")[0]
+        self.assertAlmostEqual(float(row["object_window_presence_mean"]), 2.5)
+        # everything here is ego-visible, so the ego-only presence matches
+        self.assertAlmostEqual(float(row["object_window_presence_ego_mean"]), 2.5)
+
+    def test_object_window_presence_separates_ego_from_collaborator_source(self):
+        cfg = perc_config()
+        ego, collabs, objects = policy_scene_inputs()  # 100 ego-visible; 101/102 collaborator-only
+        policy = WAMPolicy((2,), {2: "objlist"}, {2: 0.5}, 5, "t")
+        graph = build_stage1_policy_graph(
+            ego=ego, collaborators=collabs, objects=objects, policy=policy,
+            spec=GraphBuildSpec(route_waypoints=ROUTE_WAYPOINTS), notable_ids={101},
+        )
+        window = [graph, graph]
+        ids = union_object_ids(window)
+        sample = make_stage1_sample(window, torch.randn(len(ids), cfg.traj_samples, 2),
+                                    torch.ones(len(ids), cfg.traj_samples), ids)
+        row = evaluate_stage1_uncertainty_rows(WAMPerceptionModel(cfg), [sample], device="cpu")[0]
+        # collaborator-only objects count toward total presence but not toward ego presence
+        self.assertGreater(float(row["object_window_presence_mean"]),
+                           float(row["object_window_presence_ego_mean"]))
+
 
 class DatasetTrainerTest(unittest.TestCase):
     def _model_and_cfg(self, **overrides):

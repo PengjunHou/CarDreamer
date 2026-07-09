@@ -227,6 +227,7 @@ class WAMRuntimeTest(unittest.TestCase):
         mixin._wam_random_policy_counts = ("all",)
         mixin._wam_random_policy_modalities = (("bev",),)
         mixin._wam_random_policy_bandwidth_ratios = (0.5,)
+        mixin._wam_random_policy_duration_grid = (5,)
         mixin._comm_config = SimpleNamespace(policy_duration_steps=5)
         mixin._comm_policy_counter = 0
         mixin.ego = SimpleNamespace(id=100)
@@ -262,6 +263,7 @@ class WAMRuntimeTest(unittest.TestCase):
         mixin._wam_random_policy_counts = ("all",)
         mixin._wam_random_policy_modalities = (("objlist",),)
         mixin._wam_random_policy_bandwidth_ratios = (1.0,)
+        mixin._wam_random_policy_duration_grid = (5,)
         mixin._comm_config = SimpleNamespace(policy_duration_steps=5, sensor_period_steps=1)
         mixin._comm_policy_counter = 0
         mixin._wam_coop_request = None

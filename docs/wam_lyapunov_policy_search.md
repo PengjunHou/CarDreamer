@@ -106,9 +106,14 @@ New test modules: `test_wam_action_chunk`, `test_wam_lyapunov`, `test_wam_risk_c
 Import guard for the online wiring: `python -c "import car_dreamer.v2v_comm_mixin"`.
 
 ## Caveats & future work
-- **Λ trade-off needs a Stage-1 checkpoint.** The rule fallback's `U^mot` is *collaborator-blind* (reads only
-  `visible_to_ego`), so it cancels out of the (P2) argmin and the Λ utility/backlog curve is muted. Budget
-  compliance, no-degradation, and the adaptive price `Z(t)` are all clearly shown regardless (problems log P3).
+- **The perception↔communication trade-off is set by the budget `B̄_bgt`, not Λ** (paper Sec IV.C). Sweeping
+  `B̄_bgt` gives the clean monotone U-vs-communication curve (`analyze_wam_lyapunov_tradeoff.py --sweep budget`,
+  the default); sweeping Λ correctly leaves U ~flat (`U_c ≤ U_c^opt(B̄_bgt) + O(1/Λ)`) and is the
+  convergence/backlog view (`--sweep lam`).
+- **Online-faithful cooperation value (no god-view).** `WorldActionScorer.score_chunk` only admits objects the
+  ego or a *selected* collaborator observes, so cooperation's decision-time value flows through geometric
+  coverage `U^cov` — never through knowing a hidden object exists. Without a learnable `W_θ`, object-level
+  revelation cannot be predicted online, so `U^mot` is ~cooperation-invariant by design (problems log P3).
 - **Coverage rasterization** is the offline cost driver; use a coarse `--bev-size` for long runs / sweeps.
 - **Learnable `W_θ`** matching `a=(S,B,D,n)` (Sec III) would replace the heuristic enumerator — needs a fresh
   data pipeline over the new action structure; not built here.

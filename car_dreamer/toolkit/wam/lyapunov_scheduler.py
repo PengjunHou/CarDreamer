@@ -18,6 +18,7 @@ chunk's cost rate never exceeds the local-only baseline (paper Sec IV.C). No Sta
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -55,6 +56,12 @@ class SchedulerConfig:
     t_min_slots: int = 3             # T_min (eq 8)
     T_a_slots: int = 5               # Ta (eq 8 monitoring cadence)
     ts_seconds: float = 0.5          # Ts (slot duration for the queue bits<->rate bridge)
+    # Candidate-set tractability knob (0 = legacy full enumeration). When the feasible set is
+    # larger, local-only + ALL J=1 chunks are always kept (every member/bandwidth/duration
+    # single-segment option stays evaluated -> no-degradation preserved) and the J>=2
+    # combinatorial tail is randomly subsampled up to this total budget.
+    max_score_candidates: int = 0
+    candidate_seed: int = 0          # seed for the (reproducible) candidate subsampler
 
 
 # =====================================================================
@@ -62,8 +69,16 @@ class SchedulerConfig:
 # =====================================================================
 
 
-def candidate_chunks(ctx: RolloutContext, cfg: SchedulerConfig) -> List[ActionChunk]:
-    """Feasible candidates: heuristic chunks + always-feasible local-only, filtered by (P2) constraints."""
+def candidate_chunks(
+    ctx: RolloutContext, cfg: SchedulerConfig, rng: Optional[random.Random] = None
+) -> List[ActionChunk]:
+    """Feasible candidates: heuristic chunks + always-feasible local-only, filtered by (P2) constraints.
+
+    With ``cfg.max_score_candidates > 0`` the set is capped for tractability: local-only and ALL
+    J=1 chunks are always kept (so every member x bandwidth x duration single-segment option is
+    still evaluated and the no-degradation guarantee holds), while the J>=2 combinatorial tail is
+    randomly subsampled (seeded ``rng`` -> reproducible) up to the total budget.
+    """
     members = sorted({int(c.actor_id) for c in ctx.collaborators})
     chunks = enumerate_candidate_chunks(
         members,
@@ -82,6 +97,14 @@ def candidate_chunks(ctx: RolloutContext, cfg: SchedulerConfig) -> List[ActionCh
         if any(sa.total_bandwidth() > cfg.B_max_ratio + 1e-9 for sa in c.sub_actions):
             continue
         feasible.append(c)
+    cap = int(cfg.max_score_candidates)
+    if cap > 0 and len(feasible) > cap:
+        keep = [c for c in feasible if c.num_subepochs <= 1]
+        tail = [c for c in feasible if c.num_subepochs > 1]
+        budget = max(cap - len(keep), 0)
+        if budget < len(tail):
+            tail = (rng or random.Random(int(cfg.candidate_seed))).sample(tail, budget)
+        feasible = keep + tail
     if not feasible:  # degenerate config -> at least the local-only baseline
         feasible = [local_only_chunk(n_slots=max(cfg.n_min_slots, 1), n_min=cfg.n_min_slots)]
     return feasible
@@ -104,11 +127,12 @@ def _score_candidate(
 
 
 def select_action_chunk(
-    ctx: RolloutContext, *, scorer: WorldActionScorer, lyap: LyapunovState, cfg: SchedulerConfig
+    ctx: RolloutContext, *, scorer: WorldActionScorer, lyap: LyapunovState, cfg: SchedulerConfig,
+    rng: Optional[random.Random] = None,
 ) -> Tuple[ActionChunk, CostRateBreakdown, RolloutResult]:
     """(P2) argmin over feasible candidates. Local-only is always present -> no-degradation guarantee."""
     best: Optional[Tuple[float, ActionChunk, CostRateBreakdown, RolloutResult]] = None
-    for chunk in candidate_chunks(ctx, cfg):
+    for chunk in candidate_chunks(ctx, cfg, rng):
         br, roll = _score_candidate(ctx, chunk, scorer, lyap, cfg)
         if best is None or br.total < best[0]:
             best = (br.total, chunk, br, roll)
@@ -168,6 +192,7 @@ class LyapunovScheduler:
         self.ref: Optional[ReferenceTrajectory] = None
         self.chunk: Optional[ActionChunk] = None
         self.next_epoch: Optional[int] = None
+        self._cand_rng = random.Random(int(cfg.candidate_seed))
         self._policy_id = 0
         self.epochs = 0
         self.replans = 0
@@ -192,7 +217,7 @@ class LyapunovScheduler:
 
     def plan(self, ctx: RolloutContext, step: int):
         """Solve (P2), install the chunk, store the reference trajectory. Returns ``(segments, breakdown, chunk, rollout)``."""
-        chunk, br, roll = select_action_chunk(ctx, scorer=self.scorer, lyap=self.lyap, cfg=self.cfg)
+        chunk, br, roll = select_action_chunk(ctx, scorer=self.scorer, lyap=self.lyap, cfg=self.cfg, rng=self._cand_rng)
         segments = action_chunk_to_comm_segments(
             chunk, first_policy_id=self._policy_id, request_vehicle_id=self.request_vehicle_id, start_step=int(step)
         )
