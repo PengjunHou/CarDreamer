@@ -11,10 +11,13 @@ from car_dreamer.toolkit.communication.process import CommConfig
 from car_dreamer.toolkit.wam import (
     GraphBuildSpec,
     MODALITY_TO_ID,
+    OBJECT,
     OBS_OBJ,
     OBSERVATION,
     ObjectState,
     ObservationNodeInput,
+    VEHICLE,
+    VEH_VEH,
     VehicleNodeInput,
     WAMFlowMatchingConfig,
     WAMGraphModelConfig,
@@ -345,9 +348,16 @@ class PolicyAugmentedStage1Test(unittest.TestCase):
         all_obj = next(policy for name, policy in policies if name == "all_candidates_objlist")
         self.assertEqual(all_obj.selected_vehicle_ids, (2, 3))
         self.assertTrue(all(v == "objlist" for v in all_obj.modality_by_vehicle.values()))
-        self.assertTrue(all(v == 1.0 for v in all_obj.bandwidth_by_vehicle.values()))
+        # Shared spectrum: ratio 1.0 split across |S|=2 members -> 0.5 each (Σ B_m = 1.0).
+        self.assertTrue(all(v == 0.5 for v in all_obj.bandwidth_by_vehicle.values()))
+        self.assertAlmostEqual(sum(all_obj.bandwidth_by_vehicle.values()), 1.0)
+        single = next(policy for name, policy in policies if name == "single_candidate_objlist")
+        self.assertTrue(all(v == 1.0 for v in single.bandwidth_by_vehicle.values()))  # |S|=1 -> unchanged
 
-    def test_policy_graphs_change_with_selection_and_modality(self):
+    def test_inject_graph_adds_object_nodes_not_observation_nodes(self):
+        # Injection scheme (Phase 1): cooperation injects collaborator-revealed objects as OBJECT
+        # nodes into the ego-only graph; it does NOT add observation/vehicle nodes. Scene: ego sees
+        # 100; 101 visible to collab 2; 102 visible to collab 3.
         ego, collaborators, objects = policy_scene_inputs()
         spec = GraphBuildSpec(route_waypoints=ROUTE_WAYPOINTS, max_object_nodes=8)
         ego_only = WAMPolicy((), {}, {}, frequency_steps=5, reason="t")
@@ -361,10 +371,37 @@ class PolicyAugmentedStage1Test(unittest.TestCase):
         graph_bev = build_stage1_policy_graph(ego=ego, collaborators=collaborators, objects=objects,
                                               policy=all_bev, spec=spec, notable_ids={101})
 
-        self.assertGreater(int(graph_obj[OBSERVATION].node_mask.sum()), int(graph_ego[OBSERVATION].node_mask.sum()))
+        # ego-only graph: 1 vehicle, 1 observation, 1 object (100); no collaborator structure.
+        self.assertEqual(int(graph_ego[VEHICLE].node_mask.sum()), 1)
+        self.assertEqual(int(graph_ego[OBSERVATION].node_mask.sum()), 1)
+        self.assertEqual(int(graph_ego[OBJECT].node_mask.sum()), 1)
+        self.assertEqual(int(graph_ego[VEH_VEH].edge_index.shape[1]), 0)
+        # cooperation injects objects -> more OBJECT nodes, same #observation nodes (still 1).
+        self.assertEqual(int(graph_obj[OBSERVATION].node_mask.sum()), 1)
+        self.assertEqual(int(graph_obj[VEHICLE].node_mask.sum()), 1)
+        self.assertGreater(int(graph_obj[OBJECT].node_mask.sum()), int(graph_ego[OBJECT].node_mask.sum()))
         self.assertGreater(int(graph_obj[OBS_OBJ].edge_index.shape[1]), int(graph_ego[OBS_OBJ].edge_index.shape[1]))
-        self.assertEqual(int(graph_bev[OBS_OBJ].edge_index.shape[1]), int(graph_obj[OBS_OBJ].edge_index.shape[1]))
-        self.assertTrue(hasattr(graph_bev[OBSERVATION], "bev_raster"))
+        # injected objects are invisible (ego did not see them); ego's own object is visible.
+        ids = graph_obj[OBJECT].node_id.tolist()
+        vis = graph_obj[OBJECT].visible.tolist()
+        inv = graph_obj[OBJECT].invisible.tolist()
+        by_id = {int(i): (v, iv) for i, v, iv in zip(ids, vis, inv) if int(i) >= 0}
+        self.assertEqual(by_id[100], (1.0, 0.0))   # ego-visible
+        self.assertEqual(by_id[101], (0.0, 1.0))   # collaborator-injected
+        self.assertEqual(by_id[102], (0.0, 1.0))
+        # modality is irrelevant to the injection graph: objlist/bev policies give the same object set.
+        self.assertEqual(int(graph_bev[OBJECT].node_mask.sum()), int(graph_obj[OBJECT].node_mask.sum()))
+
+    def test_legacy_fusion_mode_still_adds_observation_nodes(self):
+        ego, collaborators, objects = policy_scene_inputs()
+        spec = GraphBuildSpec(route_waypoints=ROUTE_WAYPOINTS, max_object_nodes=8)
+        ego_only = WAMPolicy((), {}, {}, frequency_steps=5, reason="t")
+        all_bev = WAMPolicy((2, 3), {2: "bev", 3: "bev"}, {2: 1.0, 3: 1.0}, 5, "t")
+        graph_ego = build_stage1_policy_graph(ego=ego, collaborators=collaborators, objects=objects,
+                                              policy=ego_only, spec=spec, notable_ids={101}, fusion_mode="legacy")
+        graph_bev = build_stage1_policy_graph(ego=ego, collaborators=collaborators, objects=objects,
+                                              policy=all_bev, spec=spec, notable_ids={101}, fusion_mode="legacy")
+        self.assertGreater(int(graph_bev[OBSERVATION].node_mask.sum()), int(graph_ego[OBSERVATION].node_mask.sum()))
         self.assertIn(MODALITY_TO_ID["bev"], graph_bev[OBSERVATION].modality_id.tolist())
 
     def test_policy_sample_metadata_and_old_sample_compatibility(self):

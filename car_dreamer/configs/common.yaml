@@ -239,9 +239,11 @@ env:
     predictor_device: auto     # auto | cpu | cuda
     predictor_uncertainty_source: notable_weighted_trace
     predictor_history_window: 10
-    policy_sampler_mode: request_all  # request_all | random_duration | stage2 | lyapunov
+    policy_sampler_mode: request_all  # request_all | random_duration | stage2 | lyapunov | local_only | dreamer
     uwm_checkpoint: null       # Stage-2 UWM checkpoint when policy_sampler_mode=stage2
     uwm_candidates: 4          # propose_policies n_candidates for the stage2 sampler
+    dreamer_world_model: null  # P2 world-model checkpoint when policy_sampler_mode=dreamer
+    dreamer_actor_critic: null # P3 actor-critic checkpoint when policy_sampler_mode=dreamer
     # Lyapunov-guided world-action policy search (policy_sampler_mode="lyapunov", V2X paper Sec IV).
     # The BS solves the per-frame program (P2) over heuristic action chunks a=(S,B,D,n), scoring each by a
     # Stage-1 U_phi rollout (predictor_checkpoint below; rule fallback if null). Online wiring is written but

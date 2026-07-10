@@ -84,6 +84,11 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
             "communication replays V2V sender/receiver queues and delayed messages offline"
         ),
     )
+    parser.add_argument(
+        "--store-source",
+        action="store_true",
+        help="store per-slot raw graph inputs (source_window) for offline graph re-building without CARLA",
+    )
     parser.add_argument("--display", dest="display", action="store_true", default=True)
     parser.add_argument("--no-display", dest="display", action="store_false")
     parser.add_argument(
@@ -307,6 +312,7 @@ def main() -> int:
                 coverage_builder=getattr(sim, "_build_wam_coverage_for_stage1_slot", None),
                 receive_window_steps=int(sim._comm_config.prediction_window_steps),
                 allow_cross_policy_messages=bool(sim._comm_config.allow_cross_policy_messages),
+                store_source=bool(known.store_source),
             )
             sample_period_steps = int(recorder.sample_period_steps)
         print(

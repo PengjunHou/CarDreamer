@@ -145,9 +145,13 @@ class WAMStage1DataRecorder:
         allow_cross_policy_messages: bool = False,
         ego_frame: bool = True,
         prefix: str = "sample",
+        store_source: bool = False,
     ):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        # When True, store each window slot's raw graph inputs (ego + collaborators + live_states w/
+        # GT visibility + route + notable) so a future graph scheme can be rebuilt offline (no CARLA).
+        self.store_source = bool(store_source)
         self.fixed_dt = float(fixed_dt)
         raw_sample_period_s = self.fixed_dt if sample_period_s is None else float(sample_period_s)
         if raw_sample_period_s <= 0:
@@ -393,6 +397,22 @@ class WAMStage1DataRecorder:
         )
         if coverage_history is not None:
             sample["coverage_history"] = coverage_history
+        if self.store_source:
+            # Light per-slot raw inputs (picklable dataclasses; no raw messages/rasters) for offline
+            # graph re-building under a future scheme. Keys mirror _wam_stage1_slot_state.
+            src = payload.get("source_window") or ()
+            sample["source_window"] = [
+                {
+                    "step": int(st.get("step", 0)),
+                    "ego": st.get("ego"),
+                    "collaborators": tuple(st.get("collaborators", ())),
+                    "ego_pose": tuple(st.get("ego_pose", ())),
+                    "live_states": tuple(st.get("live_states", ())),
+                    "route_xy": tuple(st.get("route_xy", ())),
+                    "notable_ids": tuple(int(v) for v in st.get("notable_ids", ())),
+                }
+                for st in src
+            ]
         path = self.out_dir / f"{self.prefix}_{self._written:06d}.pt"
         torch.save(sample, path)
         self._written += 1

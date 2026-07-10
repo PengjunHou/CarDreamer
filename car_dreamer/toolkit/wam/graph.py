@@ -192,6 +192,60 @@ def _dist2_to_ego(ego: VehicleNodeInput, state: ObjectState) -> float:
 
 
 # =====================================================================
+# Injection (early) fusion
+# =====================================================================
+
+
+@dataclass
+class FusedObjects:
+    """Ego-centric hard-fused object set for the injection graph.
+
+    ``object_states`` are the deduped objects (ego-visible use ego's fresh state; collaborator-only
+    objects are injected with their snapshot state, keeping the highest-confidence detection when
+    several collaborators saw the same object). ``ego_visible_ids`` marks which are ego-visible (the
+    rest are injected -> ``invisible``). ``det_confidence_by_object`` feeds the obs_obj edge attr.
+    """
+
+    object_states: List[ObjectState]
+    ego_visible_ids: Set[int]
+    det_confidence_by_object: Dict[int, float]
+
+
+def detection_confidence(observer_xy: Point2D, obj: ObjectState) -> float:
+    """Distance-based detection-confidence proxy ``1/(1+d)`` (nearer observer -> more reliable)."""
+    d = math.hypot(float(obj.x) - float(observer_xy[0]), float(obj.y) - float(observer_xy[1]))
+    return 1.0 / (1.0 + float(d))
+
+
+def fuse_injected_objects(
+    ego_visible: Sequence[ObjectState],
+    collaborator_detections: Sequence[Tuple[ObjectState, float]],
+) -> FusedObjects:
+    """Fuse ego-visible objects with collaborator detections into one ego-centric object set.
+
+    ``collaborator_detections`` is a list of ``(object_state_at_t_sense, confidence)``. Ego's fresh
+    state always wins for objects ego can see; collaborator-only objects are injected, keeping the
+    highest-confidence detection per object id.
+    """
+    fused: Dict[int, ObjectState] = {}
+    conf: Dict[int, float] = {}
+    ego_ids: Set[int] = set()
+    for s in ego_visible:
+        oid = int(s.actor_id)
+        fused[oid] = s
+        conf[oid] = 1.0
+        ego_ids.add(oid)
+    for s, c in collaborator_detections:
+        oid = int(s.actor_id)
+        if oid in ego_ids:
+            continue  # ego's fresh state overrides stale collaborator snapshots
+        if oid not in fused or float(c) > conf[oid]:
+            fused[oid] = s
+            conf[oid] = float(c)
+    return FusedObjects(list(fused.values()), ego_ids, conf)
+
+
+# =====================================================================
 # Builder
 # =====================================================================
 
@@ -206,6 +260,7 @@ def build_wam_hetero_graph(
     spec: GraphBuildSpec = GraphBuildSpec(),
     notable_ids: Optional[Set[int]] = None,
     latency_by_vehicle: Optional[Dict[int, float]] = None,
+    object_visibility: Optional[Dict[int, bool]] = None,
 ) -> HeteroData:
     """Assemble the policy-conditioned heterogeneous graph ``G_t^{e,π}`` (§7).
 
@@ -222,6 +277,10 @@ def build_wam_hetero_graph(
     """
     latency_by_vehicle = {int(k): float(v) for k, v in (latency_by_vehicle or {}).items()}
     notable_ids = {int(i) for i in (notable_ids or set())}
+    # Injection (early-fusion) mode passes an explicit per-object ego-visibility map: an object is
+    # ``visible`` iff ego saw it directly, ``invisible`` iff it was injected from a collaborator's
+    # detection. When None, fall back to deriving visibility from ego's own observation node.
+    visibility_override = None if object_visibility is None else {int(k): bool(v) for k, v in object_visibility.items()}
     selected = {int(v) for v in policy.selected_vehicle_ids}
     modality_by_vehicle = _normalize_modalities(policy.modality_by_vehicle)
     K = max(int(spec.route_waypoints), 0)
@@ -310,7 +369,10 @@ def build_wam_hetero_graph(
         obj_class[i] = CLASS_TO_ID.get(str(s.object_class), CLASS_TO_ID["other"])
         obj_node_id[i] = int(s.actor_id)
         oid = int(s.actor_id)
-        visible = oid in ego_observed
+        if visibility_override is not None:
+            visible = bool(visibility_override.get(oid, False))
+        else:
+            visible = oid in ego_observed
         invisible = (not visible) and (oid in referenced)
         obj_visible[i] = 1.0 if visible else 0.0
         obj_invisible[i] = 1.0 if invisible else 0.0

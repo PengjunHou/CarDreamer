@@ -19,6 +19,8 @@ from car_dreamer.toolkit.wam import (
     WAMHeteroGraphNet,
     WAMPolicy,
     build_wam_hetero_graph,
+    detection_confidence,
+    fuse_injected_objects,
     hetero_graph_stats,
     vehicle_state_dim,
 )
@@ -205,6 +207,51 @@ class WAMGraphModelTest(unittest.TestCase):
         with torch.no_grad():
             H = net(data)
         self.assertTrue(all(bool(torch.isfinite(t).all()) for t in H.values()))
+
+
+class InjectionFusionTest(unittest.TestCase):
+    def _obj(self, oid, x, y, *, vte=True, vtc=()):
+        s = make_object(oid, x, y)
+        return ObjectState(
+            actor_id=oid, actor_type=s.actor_type, object_class=s.object_class, x=x, y=y, z=0.0,
+            vx=1.0, vy=0.0, yaw=0.0, length=4.0, width=2.0, height=1.5,
+            visible_to_ego=vte, visible_to_collaborators=vtc,
+        )
+
+    def test_fuse_prefers_ego_and_highest_confidence(self):
+        ego_vis = [self._obj(100, 5, 0)]
+        dets = [
+            (self._obj(101, 20, 0, vte=False, vtc=(2,)), 0.4),
+            (self._obj(101, 20, 0, vte=False, vtc=(3,)), 0.85),  # higher conf wins
+            (self._obj(100, 5, 0), 0.2),                          # ego already has it
+        ]
+        fused = fuse_injected_objects(ego_vis, dets)
+        self.assertEqual({int(s.actor_id) for s in fused.object_states}, {100, 101})
+        self.assertEqual(fused.ego_visible_ids, {100})
+        self.assertAlmostEqual(fused.det_confidence_by_object[101], 0.85)
+        self.assertEqual(fused.det_confidence_by_object[100], 1.0)
+
+    def test_detection_confidence_decreases_with_distance(self):
+        near = detection_confidence((0.0, 0.0), make_object(1, 1.0, 0.0))
+        far = detection_confidence((0.0, 0.0), make_object(1, 50.0, 0.0))
+        self.assertGreater(near, far)
+        self.assertLessEqual(near, 1.0)
+
+    def test_object_visibility_override_sets_labels(self):
+        ego = VehicleNodeInput(actor_id=1, is_ego=True, agent_slot=0, x=0, y=0, z=0, vx=1, vy=0, yaw=0,
+                               route_xy=((5.0, 0.0),))
+        objs = [make_object(100, 8, 1), make_object(101, 12, 6)]
+        # single ego observation referencing both; visibility comes from the override, not the obs.
+        obs = ObservationNodeInput(vehicle_id=1, modality="objlist", observed_object_ids=(100, 101),
+                                   det_confidence_by_object={100: 1.0, 101: 0.7})
+        policy = WAMPolicy((), {}, {}, frequency_steps=5, reason="inject")
+        data = build_wam_hetero_graph(ego=ego, collaborators=[], objects=objs, observations=[obs],
+                                      policy=policy, object_visibility={100: True, 101: False})
+        by_id = {int(i): (v, iv) for i, v, iv in zip(
+            data[OBJECT].node_id.tolist(), data[OBJECT].visible.tolist(), data[OBJECT].invisible.tolist()) if int(i) >= 0}
+        self.assertEqual(by_id[100], (1.0, 0.0))
+        self.assertEqual(by_id[101], (0.0, 1.0))  # injected -> invisible even though ego obs references it
+        self.assertEqual(int(data[VEH_VEH].edge_index.shape[1]), 0)
 
 
 if __name__ == "__main__":

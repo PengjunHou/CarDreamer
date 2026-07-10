@@ -238,7 +238,8 @@ class WAMRuntimeTest(unittest.TestCase):
         self.assertEqual(policy.duration_steps, 5)
         self.assertEqual(policy.selected_collaborators, (1, 2, 3))
         self.assertEqual(policy.modalities_by_vehicle, {1: ("bev",), 2: ("bev",), 3: ("bev",)})
-        self.assertEqual(policy.bandwidth_by_vehicle, {1: 0.5, 2: 0.5, 3: 0.5})
+        # Shared spectrum: sampled ratio 0.5 split across |S|=3 members -> 0.5/3 each (Σ B_m = 0.5).
+        self.assertEqual(policy.bandwidth_by_vehicle, {1: 0.5 / 3, 2: 0.5 / 3, 3: 0.5 / 3})
         self.assertEqual(policy.reason, "random_duration")
 
     def test_random_duration_policy_lifecycle_respects_td(self):

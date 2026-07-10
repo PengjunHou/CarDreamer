@@ -55,10 +55,13 @@ from .graph import (
     VEH_VEH_EDGE_DIM,
     VEHICLE,
     WAM_METADATA,
+    FusedObjects,
     GraphBuildSpec,
     ObservationNodeInput,
     VehicleNodeInput,
     build_wam_hetero_graph,
+    detection_confidence,
+    fuse_injected_objects,
     hetero_graph_stats,
     vehicle_state_dim,
 )
@@ -106,6 +109,7 @@ from .stage2 import (
     WAMStage2Trainer,
     collate_flow_samples,
     decode_chunk_to_wampolicy,
+    uwm_propose_chunks,
     load_wam_uwm,
     make_flow_sample,
     wam_configs_from_env,
@@ -139,6 +143,19 @@ from .risk_controller import (
     select_accel,
 )
 from .rollout_scorer import RolloutContext, RolloutResult, WorldActionScorer
+from .wam_mdp import (
+    ActionSpec,
+    MDPConfig,
+    encode_subaction,
+    decode_subaction,
+    subaction_from_metadata,
+    subaction_cost,
+    eq12_motion_uncertainty,
+)
+from .wam_rssm import RSSM, RSSMConfig
+from .wam_world_model import WAMWorldModel, WorldModelConfig, symlog, symexp
+from .wam_actor_critic import ActorCriticConfig, Critic, FactorizedActor, WAMActorCritic, lambda_return
+from .wam_planner import WAMDreamerPolicy, load_dreamer_policy
 from .lyapunov_scheduler import (
     LyapunovScheduler,
     ReferenceTrajectory,
@@ -249,6 +266,9 @@ __all__ = [
     "ObservationNodeInput",
     "VehicleNodeInput",
     "build_wam_hetero_graph",
+    "detection_confidence",
+    "fuse_injected_objects",
+    "FusedObjects",
     "hetero_graph_stats",
     "vehicle_state_dim",
     # graph embedding + HGT encoder (§5, §9)
@@ -292,6 +312,7 @@ __all__ = [
     "WAMStage2Trainer",
     "collate_flow_samples",
     "decode_chunk_to_wampolicy",
+    "uwm_propose_chunks",
     "load_wam_uwm",
     "make_flow_sample",
     "wam_configs_from_env",
@@ -323,6 +344,30 @@ __all__ = [
     "RolloutContext",
     "RolloutResult",
     "WorldActionScorer",
+    # cooperative-perception semi-MDP (Dreamer redesign, P1): reward + action codec + eq-12 U
+    "ActionSpec",
+    "MDPConfig",
+    "encode_subaction",
+    "decode_subaction",
+    "subaction_from_metadata",
+    "subaction_cost",
+    "eq12_motion_uncertainty",
+    # Dreamer world model (P2): RSSM + encoder/reward/cont/BEV heads
+    "RSSM",
+    "RSSMConfig",
+    "WAMWorldModel",
+    "WorldModelConfig",
+    "symlog",
+    "symexp",
+    # Dreamer actor-critic (P3): imagination policy + value
+    "ActorCriticConfig",
+    "FactorizedActor",
+    "Critic",
+    "WAMActorCritic",
+    "lambda_return",
+    # Dreamer online planner (P4)
+    "WAMDreamerPolicy",
+    "load_dreamer_policy",
     # Lyapunov-guided policy search (Sec IV, Algorithm 1): P2 solver + event-driven replan
     "LyapunovScheduler",
     "ReferenceTrajectory",

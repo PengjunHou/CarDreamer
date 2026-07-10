@@ -29,6 +29,8 @@ from .graph import (
     ObservationNodeInput,
     VehicleNodeInput,
     build_wam_hetero_graph,
+    detection_confidence,
+    fuse_injected_objects,
 )
 from .heads import per_object_trace, policy_uncertainty, trajectory_ade_fde
 from .runtime import ObjectState, WAMPolicy
@@ -105,7 +107,9 @@ def enumerate_stage1_policies(
 
     def make_policy(policy_type: str, selected: Sequence[int], modality: str) -> WAMPolicy:
         selected_tuple = tuple(int(v) for v in selected)
-        ratio = min(max(float(bandwidth_ratio), 0.0), 1.0) if selected_tuple else 0.0
+        # Shared spectrum: the ``bandwidth_ratio`` is the TOTAL band, split equally among the |S|
+        # selected members (per-member B_m = ratio/|S|), so Σ_m B_m = ratio (paper Σ B_m ≤ B_max).
+        ratio = (min(max(float(bandwidth_ratio), 0.0), 1.0) / len(selected_tuple)) if selected_tuple else 0.0
         return WAMPolicy(
             selected_vehicle_ids=selected_tuple,
             modality_by_vehicle={vid: str(modality) for vid in selected_tuple},
@@ -169,8 +173,14 @@ def build_stage1_policy_graph(
     bev_feature_dtype_bytes: int = 4,
     gamma_freshness: float = 5.0,
     overhead_bytes: int = 64,
+    fusion_mode: str = "inject",
 ) -> object:
-    """Build a policy-conditioned graph using the current step's visibility state."""
+    """Build a policy-conditioned graph using the current step's visibility state.
+
+    ``fusion_mode="inject"`` (Phase 1, default): ego-only structure + collaborator-revealed objects
+    injected as object nodes (no collaborator vehicle/observation nodes). ``fusion_mode="legacy"``:
+    the original big-graph scheme with collaborator observation nodes fused via GNN attention.
+    """
     latency_by_vehicle = {int(k): float(v) for k, v in (latency_by_vehicle or {}).items()}
     objects = list(objects)
     selected = [int(v) for v in policy.selected_vehicle_ids]
@@ -178,6 +188,40 @@ def build_stage1_policy_graph(
 
     ego_visible = [s for s in objects if bool(s.visible_to_ego)]
     ego_pose = (float(ego.x), float(ego.y), float(ego.yaw))
+
+    if str(fusion_mode).lower() == "inject":
+        detections = []
+        for vid in selected:
+            collab = collaborator_by_id.get(int(vid))
+            if collab is None:
+                continue
+            observer_xy = (float(collab.x), float(collab.y))
+            for s in objects:
+                if int(vid) in s.visible_to_collaborators:
+                    detections.append((s, detection_confidence(observer_xy, s)))
+        fused = fuse_injected_objects(ego_visible, detections)
+        ego_obs = ObservationNodeInput(
+            vehicle_id=int(ego.actor_id),
+            modality="objlist",
+            observed_object_ids=tuple(int(s.actor_id) for s in fused.object_states),
+            payload_bytes=objlist_payload_bytes(len(fused.object_states), overhead_bytes=overhead_bytes),
+            latency_s=0.0,
+            freshness=1.0,
+            quality=1.0,
+            sample_age_s=0.0,
+            det_confidence_by_object=dict(fused.det_confidence_by_object),
+        )
+        return build_wam_hetero_graph(
+            ego=ego,
+            collaborators=[],
+            objects=fused.object_states,
+            observations=[ego_obs],
+            policy=WAMPolicy(selected_vehicle_ids=(), modality_by_vehicle={}, bandwidth_by_vehicle={},
+                             frequency_steps=policy.frequency_steps, reason="inject"),
+            spec=spec,
+            notable_ids={int(i) for i in notable_ids},
+            object_visibility={int(oid): True for oid in fused.ego_visible_ids},
+        )
     observations: List[ObservationNodeInput] = [
         ObservationNodeInput(
             vehicle_id=int(ego.actor_id),
@@ -1017,15 +1061,15 @@ def evaluate_stage1_uncertainty_rows(
 ) -> List[Dict[str, object]]:
     """Run a Stage-1 model over samples and return CSV-ready uncertainty rows.
 
-    Also emits [0, 1]-normalized columns. ``motion_uncertainty_norm_notable`` is the mean over the
-    GT-notable set (``metadata['notable_object_ids']``) of ``1 - exp(-TrΣ_o / τ)``, with un-observed
-    notable objects counted as 1 (blind-spot penalty); a step with no notable objects -> 0 (it is NOT
-    averaged over the union -- that union fallback applies only to legacy samples lacking the
-    ``notable_object_ids`` field). ``total_uncertainty_norm_notable`` =
-    ``alpha * motion_norm + (1-alpha) * coverage_uncertainty`` (convex, so in [0, 1]). The ``_norm``
-    (without ``_notable``) variants are the same saturation but averaged over *all* observed objects
-    (the union; no fixed set / blind-spot term). ``sigma_scale`` (τ, m²) sets the saturation scale; if
-    ``None`` it is the median observed ``TrΣ_o`` across all samples.
+    Aggregate motion uncertainty (paper eq 11): ``motion_uncertainty`` is the soft-gated notable-mass-
+    floored weighted mean of ``TrΣ_o``; ``motion_uncertainty_notable`` is the equal-weight aggregate over
+    the GT-notable set (weights all 1). The [0,1]-normalized columns apply paper eq (12) to those
+    AGGREGATES: ``motion_uncertainty_norm = 1 - exp(-motion_uncertainty / σ_0)`` and
+    ``motion_uncertainty_norm_notable = 1 - exp(-motion_uncertainty_notable / σ_0)`` -- NOT a per-object
+    saturation averaged over the window union (that mismatched eq 12 and inflated cooperation via the
+    enlarged union object set). ``total_uncertainty_norm[_notable] = alpha * motion_norm +
+    (1-alpha) * coverage_uncertainty`` (convex, in [0, 1]). ``sigma_scale`` = σ_0 (a predefined reference
+    variance scale, m²); when ``None`` it falls back to the median observed ``TrΣ_o``.
     """
     device = torch.device(device)
     model.to(device)
@@ -1123,41 +1167,25 @@ def evaluate_stage1_uncertainty_rows(
         for field in COMM_REPLAY_METADATA_FIELDS:
             if field in metadata:
                 row[field] = metadata[field]
-        row["_trace_by_id"] = trace_by_id
-        # ``_has_ref`` distinguishes "notable set is known (this is policy/eval data)" from "field absent
-        # (legacy data)". A known-but-empty notable set means no notable objects this step -> motion 0,
-        # NOT a fallback to the union.
-        row["_has_ref"] = "notable_object_ids" in metadata
-        row["_ref_ids"] = [int(v) for v in metadata.get("notable_object_ids", [])]
         rows.append(row)
 
-    # [0, 1] normalization: saturate per-object TrΣ, fixed GT-notable set with blind-spot=1, then a
-    # convex combination with the (already [0, 1]) coverage term. tau defaults to the median TrΣ.
-    if sigma_scale is not None:
-        tau = max(float(sigma_scale), 1e-6)
-    else:
-        tau = max(float(_median(all_traces) or 1.0), 1e-6)
+    # [0, 1] normalization: paper eq (12) applied to the AGGREGATE motion uncertainty (eq 11), i.e.
+    # U^mot = 1 - exp(-Ũ^mot / σ_0), NOT per-object-then-average (which would (a) mismatch eq 12 by
+    # Jensen and (b) inflate cooperation via the enlarged window-union object set). ``motion_uncertainty``
+    # is the soft-gated aggregate; ``motion_uncertainty_notable`` is the equal-weight aggregate over the
+    # GT-notable set (weights all 1). ``σ_0`` = sigma_scale (a predefined reference variance scale; when
+    # omitted it falls back to the median observed TrΣ). Then a convex combo with the [0,1] coverage term.
+    sigma0 = max(float(sigma_scale), 1e-6) if sigma_scale is not None else max(float(_median(all_traces) or 1.0), 1e-6)
     a = float(min(max(alpha, 0.0), 1.0))
     for row in rows:
-        trace_by_id = row.pop("_trace_by_id", {})
-        ref_ids = row.pop("_ref_ids", [])
-        has_ref = bool(row.pop("_has_ref", False))
-        if has_ref:  # known GT-notable set: average over it (blind-spot=1); empty -> no notable -> 0
-            u_vals = [(1.0 - math.exp(-trace_by_id[o] / tau)) if o in trace_by_id else 1.0 for o in ref_ids]
-        elif trace_by_id:  # notable set unknown (legacy data) -> fall back to the observed union
-            u_vals = [1.0 - math.exp(-t / tau) for t in trace_by_id.values()]
-        else:
-            u_vals = []
-        motion_norm = float(sum(u_vals) / len(u_vals)) if u_vals else 0.0
         cov01 = min(max(float(row.get("coverage_uncertainty", 0.0)), 0.0), 1.0)
-        # Union variant: saturate over *all* observed objects (no fixed set / blind-spot term).
-        u_union = [1.0 - math.exp(-t / tau) for t in trace_by_id.values()]
-        motion_norm_union = float(sum(u_union) / len(u_union)) if u_union else 0.0
-        row["motion_uncertainty_norm"] = motion_norm_union
-        row["total_uncertainty_norm"] = a * motion_norm_union + (1.0 - a) * cov01
-        row["motion_uncertainty_norm_notable"] = motion_norm
-        row["total_uncertainty_norm_notable"] = a * motion_norm + (1.0 - a) * cov01
-        row["sigma_scale"] = float(tau)
+        motion_norm = 1.0 - math.exp(-float(row["motion_uncertainty"]) / sigma0)            # eq (12), soft aggregate
+        motion_norm_notable = 1.0 - math.exp(-float(row["motion_uncertainty_notable"]) / sigma0)  # eq (12), notable aggregate
+        row["motion_uncertainty_norm"] = motion_norm
+        row["total_uncertainty_norm"] = a * motion_norm + (1.0 - a) * cov01
+        row["motion_uncertainty_norm_notable"] = motion_norm_notable
+        row["total_uncertainty_norm_notable"] = a * motion_norm_notable + (1.0 - a) * cov01
+        row["sigma_scale"] = float(sigma0)
 
     if was_training:
         model.train()

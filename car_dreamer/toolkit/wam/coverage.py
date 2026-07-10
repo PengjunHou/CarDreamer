@@ -56,16 +56,38 @@ def _ego_to_world(x: float, y: float, ego_pose: EgoPose) -> Point2D:
 
 
 def _cell_centers_world(ego_pose: EgoPose, spec: BevSpec) -> np.ndarray:
+    """Vectorized ego-frame cell grid -> world coordinates (rotation + translation of a meshgrid)."""
     center = float(spec.size) / 2.0
     ppm = float(spec.pixels_per_meter)
     rows, cols = np.meshgrid(np.arange(spec.size), np.arange(spec.size), indexing="ij")
     ego_x = (center - (rows + 0.5)) / ppm
     ego_y = (center - (cols + 0.5)) / ppm
-    world = np.zeros((spec.size, spec.size, 2), dtype=np.float32)
-    for r in range(spec.size):
-        for c in range(spec.size):
-            world[r, c] = _ego_to_world(float(ego_x[r, c]), float(ego_y[r, c]), ego_pose)
-    return world
+    ex, ey, yaw_deg = ego_pose
+    yaw = math.radians(float(yaw_deg))
+    cos_a, sin_a = math.cos(yaw), math.sin(yaw)
+    wx = float(ex) + ego_x * cos_a - ego_y * sin_a
+    wy = float(ey) + ego_x * sin_a + ego_y * cos_a
+    return np.stack((wx, wy), axis=-1).astype(np.float32)
+
+
+def _cells_distance_to_polyline(centers: np.ndarray, polyline: Sequence[Point2D]) -> np.ndarray:
+    """Vectorized per-cell min distance to a polyline. ``centers`` is ``[H,W,2]``; returns ``[H,W]``."""
+    hw = centers.shape[:2]
+    if not polyline:
+        return np.full(hw, np.inf, dtype=np.float32)
+    poly = np.asarray(polyline, dtype=np.float64)
+    pts = centers.reshape(-1, 2).astype(np.float64)  # [N,2]
+    if len(poly) == 1:
+        d = np.hypot(pts[:, 0] - poly[0, 0], pts[:, 1] - poly[0, 1])
+        return d.reshape(hw).astype(np.float32)
+    a = poly[:-1]           # [S,2]
+    ab = poly[1:] - a       # [S,2]
+    denom = np.maximum((ab ** 2).sum(1), 1e-9)          # [S]
+    ap = pts[:, None, :] - a[None, :, :]                 # [N,S,2]
+    t = np.clip((ap * ab[None]).sum(2) / denom[None], 0.0, 1.0)  # [N,S]
+    proj = a[None] + t[..., None] * ab[None]             # [N,S,2]
+    d = np.sqrt(((pts[:, None, :] - proj) ** 2).sum(2))  # [N,S]
+    return d.min(1).reshape(hw).astype(np.float32)
 
 
 def _point_segment_distance(point: Point2D, start: Point2D, end: Point2D) -> float:
@@ -244,17 +266,13 @@ def build_coverage_raster(
         future_route_distance_m=config.future_route_distance_m,
     )
 
-    route_mask = np.zeros((spec.size, spec.size), dtype=np.float32)
-    route_risk = np.zeros_like(route_mask)
     ego_xy = (float(ego_pose[0]), float(ego_pose[1]))
     half_width = float(config.corridor_width_m) / 2.0
     route_scale = max(float(config.route_risk_distance_scale_m), 1e-6)
-    for r in range(spec.size):
-        for c in range(spec.size):
-            point = (float(centers[r, c, 0]), float(centers[r, c, 1]))
-            if _distance_to_polyline(point, corridor) <= half_width:
-                route_mask[r, c] = 1.0
-                route_risk[r, c] = 1.0 / (1.0 + math.hypot(point[0] - ego_xy[0], point[1] - ego_xy[1]) / route_scale)
+    dist_to_corridor = _cells_distance_to_polyline(centers, corridor)  # [H,W]
+    route_mask = (dist_to_corridor <= half_width).astype(np.float32)
+    dist_to_ego = np.hypot(centers[..., 0] - ego_xy[0], centers[..., 1] - ego_xy[1])
+    route_risk = (route_mask / (1.0 + dist_to_ego / route_scale)).astype(np.float32)
 
     polygons = actor_polygons or {}
     ego_quality = _observer_quality(

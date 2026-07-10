@@ -79,6 +79,8 @@ from .toolkit.wam import (
     build_coverage_raster,
     rasterize_bev,
     build_wam_hetero_graph,
+    detection_confidence,
+    fuse_injected_objects,
     hetero_graph_stats,
     predict_notable_motion,
     select_notable_objects,
@@ -221,6 +223,7 @@ class V2VCommMixin:
         self._wam_graph_bev_channels = int(getattr(graph_wam_cfg, "bev_channels", 7))
         self._wam_graph_bev_size = int(getattr(graph_wam_cfg, "bev_size", 64))
         self._wam_graph_bev_range_m = float(getattr(graph_wam_cfg, "bev_range_m", 50.0))
+        self._wam_graph_fusion_mode = str(getattr(graph_wam_cfg, "fusion_mode", "inject")).lower()
         self._wam_bev_spec = BevSpec(size=self._wam_graph_bev_size, range_m=self._wam_graph_bev_range_m)
         self._wam_graph_net = None
         self._wam_graph_embeddings = None
@@ -260,6 +263,13 @@ class V2VCommMixin:
         self._wam_lyap_last_ctx = None
         random_policy_cfg = getattr(wam_cfg, "random_policy", None)
         self._wam_policy_sampler_mode = str(getattr(wam_cfg, "policy_sampler_mode", "request_all")).lower()
+        # Dreamer online sampler (P4): trained world-model + actor-critic checkpoints.
+        self._wam_dreamer_world_model = getattr(wam_cfg, "dreamer_world_model", None)
+        self._wam_dreamer_actor_critic = getattr(wam_cfg, "dreamer_actor_critic", None)
+        self._wam_dreamer_policy = None
+        self._wam_dreamer_scorer = None
+        self._wam_dreamer_lyap = None
+        self._wam_dreamer_prev_sub = None
         self._wam_random_policy_local_prob = float(getattr(random_policy_cfg, "local_prob", 0.2))
         self._wam_random_policy_counts = self._as_config_list(
             getattr(random_policy_cfg, "collaborator_counts", (1, "all")),
@@ -397,6 +407,20 @@ class V2VCommMixin:
         self._wam_object_states_step = -1  # last step the (per-step) visibility scan ran
         self._wam_motion_predictions = {}
         self._wam_coop_request = None
+        # Per-episode Lyapunov reset: clear the virtual queue Z / link backlogs so they do not carry
+        # over across episodes (cached scheduler persists across env.reset).
+        self._wam_lyap_pending_segments = []
+        self._wam_lyap_reference = None
+        self._wam_lyap_last_ctx = None
+        sched = getattr(self, "_wam_lyapunov_scheduler", None)
+        if sched is not None and hasattr(sched, "reset"):
+            sched.reset()
+        # Per-episode Dreamer reset: clear the RSSM posterior carry, the shadow queue, and the prev action.
+        dreamer = getattr(self, "_wam_dreamer_policy", None)
+        if dreamer is not None and hasattr(dreamer, "reset"):
+            dreamer.reset()
+        self._wam_dreamer_lyap = None  # reloaded lazily on next decision (fresh queue)
+        self._wam_dreamer_prev_sub = None
         self._wam_graph = None
         self._wam_graph_step = -1
         graph_window_len = max(int(getattr(self, "_wam_predictor_history_window", 4)), 0) + 1
@@ -517,16 +541,18 @@ class V2VCommMixin:
 
     def _build_coop_policy(self, step: int, candidates: List[int]) -> CommPolicy:
         """Base-Station cooperative policy: all candidates collaborate, bundled modalities (§3)."""
-        bandwidth_ratio = float(self._comm_bandwidth_ratio)
+        cand = [int(c) for c in candidates]
+        # Shared spectrum: split the total bandwidth ratio equally across the |S| members (B_m = ratio/|S|).
+        bandwidth_ratio = float(self._comm_bandwidth_ratio) / max(len(cand), 1)
         modalities = tuple(self._collaborator_modalities)
         return CommPolicy(
             policy_id=self._next_policy_id(),
             request_vehicle_id=int(self.ego.id),
             start_step=int(step),
             duration_steps=int(self._comm_config.policy_duration_steps),
-            selected_collaborators=tuple(int(c) for c in candidates),
-            modalities_by_vehicle={int(c): modalities for c in candidates},
-            bandwidth_by_vehicle={int(c): bandwidth_ratio for c in candidates},
+            selected_collaborators=tuple(cand),
+            modalities_by_vehicle={int(c): modalities for c in cand},
+            bandwidth_by_vehicle={int(c): bandwidth_ratio for c in cand},
             reason="coop_request",
         )
 
@@ -587,6 +613,8 @@ class V2VCommMixin:
         ratios = tuple(getattr(self, "_wam_random_policy_bandwidth_ratios", (1.0,))) or (1.0,)
         bandwidth_ratio = float(ratios[int(self._wam_policy_rng.integers(0, len(ratios)))])
         bandwidth_ratio = float(np.clip(bandwidth_ratio, 0.0, 1.0))
+        # Shared spectrum: split the sampled total ratio equally across the |S| members (B_m = ratio/|S|).
+        bandwidth_ratio = bandwidth_ratio / max(len(selected), 1)
 
         return CommPolicy(
             policy_id=self._next_policy_id(),
@@ -707,6 +735,7 @@ class V2VCommMixin:
             ts_seconds=float(self._comm_config.dt),
             max_score_candidates=int(g("max_score_candidates", 200)),
             candidate_seed=int(g("candidate_seed", 0)),
+            uwm_candidates=int(g("uwm_candidates", 4)),
         )
         device = self._wam_predictor_device_resolved or self._resolve_wam_predictor_device()
         self._wam_predictor_device_resolved = device
@@ -716,9 +745,19 @@ class V2VCommMixin:
             freshness_gamma=float(getattr(self, "_wam_graph_gamma_freshness", 5.0)),
             device=str(device),
         )
-        self._wam_lyapunov_scheduler = LyapunovScheduler(cfg, scorer, request_vehicle_id=int(self.ego.id))
-        V2V_LOGGER.info("WAM lyapunov scheduler ready (U_φ=%s, Λ=%.3g, B̄_bgt=%.3g)",
-                        "checkpoint" if model is not None else "rule", cfg.lam, cfg.budget_bandwidth)
+        # Stage-2 UWM action proposer W_θ (Phase 5): loaded when env.wam.uwm_checkpoint is set.
+        uwm = None
+        uwm_ckpt = getattr(self, "_wam_uwm_checkpoint", None)
+        if uwm_ckpt not in (None, "", "null"):
+            try:
+                uwm = self._load_wam_uwm()
+            except Exception as exc:  # proposer is best-effort; heuristics still cover the candidate set
+                V2V_LOGGER.warning("WAM lyapunov: UWM proposer load failed (%s); heuristic-only", exc)
+                uwm = None
+        self._wam_lyapunov_scheduler = LyapunovScheduler(cfg, scorer, request_vehicle_id=int(self.ego.id), uwm=uwm)
+        V2V_LOGGER.info("WAM lyapunov scheduler ready (U_φ=%s, proposer=%s, Λ=%.3g, B̄_bgt=%.3g)",
+                        "checkpoint" if model is not None else "rule",
+                        "UWM" if uwm is not None else "heuristic", cfg.lam, cfg.budget_bandwidth)
         return self._wam_lyapunov_scheduler
 
     def _build_rollout_context(self, step: int, candidates: List[int]):
@@ -786,6 +825,119 @@ class V2VCommMixin:
                 start_step=int(step), duration_steps=int(self._comm_config.policy_duration_steps),
             )
 
+    def _load_dreamer_policy(self):
+        """Return the P4 Dreamer sampler. Policy + safety scorer are cached; the shadow queue is
+        (re)created per episode (``_wam_dreamer_lyap`` is cleared to ``None`` on ``_reset_wam_runtime_state``)."""
+        from .toolkit.wam import (
+            LyapunovConfig, LyapunovState, WorldActionScorer, load_dreamer_policy,
+        )
+
+        node = self._wam_lyap_config_node
+
+        def g(key, default):
+            return getattr(node, key, default) if node is not None else default
+
+        if self._wam_dreamer_policy is None:
+            device = self._wam_predictor_device_resolved or self._resolve_wam_predictor_device()
+            self._wam_predictor_device_resolved = device
+            self._wam_dreamer_policy = load_dreamer_policy(
+                str(self._wam_dreamer_world_model), str(self._wam_dreamer_actor_critic), device=str(device)
+            )
+            model = None
+            if str(getattr(self, "_wam_predictor_mode", "rule")).lower() == "checkpoint":
+                try:
+                    model = self._load_wam_predictor()
+                except Exception as exc:  # unverified online path
+                    V2V_LOGGER.warning("WAM dreamer: Stage-1 U_φ load failed (%s); rule fallback for safety P2", exc)
+                    model = None
+            self._wam_dreamer_scorer = WorldActionScorer(
+                perception_model=model, alpha=float(g("alpha", 0.5)),
+                sigma_scale=float(getattr(self, "_wam_uncertainty_sigma_scale", 4.0)),
+                freshness_gamma=float(getattr(self, "_wam_graph_gamma_freshness", 5.0)), device=str(device),
+            )
+            V2V_LOGGER.info("WAM dreamer sampler ready (world_model=%s, actor=%s)",
+                            self._wam_dreamer_world_model, self._wam_dreamer_actor_critic)
+        if self._wam_dreamer_lyap is None:  # fresh queue at episode start
+            self._wam_dreamer_lyap = LyapunovState(LyapunovConfig(
+                lam=float(g("lam", 1.0)), c0=float(g("c0", 0.5)),
+                budget_bandwidth=float(g("budget_bandwidth_ratio", 0.4)), ts_seconds=float(self._comm_config.dt)))
+            self._wam_dreamer_prev_sub = None
+        return self._wam_dreamer_policy
+
+    def _sample_dreamer_comm_policy(self, step: int, candidates: List[int]) -> CommPolicy:
+        """Dreamer actor picks ``(S,B,D)`` from the RSSM posterior; local-only safety keeps no-degradation.
+
+        Defensive: any failure in this (unverified) online path falls back to a local-only policy."""
+        import torch
+
+        from .toolkit.wam import MDPConfig, WAMPolicy, subaction_cost
+        from .toolkit.wam.action_chunk import SubAction, sub_action_to_comm_policy
+        from .toolkit.wam.graph import OBJECT, VEHICLE
+        from .toolkit.wam.stage1_policy import build_stage1_policy_graph
+
+        candidates = sorted(int(c) for c in candidates)
+        try:
+            policy_obj = self._load_dreamer_policy()
+            ctx = self._build_rollout_context(int(step), candidates)
+            model = self._load_wam_predictor()
+            device = self._wam_predictor_device_resolved
+            hidden = int(model.config.hidden_dim)
+
+            # observation graph embedding: build the graph under the currently-observed cooperation state
+            sel_ids = set(int(x) for x in getattr(self, "selected_collaborators", set()))
+            sel = [c for c in ctx.collaborators if int(c.actor_id) in sel_ids]
+            obs_policy = WAMPolicy(
+                selected_vehicle_ids=tuple(int(c.actor_id) for c in sel),
+                modality_by_vehicle={int(c.actor_id): "objlist" for c in sel},
+                bandwidth_by_vehicle={int(c.actor_id): 1.0 for c in sel},
+                frequency_steps=1, reason="dreamer_obs")
+            graph = build_stage1_policy_graph(
+                ego=ctx.ego, collaborators=list(sel), objects=list(ctx.objects),
+                policy=obs_policy, spec=ctx.graph_spec, notable_ids=ctx.notable_ids).to(device)
+            with torch.no_grad():
+                H = model.graph_net(graph)
+
+            def pool(key):
+                return H[key].mean(0) if (key in H and H[key].numel()) else torch.zeros(hidden, device=device)
+
+            graph_embed = torch.cat([pool(VEHICLE), pool(OBJECT)])
+            lyap = self._wam_dreamer_lyap
+            scalars = torch.tensor(
+                [lyap.z.value, lyap.total_backlog(), ctx.ego_v0, float(len(candidates)), float(len(ctx.notable_ids))],
+                dtype=torch.float32)
+            is_first = self._wam_dreamer_prev_sub is None
+            sub = policy_obj.act(graph_embed, scalars, candidate_ids=candidates, is_first=is_first)
+
+            # local-only safety: install whichever of {actor sub-action, local-only} has lower P2 cost
+            cfg = MDPConfig(lam=lyap.config.lam, c0=lyap.config.c0, budget_bandwidth=lyap.config.budget_bandwidth)
+            c_sub, roll_sub, _ = subaction_cost(ctx, sub, self._wam_dreamer_scorer, cfg,
+                                                z=lyap.z.value, link_backlogs=lyap.backlogs())
+            local = SubAction(selected=(), duration_slots=int(sub.duration_slots))
+            c_loc, roll_loc, _ = subaction_cost(ctx, local, self._wam_dreamer_scorer, cfg,
+                                                z=lyap.z.value, link_backlogs=lyap.backlogs())
+            if c_loc < c_sub:
+                sub, roll = local, roll_loc
+            else:
+                roll = roll_sub
+
+            # evolve the queue over the installed sub-action's slots (frame totals spread evenly)
+            nslot = max(int(sub.duration_slots), 1)
+            svc = {int(k): float(v) / nslot for k, v in roll.per_member_predicted_service_bits.items()}
+            arr = {int(k): float(v) / nslot for k, v in roll.per_member_predicted_load_bits.items()}
+            for _ in range(nslot):
+                lyap.advance_slot(per_member_service_bits=svc, per_member_arrival_bits=arr,
+                                  allocated_bandwidth=float(sub.total_bandwidth()), budget_bandwidth=cfg.budget_bandwidth)
+            self._wam_dreamer_prev_sub = sub
+            V2V_LOGGER.info("WAM dreamer step=%d selected=%s bw=%s local=%s",
+                            int(step), list(sub.selected), dict(sub.bandwidth_by_vehicle), bool(sub.is_local_only))
+            return sub_action_to_comm_policy(sub, policy_id=self._next_policy_id(),
+                                             request_vehicle_id=int(self.ego.id), start_step=int(step))
+        except Exception as exc:
+            V2V_LOGGER.warning("WAM dreamer sampler failed (%s); installing local-only", exc)
+            return make_local_policy(
+                policy_id=self._next_policy_id(), request_vehicle_id=int(self.ego.id),
+                start_step=int(step), duration_steps=int(self._comm_config.policy_duration_steps))
+
     def _sync_policy_views(self, policy: CommPolicy) -> None:
         """Mirror the active :class:`CommPolicy` into the WAMPolicy view used for info/graph."""
         self.selected_collaborators = set(int(c) for c in policy.selected_collaborators)
@@ -825,6 +977,18 @@ class V2VCommMixin:
         request = getattr(self, "_wam_coop_request", None)
         candidates = sorted(int(v) for v in getattr(self, "coop_participant_ids", set()))
         sampler_mode = str(getattr(self, "_wam_policy_sampler_mode", "request_all")).lower()
+        if sampler_mode == "local_only":
+            # Ego-only baseline: never cooperate (for the vs-lyapunov comparison, Phase 3).
+            if active is not None and active.is_local_only and active.active_at(step):
+                return
+            policy = make_local_policy(
+                policy_id=self._next_policy_id(), request_vehicle_id=int(self.ego.id),
+                start_step=int(step), duration_steps=int(self._comm_config.policy_duration_steps),
+            )
+            proc.set_policy(policy, int(step))
+            self._sync_policy_views(policy)
+            return
+
         if sampler_mode == "random_duration":
             if active is not None and active.active_at(step):
                 return  # sampled policies, including local-only, persist for the full Td
@@ -845,6 +1009,15 @@ class V2VCommMixin:
             if active is not None and active.active_at(step):
                 return  # the UWM-proposed policy runs its full Td
             policy = self._sample_stage2_comm_policy(step, candidates)
+            proc.set_policy(policy, int(step))
+            self._sync_policy_views(policy)
+            return
+
+        if sampler_mode == "dreamer":
+            # trained Dreamer actor picks (S,B,D) per decision epoch; the sub-action runs its short duration
+            if active is not None and active.active_at(step):
+                return
+            policy = self._sample_dreamer_comm_policy(int(step), candidates)
             proc.set_policy(policy, int(step))
             self._sync_policy_views(policy)
             return
@@ -1751,6 +1924,20 @@ class V2VCommMixin:
     ):
         dt = float(self._comm_config.dt)
         ego_visible = [s for s in live_states if bool(s.visible_to_ego)]
+
+        # Most-recent message per collaborator (§13.2): its latency drives the veh_veh edge.
+        latest_by_sender: Dict[int, Any] = {}
+        for message in messages:
+            current = latest_by_sender.get(int(message.sender_id))
+            if current is None or int(message.t_sense) >= int(current.t_sense):
+                latest_by_sender[int(message.sender_id)] = message
+
+        if str(getattr(self, "_wam_graph_fusion_mode", "inject")).lower() == "inject":
+            return self._assemble_wam_graph_inject(
+                ego=ego, ego_visible=ego_visible, messages=messages,
+                latest_by_sender=latest_by_sender, notable_ids=notable_ids,
+            )
+
         observations = [
             ObservationNodeInput(
                 vehicle_id=int(ego.actor_id),
@@ -1779,13 +1966,6 @@ class V2VCommMixin:
                 ),
             ),
         ]
-
-        # Most-recent message per collaborator (§13.2): its latency drives the veh_veh edge.
-        latest_by_sender: Dict[int, Any] = {}
-        for message in messages:
-            current = latest_by_sender.get(int(message.sender_id))
-            if current is None or int(message.t_sense) >= int(current.t_sense):
-                latest_by_sender[int(message.sender_id)] = message
 
         collaborators: List[VehicleNodeInput] = []
         latency_by_vehicle: Dict[int, float] = {}
@@ -1854,6 +2034,54 @@ class V2VCommMixin:
             latency_by_vehicle=latency_by_vehicle,
         )
         return graph, latest_by_sender, observations, ego_visible
+
+    def _assemble_wam_graph_inject(self, *, ego, ego_visible, messages, latest_by_sender, notable_ids):
+        """Injection (early-fusion) graph: ego-only structure + collaborator-revealed objects injected
+        as object nodes (Phase 1). No collaborator vehicle/observation nodes, no veh_veh edges."""
+        # Collect collaborator detections: each message's snapshot objects @ t_sense, with a
+        # distance-based confidence from the sender's pose. fuse_injected_objects dedups (ego wins,
+        # else highest confidence).
+        detections = []
+        for message in messages:
+            pose = message.data.get("pose", {})
+            observer_xy = (float(pose.get("x", 0.0)), float(pose.get("y", 0.0)))
+            for snap_state in message.data.get("object_states", ()):
+                detections.append((snap_state, detection_confidence(observer_xy, snap_state)))
+        fused = fuse_injected_objects(ego_visible, detections)
+
+        ego_obs = ObservationNodeInput(
+            vehicle_id=int(ego.actor_id),
+            modality="objlist",
+            observed_object_ids=tuple(int(s.actor_id) for s in fused.object_states),
+            payload_bytes=self._wam_objlist_payload_bytes(len(fused.object_states)),
+            latency_s=0.0,
+            freshness=1.0,
+            quality=1.0,
+            sample_age_s=0.0,
+            det_confidence_by_object=dict(fused.det_confidence_by_object),
+        )
+        policy_view = WAMPolicy(
+            selected_vehicle_ids=(),
+            modality_by_vehicle={},
+            bandwidth_by_vehicle={},
+            frequency_steps=int(self._comm_config.sensor_period_steps),
+            reason="inject",
+        )
+        spec = GraphBuildSpec(
+            route_waypoints=int(self._wam_graph_route_waypoints),
+            max_object_nodes=int(self._wam_graph_max_object_nodes),
+        )
+        graph = build_wam_hetero_graph(
+            ego=ego,
+            collaborators=[],
+            objects=fused.object_states,
+            observations=[ego_obs],
+            policy=policy_view,
+            spec=spec,
+            notable_ids={int(v) for v in notable_ids},
+            object_visibility={int(oid): True for oid in fused.ego_visible_ids},
+        )
+        return graph, latest_by_sender, [ego_obs], ego_visible
 
     def _wam_stage1_slot_state(self, step: int):
         """Capture the slot-local graph inputs used later by Stage-1 recording."""
@@ -2103,6 +2331,21 @@ class V2VCommMixin:
             "wam_policy_selected_vehicle_ids": list(policy.selected_vehicle_ids) if policy is not None else [],
             "wam_policy_modality_by_vehicle": dict(policy.modality_by_vehicle) if policy is not None else {},
         }
+        # Allocated bandwidth this step = Σ_m B_m of the active BS policy (0 for local-only).
+        active_policy = getattr(self._ensure_comm_process(), "policy", None) if hasattr(self, "_ensure_comm_process") else None
+        if active_policy is not None:
+            info["wam_allocated_bandwidth"] = float(sum(float(v) for v in active_policy.bandwidth_by_vehicle.values()))
+        else:
+            info["wam_allocated_bandwidth"] = 0.0
+        # Lyapunov queue state (only populated in policy_sampler_mode=lyapunov).
+        sched = getattr(self, "_wam_lyapunov_scheduler", None)
+        if sched is not None and getattr(sched, "lyap", None) is not None:
+            try:
+                info["wam_lyap_z"] = float(sched.lyap.z.value)
+                info["wam_lyap_total_backlog"] = float(sum(float(v) for v in sched.lyap.backlogs().values()))
+            except Exception:  # unverified online scheduler path: never break the info dict
+                info["wam_lyap_z"] = 0.0
+                info["wam_lyap_total_backlog"] = 0.0
         graph = getattr(self, "_wam_graph", None)
         if graph is not None:
             info.update(hetero_graph_stats(graph))

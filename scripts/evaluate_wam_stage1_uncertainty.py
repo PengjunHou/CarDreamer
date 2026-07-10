@@ -29,7 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--sigma-scale", type=float, default=None,
-                        help="tau (m^2) for the [0,1] saturation 1-exp(-TrSigma/tau); default=auto (median TrSigma)")
+                        help="sigma_0 (m^2): predefined reference scale for paper eq (12) normalization "
+                             "U^mot=1-exp(-U_agg/sigma_0); default=auto (median observed TrSigma)")
     parser.add_argument("--alpha", type=float, default=0.5,
                         help="convex weight on motion vs coverage for total_uncertainty_norm (in [0,1])")
     parser.add_argument("--notable-gate-k", type=float, default=0.0,

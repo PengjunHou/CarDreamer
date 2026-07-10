@@ -475,3 +475,56 @@ def decode_chunk_to_wampolicy(
         frequency_steps=int(frequency_steps),
         reason="stage2_generated",
     )
+
+
+def uwm_propose_chunks(
+    uwm: WAMUnifiedWorldModel,
+    request_graph,
+    notable_object_ids: Sequence[int],
+    candidate_ids: Sequence[int],
+    *,
+    n_candidates: int = 4,
+    duration_grid: Sequence[int] = (10, 30, 50),
+    sel_threshold: float = 0.5,
+    device: Union[str, torch.device] = "cpu",
+):
+    """UWM as the generative action proposer W_θ (paper Sec III): draw ``n_candidates`` policy chunks,
+    decode each to a cooperation decision (S, B, D) at step 0, and wrap it over ``duration_grid`` into
+    :class:`ActionChunk` candidates (|S|<=1, single sub-action). Local-only proposals are skipped
+    (``local_only_chunk`` is always present in the scheduler's candidate set). Returns a deduped list.
+    """
+    from .action_chunk import ActionChunk, SubAction
+
+    cand = [int(c) for c in candidate_ids]
+    if not cand or int(n_candidates) <= 0:
+        return []
+    uwm.eval()
+    with torch.no_grad():
+        cond, tids = uwm.condition_tokens([request_graph.to(device)], 0, [int(v) for v in notable_object_ids])
+        cond = cond.unsqueeze(0)
+        tids = tids.unsqueeze(0)
+        mask = torch.ones(1, cond.shape[1], device=cond.device)
+        m_max = int(uwm.flow.config.max_members)
+        mm = torch.zeros(1, m_max, device=cond.device)
+        mm[0, : min(len(cand), m_max)] = 1.0
+        pol = uwm.flow.propose_policies(cond, tids, mask, n_candidates=int(n_candidates), member_mask=mm)
+    num_formats = int(uwm.flow.config.num_formats)
+    chunks = []
+    seen = set()
+    for i in range(pol.shape[1]):
+        wp = decode_chunk_to_wampolicy(pol[0, i], cand, num_formats=num_formats, step=0, sel_threshold=sel_threshold)
+        sel = [int(v) for v in wp.selected_vehicle_ids][:1]  # |S| <= 1 (v1)
+        if not sel:
+            continue  # local-only proposal: local_only_chunk already in the candidate set
+        m = sel[0]
+        bw = float(min(max(float(wp.bandwidth_by_vehicle.get(m, 0.5)), 0.05), 1.0))
+        mod = str(wp.modality_by_vehicle.get(m, "bev"))
+        for n in duration_grid:
+            key = (m, round(bw, 3), mod, int(n))
+            if key in seen:
+                continue
+            seen.add(key)
+            chunks.append(ActionChunk((SubAction(
+                selected=(m,), bandwidth_by_vehicle={m: bw}, modality_by_vehicle={m: mod},
+                duration_slots=int(n)),)))
+    return chunks

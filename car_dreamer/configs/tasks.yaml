@@ -177,6 +177,10 @@ carla_group_right_turn_auto:
   env.wam.graph.bev_channels: 7
   env.wam.graph.bev_size: 64
   env.wam.graph.bev_range_m: 50.0
+  # Cooperative fusion scheme (Phase 1). inject: ego-only graph + collaborator-revealed objects
+  # injected as object nodes at their historical t_sense slot (early/hard fusion, objlist).
+  # legacy: original big-graph with collaborator observation nodes fused via GNN attention.
+  env.wam.graph.fusion_mode: inject
   # WAM BS-centric Diffusion UWM (Design Update §7-§8, §13). hidden_dim/route_waypoints are shared with
   # wam.graph above; bev_latent_dim defaults to hidden_dim. Generated variables = future policy chunk
   # (H,M,P) + future request BEV latent (H,Dz); object-state X is a condition token, not generated.

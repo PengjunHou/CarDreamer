@@ -25,7 +25,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from .action_chunk import ActionChunk, action_chunk_to_comm_segments, enumerate_candidate_chunks, local_only_chunk
 from .lyapunov import CostRateBreakdown, LyapunovConfig, LyapunovState, action_cost_rate
 from .rollout_scorer import RolloutContext, RolloutResult, WorldActionScorer
-from .stage1_policy import bev_payload_bytes
+from .stage1_policy import bev_payload_bytes, build_stage1_policy_graph
 
 __all__ = [
     "SchedulerConfig",
@@ -56,6 +56,7 @@ class SchedulerConfig:
     t_min_slots: int = 3             # T_min (eq 8)
     T_a_slots: int = 5               # Ta (eq 8 monitoring cadence)
     ts_seconds: float = 0.5          # Ts (slot duration for the queue bits<->rate bridge)
+    uwm_candidates: int = 4          # Stage-2 UWM proposals per epoch (Phase 5); 0 disables the proposer
     # Candidate-set tractability knob (0 = legacy full enumeration). When the feasible set is
     # larger, local-only + ALL J=1 chunks are always kept (every member/bandwidth/duration
     # single-segment option stays evaluated -> no-degradation preserved) and the J>=2
@@ -70,7 +71,7 @@ class SchedulerConfig:
 
 
 def candidate_chunks(
-    ctx: RolloutContext, cfg: SchedulerConfig, rng: Optional[random.Random] = None
+    ctx: RolloutContext, cfg: SchedulerConfig, rng: Optional[random.Random] = None, uwm=None
 ) -> List[ActionChunk]:
     """Feasible candidates: heuristic chunks + always-feasible local-only, filtered by (P2) constraints.
 
@@ -78,15 +79,22 @@ def candidate_chunks(
     J=1 chunks are always kept (so every member x bandwidth x duration single-segment option is
     still evaluated and the no-degradation guarantee holds), while the J>=2 combinatorial tail is
     randomly subsampled (seeded ``rng`` -> reproducible) up to the total budget.
+
+    When ``uwm`` is given (Phase 5), the Stage-2 UWM proposes cooperation decisions (W_θ, Sec III):
+    its decoded (S, B, D) chunks are merged into the J=1 pool (deduped) so they are always scored
+    alongside the heuristics; local-only is still kept, so the no-degradation guarantee holds.
     """
     members = sorted({int(c.actor_id) for c in ctx.collaborators})
-    chunks = enumerate_candidate_chunks(
+    chunks = list(enumerate_candidate_chunks(
         members,
         bandwidth_grid=cfg.bandwidth_grid, duration_grid=cfg.duration_grid, j_max=cfg.j_max,
         modality="bev", f_max=cfg.F_max_slots, n_min=cfg.n_min_slots,
         local_only_slots=cfg.F_max_slots,
-    )
+    ))
+    if uwm is not None and members:
+        chunks.extend(_uwm_proposed_chunks(ctx, cfg, uwm))
     feasible: List[ActionChunk] = []
+    seen_keys: set = set()
     for c in chunks:
         if c.horizon_slots > cfg.F_max_slots:
             continue
@@ -96,6 +104,14 @@ def candidate_chunks(
             continue
         if any(sa.total_bandwidth() > cfg.B_max_ratio + 1e-9 for sa in c.sub_actions):
             continue
+        key = tuple(
+            (sa.selected, tuple(sorted((int(k), round(float(v), 3)) for k, v in sa.bandwidth_by_vehicle.items())),
+             sa.duration_slots)
+            for sa in c.sub_actions
+        )
+        if key in seen_keys:  # collapse heuristic/UWM duplicates
+            continue
+        seen_keys.add(key)
         feasible.append(c)
     cap = int(cfg.max_score_candidates)
     if cap > 0 and len(feasible) > cap:
@@ -108,6 +124,28 @@ def candidate_chunks(
     if not feasible:  # degenerate config -> at least the local-only baseline
         feasible = [local_only_chunk(n_slots=max(cfg.n_min_slots, 1), n_min=cfg.n_min_slots)]
     return feasible
+
+
+def _uwm_proposed_chunks(ctx: RolloutContext, cfg: SchedulerConfig, uwm) -> List[ActionChunk]:
+    """Build the request graph from ``ctx`` and ask the UWM (W_θ) for proposed (S,B,D) chunks over
+    the duration grid. Best-effort: any failure returns no proposals (heuristics still cover the set)."""
+    try:
+        from .runtime import WAMPolicy
+        from .stage2 import uwm_propose_chunks
+
+        members = sorted({int(c.actor_id) for c in ctx.collaborators})
+        graph = build_stage1_policy_graph(
+            ego=ctx.ego, collaborators=ctx.collaborators, objects=ctx.objects,
+            policy=WAMPolicy(selected_vehicle_ids=tuple(members), modality_by_vehicle={m: "bev" for m in members},
+                             bandwidth_by_vehicle={m: 1.0 for m in members}, frequency_steps=1, reason="uwm_ctx"),
+            spec=ctx.graph_spec, notable_ids=ctx.notable_ids,
+        )
+        return uwm_propose_chunks(
+            uwm, graph, ctx.notable_ids, members,
+            n_candidates=int(getattr(cfg, "uwm_candidates", 4)), duration_grid=cfg.duration_grid,
+        )
+    except Exception:  # UWM proposal is best-effort; heuristics + local-only still guarantee coverage
+        return []
 
 
 def _score_candidate(
@@ -128,11 +166,11 @@ def _score_candidate(
 
 def select_action_chunk(
     ctx: RolloutContext, *, scorer: WorldActionScorer, lyap: LyapunovState, cfg: SchedulerConfig,
-    rng: Optional[random.Random] = None,
+    rng: Optional[random.Random] = None, uwm=None,
 ) -> Tuple[ActionChunk, CostRateBreakdown, RolloutResult]:
     """(P2) argmin over feasible candidates. Local-only is always present -> no-degradation guarantee."""
     best: Optional[Tuple[float, ActionChunk, CostRateBreakdown, RolloutResult]] = None
-    for chunk in candidate_chunks(ctx, cfg, rng):
+    for chunk in candidate_chunks(ctx, cfg, rng, uwm=uwm):
         br, roll = _score_candidate(ctx, chunk, scorer, lyap, cfg)
         if best is None or br.total < best[0]:
             best = (br.total, chunk, br, roll)
@@ -182,9 +220,10 @@ def next_epoch_step(ref: ReferenceTrajectory, *, realized_uncertainty_fn: Realiz
 class LyapunovScheduler:
     """Stateful Sec IV / Algorithm-1 driver. Drives an offline episode or backs the online sampler."""
 
-    def __init__(self, cfg: SchedulerConfig, scorer: WorldActionScorer, *, request_vehicle_id: int = 0):
+    def __init__(self, cfg: SchedulerConfig, scorer: WorldActionScorer, *, request_vehicle_id: int = 0, uwm=None):
         self.cfg = cfg
         self.scorer = scorer
+        self.uwm = uwm  # Stage-2 UWM action proposer W_θ (Phase 5); None -> heuristic enumerator only
         self.request_vehicle_id = int(request_vehicle_id)
         self.lyap = LyapunovState(
             LyapunovConfig(lam=cfg.lam, c0=cfg.c0, budget_bandwidth=cfg.budget_bandwidth, ts_seconds=cfg.ts_seconds)
@@ -194,6 +233,22 @@ class LyapunovScheduler:
         self.next_epoch: Optional[int] = None
         self._cand_rng = random.Random(int(cfg.candidate_seed))
         self._policy_id = 0
+        self.epochs = 0
+        self.replans = 0
+        self._u_c_sum = 0.0
+        self._slots = 0
+
+    def reset(self) -> None:
+        """Reset per-episode state: the virtual queue Z, link backlogs Q_m, reference trajectory,
+        installed chunk and epoch counters. Call at each episode start so queues do not carry over."""
+        self.lyap = LyapunovState(
+            LyapunovConfig(lam=self.cfg.lam, c0=self.cfg.c0,
+                           budget_bandwidth=self.cfg.budget_bandwidth, ts_seconds=self.cfg.ts_seconds)
+        )
+        self.ref = None
+        self.chunk = None
+        self.next_epoch = None
+        self._cand_rng = random.Random(int(self.cfg.candidate_seed))
         self.epochs = 0
         self.replans = 0
         self._u_c_sum = 0.0
@@ -217,7 +272,8 @@ class LyapunovScheduler:
 
     def plan(self, ctx: RolloutContext, step: int):
         """Solve (P2), install the chunk, store the reference trajectory. Returns ``(segments, breakdown, chunk, rollout)``."""
-        chunk, br, roll = select_action_chunk(ctx, scorer=self.scorer, lyap=self.lyap, cfg=self.cfg, rng=self._cand_rng)
+        chunk, br, roll = select_action_chunk(ctx, scorer=self.scorer, lyap=self.lyap, cfg=self.cfg,
+                                              rng=self._cand_rng, uwm=self.uwm)
         segments = action_chunk_to_comm_segments(
             chunk, first_policy_id=self._policy_id, request_vehicle_id=self.request_vehicle_id, start_step=int(step)
         )

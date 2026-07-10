@@ -148,5 +148,68 @@ class RunOfflineTest(unittest.TestCase):
         self.assertGreater(summary["replans"], 0)
 
 
+class _StubFlowConfig:
+    max_members = 8
+    num_formats = 2
+    horizon = 6
+
+
+class _StubFlow:
+    def __init__(self):
+        self.config = _StubFlowConfig()
+
+    def propose_policies(self, cond, tids, mask, *, n_candidates, member_mask=None):
+        import torch
+
+        # deterministic: member slot 0 selected (sel logit > 0), bev format, bandwidth 0.5
+        H, M, P = self.config.horizon, self.config.max_members, self.config.num_formats + 3
+        pol = torch.full((1, int(n_candidates), H, M, P), -5.0)  # sel logit <0 -> unselected by default
+        pol[..., 0, 0] = 5.0            # member slot 0 sel logit > 0 (selected)
+        pol[..., 0, 1] = 5.0            # format 0 (objlist) high; format 1 (bev) stays low -> argmax=0
+        pol[..., 0, self.config.num_formats + 2] = 0.5  # bandwidth
+        return pol
+
+
+class _StubUWM:
+    def __init__(self):
+        self.flow = _StubFlow()
+
+    def eval(self):
+        return self
+
+    def condition_tokens(self, graphs, idx, notable):
+        import torch
+
+        return torch.zeros(3, 8), torch.zeros(3, dtype=torch.long)
+
+
+class UWMProposerTest(unittest.TestCase):
+    def test_uwm_propose_chunks_valid(self):
+        from car_dreamer.toolkit.wam import uwm_propose_chunks
+
+        ctx = make_context()
+        graph = None  # graph .to(device) is called; use a stub graph
+        class _G:
+            def to(self, d):
+                return self
+        chunks = uwm_propose_chunks(_StubUWM(), _G(), [100], [7], n_candidates=3, duration_grid=(10, 30, 50))
+        self.assertTrue(chunks)
+        for ch in chunks:
+            self.assertEqual(len(ch.sub_actions), 1)
+            sa = ch.sub_actions[0]
+            self.assertLessEqual(len(sa.selected), 1)
+            self.assertEqual(sa.selected, (7,))          # member slot 0 -> candidate_ids[0] = 7
+            self.assertIn(sa.duration_slots, (10, 30, 50))
+            self.assertAlmostEqual(sa.bandwidth_by_vehicle[7], 0.5, places=3)
+
+    def test_candidate_chunks_with_uwm_keeps_local_only_and_adds_proposals(self):
+        ctx, cfg = make_context(), small_cfg(F_max_slots=60, duration_grid=(10, 30, 50), n_min_slots=10)
+        base = candidate_chunks(ctx, cfg)
+        with_uwm = candidate_chunks(ctx, cfg, uwm=_StubUWM())
+        # local-only still present (no-degradation) and UWM proposals merged in (deduped)
+        self.assertTrue(any(all(sa.is_local_only for sa in c.sub_actions) for c in with_uwm))
+        self.assertGreaterEqual(len(with_uwm), len(base))
+
+
 if __name__ == "__main__":
     unittest.main()
