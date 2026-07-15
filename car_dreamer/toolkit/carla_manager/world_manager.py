@@ -75,6 +75,9 @@ class WorldManager:
         self._on_step = None
         self.actor_dict = {}
         self._autopilot_actor_ids = set()
+        # Autopilot handovers deferred until the reset window closes; see _request_autopilot.
+        self._pending_autopilot = []
+        self._reset_async = False
         # Pedestrians (walker bodies + their AI controllers) are tracked separately
         # from actor_dict so they never enter the vehicle-oriented BEV / visibility
         # pipeline (which assumes vehicle bounding boxes), but are still destroyed on reset.
@@ -105,15 +108,24 @@ class WorldManager:
         self._client.apply_batch_sync([carla.command.DestroyActor(id) for id in self.actor_dict])
         self.actor_dict = {}
         self._autopilot_actor_ids = set()
+        self._pending_autopilot = []
 
+        # The world runs asynchronously while actors are spawned, so autopilot handovers made
+        # inside this window are deferred (_request_autopilot) and applied once it closes --
+        # otherwise a vehicle starts driving unsupervised in real time while the rest of the
+        # scene is still spawning.
         self._set_synchronous_mode(False)
-
-        if self._on_reset is not None:
-            self._on_reset()
+        self._reset_async = True
+        try:
+            if self._on_reset is not None:
+                self._on_reset()
+        finally:
+            self._reset_async = False
 
         self._set_synchronous_mode(True)
         # This prevents some synchronization bugs
         time.sleep(1)
+        self._flush_pending_autopilot()
 
     def step(self) -> None:
         self._time_step += 1
@@ -276,7 +288,12 @@ class WorldManager:
                 driver_id = np.random.choice(bp.get_attribute("driver_id").recommended_values)
                 bp.set_attribute("driver_id", driver_id)
                 bp.set_attribute("role_name", "autopilot")
-            batch.append(carla.command.SpawnActor(bp, transform).then(carla.command.SetAutopilot(carla.command.FutureActor, True, self._tm_port)))
+            # Autopilot is deliberately NOT chained onto the spawn command: tasks call this from
+            # on_reset(), i.e. inside the asynchronous reset window, where a vehicle handed to
+            # Traffic Manager starts driving unsupervised in real time while the rest of the scene
+            # is still spawning (see _request_autopilot). Enable it per actor instead, so the
+            # deferral applies.
+            batch.append(carla.command.SpawnActor(bp, transform))
         for response in self._client.apply_batch_sync(batch, False):
             if response.error:
                 WORLD_LOGGER.warning("Batch spawn response error: %s", response.error)
@@ -284,11 +301,7 @@ class WorldManager:
                 actor = self._world.get_actor(response.actor_id)
                 actor_list.append(actor)
                 self.actor_dict[actor.id] = actor
-                self._autopilot_actor_ids.add(actor.id)
-                self._vehicle_manager.set_auto_lane_change(actor, self._config.auto_lane_change)
-                self._vehicle_manager.set_lane_change_percent(actor, left=100.0, right=100.0)
-                if "background_speed" in self._config:
-                    self._vehicle_manager.set_desired_speed(actor, self._config.background_speed)
+                self._request_autopilot(actor, free_lane_change=True)
         return actor_list
 
     def _destroy_walkers(self) -> None:
@@ -433,10 +446,30 @@ class WorldManager:
             return None
         if stationary:
             return vehicle  # parked observer: no autopilot, no route
+        self._request_autopilot(
+            vehicle, destination=destination, target_speed=target_speed, ignore_lights=ignore_lights
+        )
+        return vehicle
+
+    def _activate_autopilot(
+        self,
+        vehicle: carla.Actor,
+        *,
+        destination: carla.Location = None,
+        target_speed: float = None,
+        ignore_lights: bool = False,
+        free_lane_change: bool = False,
+    ) -> None:
+        """Hand a vehicle to the Traffic Manager: autopilot + lane change + speed + optional route.
+
+        :param free_lane_change: also allow unrestricted random lane changes (background traffic).
+        """
         vehicle.set_autopilot(True, self._tm_port)
         self._autopilot_actor_ids.add(vehicle.id)
         tm = self._vehicle_manager._tm
         self._vehicle_manager.set_auto_lane_change(vehicle, self._config.auto_lane_change)
+        if free_lane_change:
+            self._vehicle_manager.set_lane_change_percent(vehicle, left=100.0, right=100.0)
         if target_speed is not None:
             self._vehicle_manager.set_desired_speed(vehicle, float(target_speed))
         elif "background_speed" in self._config:
@@ -448,7 +481,39 @@ class WorldManager:
                 tm.set_path(vehicle, [destination])
             except Exception as exc:  # noqa: BLE001
                 WORLD_LOGGER.warning("set_path failed for scenario vehicle %s: %s", vehicle.id, exc)
-        return vehicle
+
+    def _request_autopilot(self, vehicle: carla.Actor, **kwargs) -> None:
+        """Enable autopilot now, or defer it if the reset window is still open.
+
+        During reset the world is asynchronous (see :py:meth:`reset`), so a vehicle handed to the
+        Traffic Manager there starts driving **immediately and unsupervised**, in real time, while
+        the remaining actors are still being spawned. It drives off its lane, hits the roadside, and
+        can be despawned by CARLA before the episode even starts -- a stationary vehicle spawned at
+        the same point is unaffected, which is what makes the symptom look like a spawn-position bug.
+        Deferring to :py:meth:`_flush_pending_autopilot` keeps every vehicle parked at its spawn pose
+        until the world is stepping under our control again.
+        """
+        if self._reset_async:
+            self._pending_autopilot.append((vehicle, kwargs))
+        else:
+            self._activate_autopilot(vehicle, **kwargs)
+
+    def _flush_pending_autopilot(self) -> None:
+        """Apply the autopilot handovers deferred during reset (world is synchronous again)."""
+        pending, self._pending_autopilot = self._pending_autopilot, []
+        activated = 0
+        for vehicle, kwargs in pending:
+            if not _actor_is_alive(vehicle):
+                continue
+            try:
+                self._activate_autopilot(vehicle, **kwargs)
+                activated += 1
+            except RuntimeError as exc:  # despawned between the spawn and the flush
+                WORLD_LOGGER.warning("Deferred autopilot failed for vehicle %s: %s", vehicle.id, exc)
+        if pending:
+            WORLD_LOGGER.info(
+                "Enabled deferred autopilot for %d/%d vehicle(s) after reset", activated, len(pending)
+            )
 
     def spawn_scenario_walkers(
         self,

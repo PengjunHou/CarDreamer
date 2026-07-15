@@ -478,9 +478,11 @@ class V2VCommMixin:
             aid = int(actor.id)
             if aid not in self.coop_participant_ids:
                 continue
-            # A cooperative vehicle can be despawned by CARLA shortly after spawn (e.g. a bad spawn
-            # position, an early collision, or falling through the map). A destroyed collaborator
-            # cannot cooperate, so drop it from the group instead of crashing on its transform.
+            # Defensive only -- this should now be rare. Collaborators used to be despawned
+            # routinely right after spawn because autopilot was enabled inside the asynchronous
+            # reset window, so they drove off unsupervised and crashed before step 0; that root
+            # cause is fixed in WorldManager._request_autopilot. Treat a drop as a signal worth
+            # investigating (scripts/trace_scenario_vehicles.py), not as normal attrition.
             if not bool(getattr(actor, "is_alive", True)):
                 dead_ids.append(aid)
                 continue
@@ -498,7 +500,10 @@ class V2VCommMixin:
         """Remove a no-longer-alive collaborator from all cooperative-group state.
 
         Keeps the episode running with the surviving collaborators: the dropped vehicle stops
-        being observed, streamed over V2V, and included in the policy graph.
+        being observed, streamed over V2V, and included in the policy graph. This is a safety net,
+        not an expected event -- see the note in :meth:`_update_group_observations`. A run that
+        keeps dropping collaborators is silently shrinking the cooperative pool, which quietly
+        weakens every V2V result computed from it.
         """
         actor_id = int(actor_id)
         self.coop_participant_ids.discard(actor_id)
@@ -514,7 +519,12 @@ class V2VCommMixin:
         group = self.groups.get(GROUP_ID)
         if group is not None:
             group.discard(actor_id)
-        V2V_LOGGER.warning("Dropped destroyed cooperative vehicle id=%s from group", actor_id)
+        V2V_LOGGER.warning(
+            "Dropped destroyed cooperative vehicle id=%s from group; %d collaborator(s) left. "
+            "This is unexpected since the reset-window autopilot fix -- investigate rather than ignore.",
+            actor_id,
+            len(self.coop_participant_ids),
+        )
 
     # =========================================================
     # Cooperative-vehicle registration (driven by scenario_actors `start` vehicles)
