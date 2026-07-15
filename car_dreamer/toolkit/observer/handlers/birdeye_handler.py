@@ -44,6 +44,13 @@ class BirdeyeHandler(BaseHandler):
         is_fov_visible, is_recursive_visible = get_visibility(
             self._ego, actor_transforms, actor_polygons, self._config.sight_fov, self._config.sight_range
         )
+        # actor_ids, actor_transforms and actor_polygons are cached independently per sim step and
+        # can diverge mid-step (e.g. actors spawned incrementally during reset_spawn), so a newly
+        # added actor may be missing from the visibility dicts. Backfill every known id as
+        # not-visible so all downstream lookups (color helpers, get_neighbors) stay total.
+        known_ids = set(self._world.actor_ids) | set(actor_transforms.keys()) | set(actor_polygons.keys())
+        is_fov_visible = {id: is_fov_visible.get(id, False) for id in known_ids}
+        is_recursive_visible = {id: is_recursive_visible.get(id, False) for id in known_ids}
         neighbors = get_neighbors(self._ego, actor_transforms, is_fov_visible)
         observability = Observability(self._config.observability)
         if observability == Observability.FOV:

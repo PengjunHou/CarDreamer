@@ -37,19 +37,19 @@ def _setup_carla_pythonapi() -> None:
             sys.path.append(path)
 
 
-def _enable_wide_bev(config) -> None:
+def _enable_wide_bev(config):
     """Append the wide ego-centered birdeye (birdeye_wam100) to the ego observation (record-only).
 
     Enabled last so its dump wins (data/birdeye_frames/vehicle_<id>/birdeye_<step>.png becomes the
     100 m view). Does not touch the model's birdeye_wpt input. Render with the viz flags
     ``--bev-obs-range 100 --bev-ego-offset 50``.
+
+    Config is immutable, so this returns the updated config instead of mutating in place.
     """
-    try:
-        enabled = list(config.env.observation.enabled)
-        if "birdeye_wam100" not in enabled:
-            config.env.observation.enabled = enabled + ["birdeye_wam100"]
-    except Exception as exc:  # pragma: no cover - config shape varies
-        print(f"warning: could not enable wide BEV (birdeye_wam100): {exc}", flush=True)
+    enabled = list(config.env.observation.enabled)
+    if "birdeye_wam100" not in enabled:
+        config = config.update({"env.observation.enabled": enabled + ["birdeye_wam100"]})
+    return config
 
 
 def build_env(task: str, env_args: List[str], wide_bev: bool = False):
@@ -61,7 +61,9 @@ def build_env(task: str, env_args: List[str], wide_bev: bool = False):
     config = car_dreamer.load_task_configs(task)
     config, _ = toolkit.Flags(config).parse_known(env_args)
     if wide_bev:
-        _enable_wide_bev(config)
+        config = _enable_wide_bev(config)
+    # This script's viz pipeline reads the per-step birdeye dumps, so recording must be on.
+    config = config.update({"env.observation.dump_frames": True})
     env = gym.make(config.env.name, config=config.env)
     return env, config
 

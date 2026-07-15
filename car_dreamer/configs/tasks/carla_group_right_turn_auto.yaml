@@ -27,7 +27,9 @@ env:
   # --- shared V2V cooperative settings (apply to every scenario vehicle that has a `start`) ---
   coop_participation_prob: 1
   group_observation:
-    enabled: [camera, collision]
+    # birdeye_wpt: each collaborator renders its own vehicle-centric BEV (itself drawn as ego);
+    # dumps to data/birdeye_frames/vehicle_<id>/ when group_observation.dump_frames is on.
+    enabled: [camera, collision, birdeye_wpt]
     camera:
       fov: 180
 

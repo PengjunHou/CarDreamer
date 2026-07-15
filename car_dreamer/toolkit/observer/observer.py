@@ -1,4 +1,4 @@
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import carla
 # import gymnasium as gym
@@ -23,6 +23,7 @@ class Observer:
     def __init__(self, world: WorldManager, obs_config: dict):
         self._world = world
         self._obs_config = obs_config
+        self._dump_frames = bool(obs_config["dump_frames"]) if "dump_frames" in obs_config else False
         self._data_handlers = self._init_data_handlers()
 
     def register_simple_handler(
@@ -69,8 +70,14 @@ class Observer:
             obs_spaces.update(handler.get_observation_space())
         return spaces.Dict(obs_spaces)
 
-    def get_observation(self, env_state: Dict, visualize: bool = True) -> Tuple[Dict, Dict]:
-        """Get the current observation data from all the registered handlers."""
+    def get_observation(self, env_state: Dict, visualize: Optional[bool] = None) -> Tuple[Dict, Dict]:
+        """Get the current observation data from all the registered handlers.
+
+        ``visualize=None`` falls back to the observation config's ``dump_frames`` flag,
+        which controls whether handlers dump per-step debug frames under ``data/``.
+        """
+        if visualize is None:
+            visualize = self._dump_frames
         obs = {}
         info = {}
         for handler in self._data_handlers.values():

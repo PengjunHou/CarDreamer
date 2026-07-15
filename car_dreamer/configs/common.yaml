@@ -12,6 +12,11 @@ env:
       tm_seed: 2024
 
   observation: &observation
+    # Dump per-step debug frames (birdeye/camera/lidar PNGs, collision .npy) under data/.
+    # Inherited by group_observation; override separately via
+    # --env.observation.dump_frames / --env.group_observation.dump_frames.
+    dump_frames: False
+
     camera:
       handler: camera
       blueprint: sensor.camera.rgb
@@ -83,8 +88,9 @@ env:
       # Use [150, 90] to mimic human driver views
       sight_fov: 64
       sight_range: 128
-      observability: full
-      color_by_obs: False
+      # fov: only draw vehicles directly FOV-visible (in sight cone + line-of-sight clear).
+      observability: fov
+      color_by_obs: True
       waypoint_obs: visible
       extend_wpt: False
       entities:

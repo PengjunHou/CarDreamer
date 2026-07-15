@@ -463,17 +463,58 @@ class V2VCommMixin:
         observer = Observer(self._world, group_observation)
         self._other_observers[int(vehicle.id)] = observer
         observer.reset(vehicle)
+        # The vehicle was just spawned this step (cooperative candidates register incrementally
+        # during reset_spawn), so drop the stale step cache before the observer takes its first
+        # observation -- otherwise its own polygon/transform is missing when the birdeye renderer
+        # draws it as ego. See WorldManager.invalidate_step_cache.
+        self._world.invalidate_step_cache()
         self.group_obs[int(vehicle.id)], _ = observer.get_observation(self.get_state())
 
     def _update_group_observations(self) -> None:
         # Only participating (collaborating) vehicles' observations are consumed by
         # V2V communication and the policy graph, so only refresh those.
+        dead_ids: List[int] = []
         for actor in self.group_vehs:
-            if int(actor.id) not in self.coop_participant_ids:
+            aid = int(actor.id)
+            if aid not in self.coop_participant_ids:
                 continue
-            observer = self._other_observers.get(int(actor.id))
+            # A cooperative vehicle can be despawned by CARLA shortly after spawn (e.g. a bad spawn
+            # position, an early collision, or falling through the map). A destroyed collaborator
+            # cannot cooperate, so drop it from the group instead of crashing on its transform.
+            if not bool(getattr(actor, "is_alive", True)):
+                dead_ids.append(aid)
+                continue
+            observer = self._other_observers.get(aid)
             if observer is not None:
-                self.group_obs[int(actor.id)], _ = observer.get_observation(self.get_state())
+                try:
+                    self.group_obs[aid], _ = observer.get_observation(self.get_state())
+                except RuntimeError:
+                    # Destroyed mid-observation (aliveness raced the render); drop it.
+                    dead_ids.append(aid)
+        for aid in dead_ids:
+            self._drop_cooperative_vehicle(aid)
+
+    def _drop_cooperative_vehicle(self, actor_id: int) -> None:
+        """Remove a no-longer-alive collaborator from all cooperative-group state.
+
+        Keeps the episode running with the surviving collaborators: the dropped vehicle stops
+        being observed, streamed over V2V, and included in the policy graph.
+        """
+        actor_id = int(actor_id)
+        self.coop_participant_ids.discard(actor_id)
+        self.group_obs.pop(actor_id, None)
+        self._actor_cache.pop(actor_id, None)
+        observer = self._other_observers.pop(actor_id, None)
+        if observer is not None:
+            try:
+                observer.destroy()
+            except Exception:  # noqa: BLE001 - observer teardown must not break the step
+                pass
+        self.group_vehs = [v for v in self.group_vehs if int(v.id) != actor_id]
+        group = self.groups.get(GROUP_ID)
+        if group is not None:
+            group.discard(actor_id)
+        V2V_LOGGER.warning("Dropped destroyed cooperative vehicle id=%s from group", actor_id)
 
     # =========================================================
     # Cooperative-vehicle registration (driven by scenario_actors `start` vehicles)

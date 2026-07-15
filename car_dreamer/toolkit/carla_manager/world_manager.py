@@ -13,6 +13,16 @@ from .vehicle_manager import VehicleManager
 WORLD_LOGGER = get_runtime_logger("car_dreamer.world")
 
 
+def _actor_is_alive(actor) -> bool:
+    """True unless the actor has been destroyed CARLA-side.
+
+    During reset the world runs asynchronously while actors are spawned, so ``actor_dict`` may
+    transiently hold an actor that CARLA has already destroyed; calling ``get_transform()`` on it
+    raises. Guard every per-actor snapshot with this check.
+    """
+    return actor is not None and bool(getattr(actor, "is_alive", True))
+
+
 def cached_step_wise(func):
     @wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -124,6 +134,18 @@ class WorldManager:
         WORLD_LOGGER.info("Warmup CARLA world ticks=%d without env callbacks", ticks)
         for _ in range(ticks):
             self._world.tick()
+        self._cache = {"step": self._time_step}
+
+    def invalidate_step_cache(self) -> None:
+        """
+        Drop the current step's cached actor snapshots (polygons/transforms/actions).
+
+        The per-step cache (see :func:`cached_step_wise`) is populated on first access within a
+        step and only auto-invalidates when ``_time_step`` advances. When actors are spawned
+        mid-step (e.g. cooperative vehicles registered incrementally during ``reset_spawn``), a
+        freshly-added actor is absent from that stale snapshot, causing same-step consumers to miss
+        it. Call this after such a spawn to force the next access to recompute from the live actors.
+        """
         self._cache = {"step": self._time_step}
 
     def get_time_step(self) -> int:
@@ -607,6 +629,8 @@ class WorldManager:
         actor_polygons: ActorPolygonDict = {}
 
         for actor in self.actors:
+            if not _actor_is_alive(actor):
+                continue
             actor_transform = actor.get_transform()
             x = actor_transform.location.x
             y = actor_transform.location.y
@@ -669,7 +693,7 @@ class WorldManager:
 
     @cached_step_wise
     def _get_actor_transforms(self) -> ActorTransformDict:
-        return {actor.id: actor.get_transform() for actor in self.actor_dict.values()}
+        return {actor.id: actor.get_transform() for actor in self.actor_dict.values() if _actor_is_alive(actor)}
 
     @property
     def actor_transforms(self) -> ActorTransformDict:
