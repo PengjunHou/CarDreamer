@@ -109,6 +109,16 @@ def main(argv=None):
     model_configs = yaml.YAML(typ="safe").load((embodied.Path(__file__).parent / "dreamerv3.yaml").read())
     config = embodied.Config({"dreamerv3": model_configs["defaults"]})
     config = config.update({"dreamerv3": model_configs["small"]})
+    # Evaluation defaults; set before CLI parsing so flags like
+    # --dreamerv3.run.steps can override them
+    config = config.update(
+        {
+            "dreamerv3.run.log_keys_sum": "(travel_distance|destination_reached|out_of_lane|time_exceeded|is_collision|timesteps)",
+            "dreamerv3.run.log_keys_mean": "(travel_distance|ttc|speed_norm|wpt_dis)",
+            "dreamerv3.run.log_keys_max": "(travel_distance|ttc|speed_norm|wpt_dis)",
+            "dreamerv3.run.steps": 5e4,
+        }
+    )
 
     parsed, other = embodied.Flags(task=["carla_navigation"]).parse_known(argv)
     for name in parsed.task:
@@ -134,15 +144,6 @@ def main(argv=None):
     env = from_gym.FromGym(env)
     env = wrap_env(env, dreamerv3_config)
     env = embodied.BatchEnv([env], parallel=False)
-
-    dreamerv3_config = dreamerv3_config.update(
-        {
-            "run.log_keys_sum": "(travel_distance|destination_reached|out_of_lane|time_exceeded|is_collision|timesteps)",
-            "run.log_keys_mean": "(travel_distance|ttc|speed_norm|wpt_dis)",
-            "run.log_keys_max": "(travel_distance|ttc|speed_norm|wpt_dis)",
-            "run.steps": 5e4,
-        }
-    )
 
     agent = dreamerv3.Agent(env.obs_space, env.act_space, step, dreamerv3_config)
     args = embodied.Config(

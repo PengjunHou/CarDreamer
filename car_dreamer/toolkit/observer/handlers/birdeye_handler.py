@@ -53,7 +53,15 @@ class BirdeyeHandler(BaseHandler):
             visible = {id: True for id in self._world.actor_ids}
 
         background_vehicles_color = self._get_background_vehicles_color(self._world.actor_ids, visible, is_fov_visible, is_recursive_visible)
-        background_waypoints_color = self._get_background_waypoints_color(self._world.actor_ids, visible, neighbors)
+        # With a comm packet, the intentions that arrive are the ones selected at
+        # broadcast time, so color-gate on the packet content rather than the
+        # current selection to stay consistent during collaborator switches.
+        packet = env_state.get("comm_packet")
+        if packet is not None:
+            shared_ids = tuple(packet["intentions"].keys())
+        else:
+            shared_ids = env_state.get("shared_intention_ids", ())
+        background_waypoints_color = self._get_background_waypoints_color(self._world.actor_ids, visible, neighbors, shared_ids)
         messages_color = self._get_messages_color(self._world.actor_ids, neighbors)
 
         env_state = {
@@ -104,12 +112,15 @@ class BirdeyeHandler(BaseHandler):
             background_vehicles_color = {id: Color.GREEN if visible[id] else None for id in actor_ids}
         return background_vehicles_color
 
-    def _get_background_waypoints_color(self, actor_ids, visible, neighbors):
+    def _get_background_waypoints_color(self, actor_ids, visible, neighbors, shared_ids=()):
         waypoint_obs = WaypointObservability(self._config.waypoint_obs)
         if waypoint_obs == WaypointObservability.ALL:
             background_waypoints_color = {id: Color.ORANGE_0 for id in actor_ids}
         elif waypoint_obs == WaypointObservability.VISIBLE:
             background_waypoints_color = {id: Color.ORANGE_0 if visible[id] else None for id in actor_ids}
+        elif waypoint_obs == WaypointObservability.DESIGNATED:
+            shared = set(shared_ids)
+            background_waypoints_color = {id: Color.ORANGE_0 if id in shared else None for id in actor_ids}
         else:
             background_waypoints_color = {id: Color.ORANGE_0 if id in neighbors else None for id in actor_ids}
         return background_waypoints_color

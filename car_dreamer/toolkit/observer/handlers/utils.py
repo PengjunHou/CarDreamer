@@ -18,6 +18,7 @@ class WaypointObservability(Enum):
     ALL = "all"  # All vehicles
     VISIBLE = "visible"  # Only visible vehicles
     NEIGHBOR = "neighbor"  # Only neighbors
+    DESIGNATED = "designated"  # Only vehicles designated via env_state["shared_intention_ids"]
 
 
 def get_sight_fov_and_range(sight_fov, sight_range):
@@ -165,25 +166,46 @@ def get_visibility(
     for obs_id, vis in fov_visible.items():
         if not vis:
             continue
-        obs_location = actor_transforms[obs_id].location
-        obs_yaw = actor_transforms[obs_id].rotation.yaw
-
-        for id, poly in actor_polys.items():
-            if id == obs_id or fov_visible[id] or recursive_visible[id]:
-                continue
-            if is_fov_visible(
-                (obs_location.x, obs_location.y),
-                obs_yaw,
-                obs_id,
-                id,
-                poly,
-                actor_polys,
-                fov,
-                sight_range,
-            ):
+        observer_visible = get_visibility_from(obs_id, actor_transforms, actor_polys, fov, sight_range)
+        for id, v in observer_visible.items():
+            if v and not fov_visible[id]:
                 recursive_visible[id] = True
 
     return fov_visible, recursive_visible
+
+
+def get_visibility_from(
+    observer_id: int,
+    actor_transforms: ActorTransformDict,
+    actor_polys: ActorPolygonDict,
+    fov: Union[float, List[float], Tuple[float]] = 150,
+    sight_range: Union[float, List[float], Tuple[float]] = 32,
+) -> Dict[int, bool]:
+    """
+    Get the FOV visibility of all actors from an arbitrary observer vehicle's pose.
+
+    :param observer_id: id of the observing vehicle (must be in actor_transforms)
+
+    :return: a dictionary mapping actor ids to whether the observer can see them
+    """
+    obs_location = actor_transforms[observer_id].location
+    obs_yaw = actor_transforms[observer_id].rotation.yaw
+    visible = {}
+    for id, poly in actor_polys.items():
+        if id == observer_id:
+            visible[id] = False
+            continue
+        visible[id] = is_fov_visible(
+            (obs_location.x, obs_location.y),
+            obs_yaw,
+            observer_id,
+            id,
+            poly,
+            actor_polys,
+            fov,
+            sight_range,
+        )
+    return visible
 
 
 def should_filter(ego_transform, actor_transform):

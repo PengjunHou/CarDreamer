@@ -38,8 +38,7 @@ class CarlaStopSignEnv(CarlaWptFixedEnv):
 
     def get_state(self):
         return {
-            "ego_waypoints": self.waypoints,
-            "timesteps": self._time_step,
+            **super().get_state(),
             "stop_sign_state": self._stop_sign_state,
         }
 

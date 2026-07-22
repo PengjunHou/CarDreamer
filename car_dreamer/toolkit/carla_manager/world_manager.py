@@ -91,6 +91,13 @@ class WorldManager:
     def step(self) -> None:
         self._time_step += 1
         self._world.tick()
+        # Populate the Traffic Manager action cache in the safe window: right
+        # after the tick (which has processed any vehicle destroyed in the
+        # previous on_step) and BEFORE this step's on_step (which may destroy
+        # flow vehicles). Querying get_all_actions in the same window as a fresh
+        # destroy segfaults the CARLA 0.9.16 TM client; caching it here means
+        # every later read this step (e.g. the intention snapshot) is a cache hit.
+        self._get_actor_actions()
         if self._on_step is not None:
             self._on_step()
 

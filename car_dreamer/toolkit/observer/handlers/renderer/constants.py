@@ -84,3 +84,4 @@ class BirdeyeEntity(Enum):
     STOP_SIGNS = "stop_signs"
     MESSAGES = "messages"
     ERROR_BACKGROUND_WAYPOINTS = "error_background_waypoints"  # Waypoints that may have transmission errors
+    COMM_VEHICLES = "comm_vehicles"  # Vehicles perceived by designated collaborators, delivered via (possibly delayed) communication

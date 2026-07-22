@@ -41,7 +41,11 @@ class CarlaWptEnv(CarlaBaseEnv):
         return self.ego_planner
 
     def get_state(self):
-        return {"ego_waypoints": self.waypoints, "timesteps": self._time_step}
+        return {
+            "ego_waypoints": self.waypoints,
+            "timesteps": self._time_step,
+            "shared_intention_ids": list(getattr(self, "shared_intention_ids", ())),
+        }
 
     def apply_control(self, action) -> None:
         control = self.get_vehicle_control(action)

@@ -67,7 +67,7 @@ env:
       sight_range: 32
       observability: full # [full, recursive_fov, fov]
       color_by_obs: False
-      waypoint_obs: visible # [neighbor, visible, all]
+      waypoint_obs: visible # [neighbor, visible, all, designated]
       extend_wpt: False
       entities: [roadmap, waypoints, ego_vehicle, background_vehicles]
 
@@ -84,6 +84,8 @@ env:
       sight_range: 32
       observability: full
       color_by_obs: False
+      # waypoint_obs: [neighbor, visible, all, designated]
+      # "designated" only renders intentions of vehicles listed in env_state["shared_intention_ids"]
       waypoint_obs: visible
       extend_wpt: False
       entities:
@@ -142,6 +144,31 @@ env:
           stop_signs,
         ]
 
+    # Cooperative-perception BEV: local layer = ego's own FOV (real-time);
+    # comm layer = vehicles perceived by designated collaborators + their
+    # intentions, delivered with intention_sharing.latency_steps delay
+    birdeye_coop:
+      handler: birdeye
+      key: birdeye_coop
+      shape: [128, 128, 3]
+      obs_range: 32
+      ego_offset: 12
+      sight_fov: 150
+      sight_range: 32
+      observability: fov
+      color_by_obs: False
+      waypoint_obs: designated
+      extend_wpt: False
+      entities:
+        [
+          roadmap,
+          waypoints,
+          background_waypoints,
+          ego_vehicle,
+          background_vehicles,
+          comm_vehicles,
+        ]
+
     birdeye_wpt_with_errors:
       handler: birdeye
       key: birdeye_wpt_with_errors
@@ -161,6 +188,21 @@ env:
     enable: True
     render_keys: [camera, birdeye_wpt]
     image_size: 512
+
+  # Which flow vehicles share intentions with ego (car-flow tasks only).
+  # Takes effect when a birdeye handler uses waypoint_obs: designated.
+  # rule: [all, none, nearest, random]; num: vehicle count for nearest/random
+  # latency_steps: communication delay in env steps -- the rendered packet
+  #   (collaborator-perceived vehicles + intentions) was broadcast that many
+  #   steps ago (0 = instantaneous)
+  # sight_fov / sight_range: the collaborator's own sensor when computing
+  #   which vehicles it perceives and shares (comm_vehicles entity)
+  intention_sharing:
+    rule: all
+    num: 1
+    latency_steps: 0
+    sight_fov: 150
+    sight_range: 32
 
   action:
     discrete: True

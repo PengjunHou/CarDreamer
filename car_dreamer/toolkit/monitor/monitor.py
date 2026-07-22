@@ -14,7 +14,9 @@ class EnvMonitorBase:
         self._config = config
         self._obs_queue = queue.Queue()
         self._info_queue = queue.Queue()
-        self._thread = threading.Thread(target=self._run_server)
+        # daemon=True: the Flask server must not block interpreter shutdown,
+        # otherwise every evaluation/training process hangs forever on exit
+        self._thread = threading.Thread(target=self._run_server, daemon=True)
         self._thread.start()
         atexit.register(self.stop)
 

@@ -171,25 +171,42 @@ class BirdeyeRenderer:
             if vehicle_color is not None:
                 self._render_polygon(self._surface, polygon, vehicle_color)
 
+    def _get_intentions_and_anchors(self, env_state):
+        """
+        Resolve background intentions as ({id: [(x, y), ...]}, {id: anchor_polygon}).
+
+        When the env provides a ``comm_packet`` (possibly delayed by its
+        communication-latency buffer), its intentions/anchors are authoritative.
+        The contract: a MISSING key means the env does not use the communication
+        model -> query the traffic manager live; an EMPTY packet is meaningful
+        ("nothing received yet", e.g. latency warm-up) and must NOT fall back.
+        """
+        packet = env_state.get("comm_packet")
+        if packet is None:
+            live = {
+                id: [(action[1].transform.location.x, action[1].transform.location.y) for action in actions]
+                for id, actions in self._world_manager.actor_actions.items()
+                if actions
+            }
+            return live, self._world_manager.actor_polygons
+        # Copy paths: extend_waypoints appends to them and must not mutate the buffer
+        intentions = {id: list(path) for id, path in packet["intentions"].items() if path}
+        return intentions, packet["anchors"]
+
     def _render_background_waypoints(self, **env_state):
         """Render the waypoints for background actors on the surface."""
         color = env_state.get("background_waypoints_color")
         extend_waypoints = env_state.get("extend_waypoints", False)
-        background_waypoints = self._world_manager.actor_actions
-        background_waypoints = {
-            id: [(action[1].transform.location.x, action[1].transform.location.y) for action in actions]
-            for id, actions in background_waypoints.items()
-            if actions
-        }
+        background_waypoints, anchors = self._get_intentions_and_anchors(env_state)
         vehicle_polygons = self._world_manager.actor_polygons
 
         for vehicle_id, path in background_waypoints.items():
-            if vehicle_id == self._ego.id or should_filter(
-                self._ego.get_transform(),
-                self._world_manager.actor_transforms[vehicle_id],
-            ):
+            if vehicle_id == self._ego.id:
                 continue
-            vehicle_polygon = vehicle_polygons.get(vehicle_id, None)
+            transform = self._world_manager.actor_transforms.get(vehicle_id)
+            if transform is not None and should_filter(self._ego.get_transform(), transform):
+                continue
+            vehicle_polygon = anchors.get(vehicle_id, vehicle_polygons.get(vehicle_id))
             if vehicle_polygon is None:
                 continue
             waypoint_color = color.get(vehicle_id, None)
@@ -205,18 +222,16 @@ class BirdeyeRenderer:
         color = env_state.get("background_waypoints_color")
         extend_waypoints = env_state.get("extend_waypoints", False)
         error_rate = env_state.get("error_rate")
-        background_waypoints = self._world_manager.actor_actions
-        background_waypoints = {
-            id: [(action[1].transform.location.x, action[1].transform.location.y) for action in actions]
-            for id, actions in background_waypoints.items()
-            if actions
-        }
+        background_waypoints, anchors = self._get_intentions_and_anchors(env_state)
         vehicle_polygons = self._world_manager.actor_polygons
 
         for vehicle_id, path in background_waypoints.items():
-            if vehicle_id == self._ego.id or should_filter(self._ego.get_transform(), self._world_manager.actor_transforms[vehicle_id]):
+            if vehicle_id == self._ego.id:
                 continue
-            vehicle_polygon = vehicle_polygons.get(vehicle_id, None)
+            transform = self._world_manager.actor_transforms.get(vehicle_id)
+            if transform is not None and should_filter(self._ego.get_transform(), transform):
+                continue
+            vehicle_polygon = anchors.get(vehicle_id, vehicle_polygons.get(vehicle_id))
             if vehicle_polygon is None:
                 continue
             waypoint_color = color.get(vehicle_id, None)
@@ -227,6 +242,27 @@ class BirdeyeRenderer:
                 path.append((last[0], last[1] - 10.0))
             if random.random() > error_rate:
                 self._render_path(self._surface, vehicle_polygon, path, waypoint_color)
+
+    def _render_comm_vehicles(self, **env_state):
+        """
+        Render vehicles perceived by designated collaborators, delivered via the
+        (possibly delayed) communication packet. Polygons come from the packet,
+        i.e. the vehicles' poses at broadcast time, NOT their current poses.
+        Vehicles already drawn by the local layer (background_vehicles) are
+        skipped so that fresher local perception wins.
+        """
+        packet = env_state.get("comm_packet")
+        if packet is None:
+            return
+        color = env_state.get("comm_vehicles_color", Color.GREEN)
+        local_color = env_state.get("background_vehicles_color", {})
+
+        for vehicle_id, polygon in packet["vehicles"].items():
+            if vehicle_id == self._ego.id:
+                continue
+            if local_color.get(vehicle_id) is not None:
+                continue  # already rendered by the local layer at its current pose
+            self._render_polygon(self._surface, polygon, color)
 
     def _render_messages(self, **env_state):
         """
@@ -414,4 +450,5 @@ class BirdeyeRenderer:
         BirdeyeEntity.STOP_SIGNS: _render_stop_signs,
         BirdeyeEntity.MESSAGES: _render_messages,
         BirdeyeEntity.ERROR_BACKGROUND_WAYPOINTS: _render_error_background_waypoints,
+        BirdeyeEntity.COMM_VEHICLES: _render_comm_vehicles,
     }

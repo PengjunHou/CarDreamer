@@ -11,6 +11,8 @@ CARLA_PORT=$1
 GPU_DEVICE=$2
 CHECKPOINT_PATH=$3
 LOG_FILE="eval_log_${CARLA_PORT}.log"
+# Repo root must be importable: replay modules use absolute `dreamerv3.*` imports
+export PYTHONPATH="$(cd "$(dirname "$0")" && pwd):$PYTHONPATH"
 CARLA_SERVER_COMMAND="$CARLA_ROOT/CarlaUE4.sh -RenderOffScreen -carla-port=$CARLA_PORT -benchmark -fps=10"
 EVAL_SCRIPT="dreamerv3/eval.py"
 COMMON_PARAMS="--env.world.carla_port $CARLA_PORT --dreamerv3.jax.policy_devices $GPU_DEVICE --dreamerv3.run.from_checkpoint $CHECKPOINT_PATH"
