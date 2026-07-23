@@ -156,9 +156,20 @@ class CarlaWptFixedEnv(CarlaWptEnv):
                 packet["anchors"][c] = polygons[c]
         return packet
 
+    def _intention_candidates(self):
+        """Vehicles eligible to share their intention with the ego.
+
+        ALL non-ego managed vehicles are candidates -- the car flow *and* the config-driven
+        scenario background vehicles (scenario_actors) -- so any surrounding vehicle can be a
+        collaborator, not just the flow. (Tasks without scenario actors are unaffected: their
+        actor_dict is just ego + flow.)
+        """
+        ego_id = self.get_ego_vehicle().id
+        return [actor for aid, actor in self._world.actor_dict.items() if aid != ego_id]
+
     def _select_shared_intentions(self):
         """
-        Select which flow vehicles share their intentions with the ego vehicle.
+        Select which vehicles share their intentions with the ego vehicle.
         Only takes effect when the birdeye ``waypoint_obs`` is set to ``designated``.
 
         Configured by ``intention_sharing``:
@@ -167,7 +178,7 @@ class CarlaWptFixedEnv(CarlaWptEnv):
         * ``num``: number of vehicles for ``nearest``/``random``
         """
         sharing = self._config.intention_sharing
-        candidates = list(self.actor_flow)
+        candidates = self._intention_candidates()
         if sharing.rule == "none" or not candidates:
             return []
         if sharing.rule == "all":
