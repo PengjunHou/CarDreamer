@@ -25,6 +25,8 @@ def main():
     ap.add_argument("--csv", default="experiments/coop-intention-latency/group_full/iu_entropy_table.csv")
     ap.add_argument("--out", default="experiments/coop-intention-latency/group_full/iu_vs_latency.png")
     ap.add_argument("--title", default="Intention Uncertainty vs communication latency\n(richer scene: +background traffic; lower = better)")
+    ap.add_argument("--ylabel", default=r"mean IU  ($\times 10^{-3}$, lower = better)")
+    ap.add_argument("--scale", type=float, default=1000.0)
     args = ap.parse_args()
 
     rows = {}
@@ -46,11 +48,11 @@ def main():
         y = []
         for k in ks:
             v = rows[rule].get(k, "")
-            y.append(float(v) * 1000.0 if v not in ("", "nan") else float("nan"))
+            y.append(float(v) * args.scale if v not in ("", "nan") else float("nan"))
         ax.plot(kvals, y, marker="o", lw=2, color=COLORS[rule], label=LABELS[rule])
 
     ax.set_xlabel("communication latency k (steps; 1 step = 100 ms)")
-    ax.set_ylabel(r"mean IU  ($\times 10^{-3}$, lower = better)")
+    ax.set_ylabel(args.ylabel)
     ax.set_title(args.title)
     ax.set_xticks(kvals)
     ax.grid(alpha=0.3)
