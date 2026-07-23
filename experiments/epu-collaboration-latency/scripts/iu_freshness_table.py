@@ -1,7 +1,7 @@
-"""EPU with entropy U_self but a TIME-FRESHNESS latency term (replaces position-residual gamma).
+"""IU with entropy U_self but a TIME-FRESHNESS latency term (replaces position-residual gamma).
 
 Shared-vehicle residual uncertainty:  u_i = U_self * (1 - trust(k)),  trust(k) = exp(-k*DT/tau)
-  - U_self is the SAME map-affordance route entropy as epu_entropy_table.u_self_entropy (unchanged).
+  - U_self is the SAME map-affordance route entropy as iu_entropy_table.u_self_entropy (unchanged).
   - k = per-config communication latency (rec["latency"]); trust is constant within a config.
   - k=0 -> trust=1 -> u=0 (fresh intention resolves the maneuver).
   - k large -> trust->0 -> u->U_self (stale intention as useless as the no-comm prior).
@@ -19,7 +19,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 from ecpg_from_geometry import relevance  # noqa: E402
-from epu_entropy_table import u_self_entropy  # noqa: E402
+from iu_entropy_table import u_self_entropy  # noqa: E402
 
 import carla  # noqa: E402
 
@@ -78,20 +78,20 @@ def main():
         print(f"  {tag}: mean_EPU={stats[tag]:.4f}  (relevant frames={len(vals)})", flush=True)
 
     rules = ["all", "nearest2", "nearest1", "random1"]
-    lines = ["", f"=== mean EPU (entropy U_self, freshness latency, tau={args.tau}s), lower = better ===",
+    lines = ["", f"=== mean IU (entropy U_self, freshness latency, tau={args.tau}s), lower = better ===",
              "rule     " + "  ".join(f"k{k:<2d}" for k in range(11))]
     for r in rules:
         row = f"{r:8s} " + "  ".join(f"{stats.get(f'{r}_k{k}', float('nan'))*1000:5.1f}" for k in range(11))
         lines.append(row)
     table = "\n".join(lines)
     print(table)
-    with open(os.path.join(args.out, "epu_freshness_table.txt"), "w") as fp:
+    with open(os.path.join(args.out, "iu_freshness_table.txt"), "w") as fp:
         fp.write(table + "\n")
-    with open(os.path.join(args.out, "epu_freshness_table.csv"), "w", newline="") as fp:
+    with open(os.path.join(args.out, "iu_freshness_table.csv"), "w", newline="") as fp:
         w = csv.writer(fp); w.writerow(["rule"] + [f"k{k}" for k in range(11)])
         for r in rules:
             w.writerow([r] + [round(stats.get(f"{r}_k{k}", float("nan")), 4) for k in range(11)])
-    print(f"\nwrote {args.out}/epu_freshness_table.txt and .csv")
+    print(f"\nwrote {args.out}/iu_freshness_table.txt and .csv")
 
 
 if __name__ == "__main__":

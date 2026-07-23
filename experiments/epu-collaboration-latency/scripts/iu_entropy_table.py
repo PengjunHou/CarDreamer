@@ -1,4 +1,4 @@
-"""EPU with entropy-based U_self (map-affordance route uncertainty).
+"""IU with entropy-based U_self (map-affordance route uncertainty).
 
 U_self(i) = normalized entropy of vehicle i's plausible routes over horizon H,
 enumerated from the CARLA (Town03) map topology -- junction branching gives high
@@ -7,8 +7,8 @@ replaces the earlier speed-only U_self so that two same-speed vehicles differ:
 one at a junction (high sharing value) vs one on a straight lane (redundant).
 
 Requires a running CARLA with Town03 (client-side waypoint queries only; no sim).
-Reads the recorded per-frame geometry, recomputes EPU, and prints the
-mean-EPU comparison table over rules x latencies.
+Reads the recorded per-frame geometry, recomputes IU, and prints the
+mean-IU comparison table over rules x latencies.
 """
 
 import argparse
@@ -146,7 +146,7 @@ def main():
     print(f"map: {cmap.name}")
 
     cache = {}
-    # mean EPU over relevant frames, per config
+    # mean IU over relevant frames, per config
     stats = {}
     for f in sorted(glob.glob(os.path.join(args.geom, "*_k*.jsonl"))):
         tag = os.path.basename(f)[:-6]
@@ -161,23 +161,23 @@ def main():
 
     # table: rules x latencies
     rules = ["all", "nearest2", "nearest1", "random1"]
-    lines = ["", "=== mean EPU (entropy U_self), lower = better ===",
+    lines = ["", "=== mean IU (entropy U_self), lower = better ===",
              "rule     " + "  ".join(f"k{k:<2d}" for k in range(11))]
     for r in rules:
         row = f"{r:8s} " + "  ".join(f"{stats.get(f'{r}_k{k}', float('nan')):.2f}" for k in range(11))
         lines.append(row)
     table = "\n".join(lines)
     print(table)
-    with open(os.path.join(args.out, "epu_entropy_table.txt"), "w") as fp:
+    with open(os.path.join(args.out, "iu_entropy_table.txt"), "w") as fp:
         fp.write(table + "\n")
 
     import csv
-    with open(os.path.join(args.out, "epu_entropy_table.csv"), "w", newline="") as fp:
+    with open(os.path.join(args.out, "iu_entropy_table.csv"), "w", newline="") as fp:
         w = csv.writer(fp)
         w.writerow(["rule"] + [f"k{k}" for k in range(11)])
         for r in rules:
             w.writerow([r] + [round(stats.get(f"{r}_k{k}", float("nan")), 3) for k in range(11)])
-    print(f"\nwrote {args.out}/epu_entropy_table.txt and .csv")
+    print(f"\nwrote {args.out}/iu_entropy_table.txt and .csv")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
-"""Plot mean entropy-EPU vs communication latency, one line per collaboration rule.
+"""Plot mean entropy-IU vs communication latency, one line per collaboration rule.
 
-Reads the epu_entropy_table.csv produced by epu_entropy_table.py (columns: rule, k0..k10)
-and draws EPU (x1e-3, lower = better) against latency k. This is the strategy x latency
-comparison view (complements the per-timestep EPU(t) curves in plot_ecpg_timeseries.py).
+Reads the iu_entropy_table.csv produced by iu_entropy_table.py (columns: rule, k0..k10)
+and draws IU (x1e-3, lower = better) against latency k. This is the strategy x latency
+comparison view (complements the per-timestep IU(t) curves in plot_ecpg_timeseries.py).
 """
 
 import argparse
@@ -22,9 +22,9 @@ LABELS = {
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", default="experiments/coop-intention-latency/group_full/epu_entropy_table.csv")
-    ap.add_argument("--out", default="experiments/coop-intention-latency/group_full/epu_vs_latency.png")
-    ap.add_argument("--title", default="Ego Perception Uncertainty vs communication latency\n(richer scene: +background traffic; lower = better)")
+    ap.add_argument("--csv", default="experiments/coop-intention-latency/group_full/iu_entropy_table.csv")
+    ap.add_argument("--out", default="experiments/coop-intention-latency/group_full/iu_vs_latency.png")
+    ap.add_argument("--title", default="Intention Uncertainty vs communication latency\n(richer scene: +background traffic; lower = better)")
     args = ap.parse_args()
 
     rows = {}
@@ -50,7 +50,7 @@ def main():
         ax.plot(kvals, y, marker="o", lw=2, color=COLORS[rule], label=LABELS[rule])
 
     ax.set_xlabel("communication latency k (steps; 1 step = 100 ms)")
-    ax.set_ylabel(r"mean EPU  ($\times 10^{-3}$, lower = better)")
+    ax.set_ylabel(r"mean IU  ($\times 10^{-3}$, lower = better)")
     ax.set_title(args.title)
     ax.set_xticks(kvals)
     ax.grid(alpha=0.3)

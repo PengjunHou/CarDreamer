@@ -5,6 +5,9 @@ import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy.interpolate import make_interp_spline
+from scipy.signal import savgol_filter
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RES = os.path.join(HERE, "results")
@@ -16,6 +19,17 @@ LAB = {"all": "all", "nearest2": "nearest-2", "nearest1": "nearest-1", "random1"
 COL = {"all": "#2a78d6", "nearest2": "#1baf7a", "nearest1": "#eb6834", "random1": "#e34948"}
 DASH = {"all": "-", "nearest2": "--", "nearest1": ":", "random1": "-."}
 KS = list(range(11))
+
+
+def _smooth(y, lo=0.0, hi=None):
+    """Savitzky-Golay denoise + cubic-spline interpolation, clipped to a valid range."""
+    y = np.asarray(y, float)
+    yy = savgol_filter(y, window_length=5, polyorder=2, mode="interp")
+    xf = np.linspace(KS[0], KS[-1], 200)
+    yf = make_interp_spline(KS, yy, k=3)(xf)
+    if lo is not None:
+        yf = np.clip(yf, lo, hi if hi is not None else yf.max())
+    return xf, yf
 
 
 def read_wide(path):
@@ -37,16 +51,18 @@ def read_driving(path):
     return d
 
 
-# Fig 1: EPU vs latency (freshness, simple env)
-fresh = read_wide(os.path.join(RES, "simple_freshness", "epu_freshness_table.csv"))
+# Fig 1: IU vs latency (freshness, simple env)
+fresh = read_wide(os.path.join(RES, "simple_freshness", "iu_freshness_table.csv"))
 fig, ax = plt.subplots(figsize=(7.5, 4.6))
 for r in RULES:
-    ax.plot(KS, fresh[r], DASH[r], color=COL[r], lw=2, marker="o", ms=4, label=LAB[r])
+    xf, yf = _smooth(fresh[r], lo=0.0)          # smoothed trend
+    ax.plot(xf, yf, DASH[r], color=COL[r], lw=2.2, label=LAB[r])
+    ax.plot(KS, fresh[r], "o", color=COL[r], ms=4, alpha=0.35)  # faint raw points
 ax.set_xlabel("communication latency k (steps; 1 step = 100 ms)")
-ax.set_ylabel(r"mean EPU ($\times 10^{-3}$, lower = better)")
-ax.set_title("EPU vs latency — simple env, freshness formula (τ=1 s)")
+ax.set_ylabel(r"mean IU ($\times 10^{-3}$, lower = better)")
+ax.set_title("IU vs latency — simple env, freshness formula (τ=1 s)")
 ax.set_xticks(KS); ax.grid(alpha=0.3); ax.legend(title="collaboration rule")
-fig.tight_layout(); fig.savefig(os.path.join(FIG, "fig1_epu_vs_latency_freshness.png"), dpi=150); plt.close(fig)
+fig.tight_layout(); fig.savefig(os.path.join(FIG, "fig1_iu_vs_latency_freshness.png"), dpi=150); plt.close(fig)
 
 # Fig 2: driving metrics 3-panel (simple env)
 dr = read_driving(os.path.join(RES, "driving_simple.csv"))
@@ -65,12 +81,12 @@ fig.suptitle("Driving metrics vs latency — simple env (right_turn_hard.ckpt)")
 fig.tight_layout(); fig.savefig(os.path.join(FIG, "fig2_driving_metrics.png"), dpi=150); plt.close(fig)
 
 # Fig 3: formula comparison for the `all` rule (gamma flat vs freshness monotone)
-gam = read_wide(os.path.join(RES, "simple_gamma_epu_table.csv"))
+gam = read_wide(os.path.join(RES, "simple_gamma_iu_table.csv"))
 fig, ax = plt.subplots(figsize=(7.5, 4.6))
 ax.plot(KS, gam["all"], "--", color="#888780", lw=2, marker="s", ms=4, label="position-residual γ (old) — flat")
 ax.plot(KS, fresh["all"], "-", color="#2a78d6", lw=2, marker="o", ms=4, label="freshness trust(k) (new) — monotone")
 ax.set_xlabel("communication latency k (steps; 1 step = 100 ms)")
-ax.set_ylabel(r"mean EPU, rule=all ($\times 10^{-3}$)")
+ax.set_ylabel(r"mean IU, rule=all ($\times 10^{-3}$)")
 ax.set_title("Latency term: position-residual γ vs freshness trust(k) — rule=all, simple env")
 ax.set_xticks(KS); ax.grid(alpha=0.3); ax.legend()
 fig.tight_layout(); fig.savefig(os.path.join(FIG, "fig3_formula_comparison.png"), dpi=150); plt.close(fig)

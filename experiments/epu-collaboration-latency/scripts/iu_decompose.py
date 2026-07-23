@@ -1,9 +1,9 @@
-"""Decompose entropy-EPU into shared-vehicle vs unshared-vehicle contributions.
+"""Decompose entropy-IU into shared-vehicle vs unshared-vehicle contributions.
 
-Answers "why doesn't EPU rise with latency?": latency (gamma) only touches SHARED
+Answers "why doesn't IU rise with latency?": latency (gamma) only touches SHARED
 vehicles, but in the richer scene most relevant vehicles are the never-shared scenario
 background cars, whose u_i = U_self is latency-independent. This prints, per config:
-    total EPU, shared-only EPU, unshared-only EPU, mean #relevant, mean #shared
+    total IU, shared-only IU, unshared-only IU, mean #relevant, mean #shared
 so we can see the shared component rise with k while the total stays flat.
 """
 
@@ -15,7 +15,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 from ecpg_from_geometry import relevance, survival  # noqa: E402
-from epu_entropy_table import u_self_entropy  # noqa: E402
+from iu_entropy_table import u_self_entropy  # noqa: E402
 
 import carla  # noqa: E402
 

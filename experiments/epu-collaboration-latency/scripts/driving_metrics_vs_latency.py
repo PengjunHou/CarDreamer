@@ -3,7 +3,7 @@
 Reads the eval metrics.jsonl written by each geometry-sweep config
 (<geom>/run_<rule>_k<k>/metrics.jsonl) and computes, per config:
     n_ep, collision_rate, success_rate, mean_speed
-This is the SAME data that produced the EPU tables (the very eval runs), just read from
+This is the SAME data that produced the IU tables (the very eval runs), just read from
 the eval side instead of the recorded geometry. No CARLA needed.
 """
 

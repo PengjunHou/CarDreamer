@@ -123,11 +123,11 @@ def frame_ecpg(rec):
 
 def frame_epu(rec):
     """
-    Ego Perception Uncertainty this frame: the relevance-weighted RESIDUAL
+    Intention Uncertainty this frame: the relevance-weighted RESIDUAL
     predictive uncertainty about surrounding vehicles' futures, given what ego
     currently knows (own kinematic prediction + any shared, possibly stale plan).
 
-        EPU(t) = sum over relevant vehicles i of  w_i * u_i
+        IU(t) = sum over relevant vehicles i of  w_i * u_i
         u_i = U_i_self                        if i's intention is not shared
               U_i_self * (1 - gamma_i)        if shared (stale by gamma_i)
 
@@ -135,7 +135,7 @@ def frame_epu(rec):
     gamma=0 (useless) -> u_i=U_i_self (as if not shared)
     gamma<0 (mislead) -> u_i>U_i_self (stale plan corrupts belief: worse than none)
 
-    Lower EPU = better understanding. Summed over ALL relevant vehicles (not
+    Lower IU = better understanding. Summed over ALL relevant vehicles (not
     just shared ones), so unshared/irrelevant collaborators leave uncertainty high.
     """
     ego_wp = rec["ego_wp"]

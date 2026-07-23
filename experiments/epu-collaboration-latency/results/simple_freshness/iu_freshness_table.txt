@@ -1,5 +1,5 @@
 
-=== mean EPU (entropy U_self, freshness latency, tau=1.0s), lower = better ===
+=== mean IU (entropy U_self, freshness latency, tau=1.0s), lower = better ===
 rule     k0   k1   k2   k3   k4   k5   k6   k7   k8   k9   k10
 all        0.0    2.5    4.8    6.0    9.0   11.2   11.9   14.2   15.0   18.5   18.9
 nearest2   3.1   10.1   11.5   13.4   15.6   21.5   18.9   23.1   19.9   26.8   25.9
