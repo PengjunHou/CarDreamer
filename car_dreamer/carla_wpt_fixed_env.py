@@ -1,3 +1,5 @@
+import json
+import os
 import random
 from collections import deque
 
@@ -5,7 +7,7 @@ import carla
 import numpy as np
 
 from .carla_wpt_env import CarlaWptEnv
-from .toolkit import FixedPathPlanner, get_location_distance, get_vehicle_pos
+from .toolkit import FixedPathPlanner, get_location_distance, get_vehicle_pos, get_vehicle_velocity
 from .toolkit.observer.handlers.utils import get_visibility_from
 
 
@@ -53,6 +55,10 @@ class CarlaWptFixedEnv(CarlaWptEnv):
         # latency_steps ago by the collaborators selected at that time
         self._comm_snapshots = deque(maxlen=self._config.intention_sharing.latency_steps + 1)
         self._comm_snapshot_step = None
+        # Opt-in per-frame geometry recorder (experiment instrumentation; off
+        # unless CARDREAMER_RECORD_GEOMETRY names an output jsonl path).
+        self._record_path = os.environ.get("CARDREAMER_RECORD_GEOMETRY", "")
+        self._episode_idx = getattr(self, "_episode_idx", -1) + 1
 
     def on_step(self) -> None:
         super().on_step()
@@ -93,7 +99,35 @@ class CarlaWptFixedEnv(CarlaWptEnv):
             packet = self._comm_snapshots[0]
         else:
             packet = self._empty_comm_packet()
+        if getattr(self, "_record_path", ""):
+            self._record_geometry(packet)
         return {**super().get_state(), "comm_packet": packet}
+
+    def _record_geometry(self, packet):
+        """Append one per-frame geometry record for offline ECPG computation."""
+        ego = self.get_ego_vehicle()
+        rec = {
+            "ep": self._episode_idx,
+            "t": self._time_step,
+            "latency": self._config.intention_sharing.latency_steps,
+            "rule": self._config.intention_sharing.rule,
+            "ego_pos": [float(v) for v in get_vehicle_pos(ego)],
+            "ego_wp": [[float(w[0]), float(w[1])] for w in self.waypoints],
+            "veh": {},          # all background vehicles: current pos + velocity
+            "shared": {},       # delayed (t-k) intention plans for selected collaborators
+        }
+        transforms = self._world.actor_transforms
+        for aid, tf in transforms.items():
+            if aid == ego.id:
+                continue
+            actor = self._world.actor_dict.get(aid)
+            v = get_vehicle_velocity(actor) if actor is not None else (0.0, 0.0)
+            rec["veh"][str(aid)] = {"pos": [float(tf.location.x), float(tf.location.y)],
+                                    "v": [float(v[0]), float(v[1])]}
+        for aid, path in packet["intentions"].items():
+            rec["shared"][str(aid)] = [[float(x), float(y)] for (x, y) in path]
+        with open(self._record_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
 
     def _snapshot_comm_packet(self):
         """

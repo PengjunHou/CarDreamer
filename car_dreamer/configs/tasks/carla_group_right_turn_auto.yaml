@@ -1,0 +1,36 @@
+# Per-task overrides for `carla_group_right_turn_auto`, merged on top of the
+# `carla_group_right_turn_auto` entry in tasks.yaml by load_task_configs.
+#
+# This task reuses the policy-driven CarlaRightTurnEnv (see tasks.yaml) and only enriches the
+# non-ego traffic with config-driven background vehicles (scenario_actors). The ego, its fixed
+# right-turn path, designated intention-sharing and communication-latency all stay unchanged.
+#
+# Scope: BACKGROUND CARS ONLY (no pedestrians / two-wheelers / V2V cooperative candidates).
+# scenario_actors schema: see car_dreamer/toolkit/scenario_actors.py.
+env:
+  # Existing car flow (background stream toward the junction); kept alongside scenario_actors.
+  flow_spawn_point: [-3.4, -151.2, 0.1, 90.0]
+  min_flow_dist: 12
+  max_flow_dist: 18
+
+  scenario_actors:
+    # Project hand-typed points to the nearest drivable lane so the TM gets a legal pose.
+    vehicle_start_mode: road          # exact | road | spawn_point
+    vehicle_destination_mode: road    # exact | road | spawn_point
+    preserve_vehicle_start_yaw: false # take the lane heading at the projected waypoint
+    vehicle_spawn_z_offset: 0.1
+    vehicles:
+      # Random background traffic (TM roam, respect lights + other vehicles).
+      - count: 8
+      # Parked observer on the junction's EAST approach (no destination, roam off -> stationary).
+      - start: [22.8, -137.8, 0.1]
+        autopilot_roam: false
+      # Roaming collaborators that follow the road via Traffic Manager autopilot.
+      - start: [4.10, -56.12, 0.28]
+        autopilot_roam: true
+      - start: [5.78, -113.23, 0.1]
+        autopilot_roam: true
+      # Roaming vehicle approaching from the south on road 29 (kept north of junction 655).
+      - start: [0.5, -180.0, 0.1]
+        autopilot_roam: true
+        target_speed: 25

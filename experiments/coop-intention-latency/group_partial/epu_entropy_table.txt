@@ -1,0 +1,7 @@
+
+=== mean EPU (entropy U_self), lower = better ===
+rule     k0   k1   k2   k3   k4   k5   k6   k7   k8   k9   k10
+all      0.01  0.02  0.01  0.01  0.01  nan  nan  nan  nan  nan  nan
+nearest2 0.01  0.02  0.01  0.02  0.02  nan  nan  nan  nan  nan  nan
+nearest1 0.03  0.03  0.02  0.02  0.03  nan  nan  nan  nan  nan  nan
+random1  0.03  0.02  0.05  0.03  0.03  nan  nan  nan  nan  nan  nan

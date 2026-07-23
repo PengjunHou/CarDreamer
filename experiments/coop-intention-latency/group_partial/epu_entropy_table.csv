@@ -1,0 +1,5 @@
+rule,k0,k1,k2,k3,k4,k5,k6,k7,k8,k9,k10
+all,0.012,0.024,0.013,0.014,0.014,nan,nan,nan,nan,nan,nan
+nearest2,0.015,0.022,0.014,0.023,0.019,nan,nan,nan,nan,nan,nan
+nearest1,0.026,0.031,0.022,0.023,0.031,nan,nan,nan,nan,nan,nan
+random1,0.031,0.025,0.054,0.025,0.029,nan,nan,nan,nan,nan,nan

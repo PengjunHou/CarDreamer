@@ -183,6 +183,11 @@ carla_right_turn_random:
     decoder.cnn_kernels: [5, 5, 5, 6, 6]
     train.log_keys_video: [camera, birdeye_wpt]
 
+# Same policy-driven right-turn env as carla_right_turn_simple, enriched with config-driven
+# background traffic. The scenario_actors block lives in configs/tasks/carla_group_right_turn_auto.yaml.
+carla_group_right_turn_auto:
+  <<: *carla_right_turn_simple
+
 carla_left_turn_simple: &carla_left_turn_simple
   env:
     world:

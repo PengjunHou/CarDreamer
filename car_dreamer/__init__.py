@@ -47,6 +47,14 @@ def load_task_configs(task_name: str):
     with open(os.path.join(dir, "tasks.yaml")) as f:
         task_config = yaml.safe_load(f)
         config = config.update(task_config[task_name])
+    # Optional per-task overrides (e.g. background scenario actors) live in
+    # configs/tasks/<task_name>.yaml and are merged on top when present.
+    task_file = os.path.join(dir, "tasks", f"{task_name}.yaml")
+    if os.path.exists(task_file):
+        with open(task_file) as f:
+            overrides = yaml.safe_load(f)
+        if overrides:
+            config = config.update(overrides)
     return config
 
 

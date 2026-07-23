@@ -6,7 +6,7 @@ import gym
 import numpy as np
 from gym import spaces
 
-from .toolkit import EnvMonitorOpenCV, Observer, WorldManager
+from .toolkit import EnvMonitorOpenCV, Observer, ScenarioActorManager, WorldManager
 
 
 class CarlaBaseEnv(gym.Env):
@@ -15,12 +15,28 @@ class CarlaBaseEnv(gym.Env):
 
         self._monitor = EnvMonitorOpenCV(self._config)
         self._world = WorldManager(self._config)
-        self._world.on_reset(self.on_reset)
-        self._world.on_step(self.on_step)
+        # Config-driven background actors (see ScenarioActorManager). Enabled only when the
+        # task declares ``env.scenario_actors``; a no-op (enabled=False) for every other task.
+        scenario_config = config.scenario_actors if "scenario_actors" in config else None
+        self._scenario_actors = ScenarioActorManager(self._world, scenario_config, cooperative_hook=None)
+        # Wrap the env reset/step callbacks so scenario actors spawn right after the task's own
+        # on_reset (i.e. after the ego is spawned) and are maintained right after each on_step.
+        self._world.on_reset(self._on_reset_hook)
+        self._world.on_step(self._on_step_hook)
         self._observer = Observer(self._world, self._config.observation)
 
         self.action_space = self._get_action_space()
         self.observation_space = self._get_observation_space()
+
+    def _on_reset_hook(self) -> None:
+        """World reset callback: run the task's on_reset, then spawn scenario actors."""
+        self.on_reset()
+        self._scenario_actors.reset_spawn()
+
+    def _on_step_hook(self) -> None:
+        """World step callback: run the task's on_step, then maintain scenario actors."""
+        self.on_step()
+        self._scenario_actors.step_update()
 
     @abstractmethod
     def on_reset(self) -> None:

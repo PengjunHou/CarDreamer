@@ -258,6 +258,52 @@ class WorldManager:
         self._vehicle_manager._tm.ignore_vehicles_percentage(vehicle, 100)
         return vehicle
 
+    def spawn_scenario_vehicle(
+        self,
+        start: Union[carla.Transform, None] = None,
+        destination: Union[carla.Location, None] = None,
+        target_speed: float = 25.0,
+        ignore_lights: bool = False,
+        stationary: bool = False,
+        blueprint: Union[carla.ActorBlueprint, None] = None,
+    ) -> Union[carla.Actor, None]:
+        """
+        Spawn one config-declared scenario vehicle for :class:`ScenarioActorManager`.
+
+        Unlike :py:meth:`try_spawn_aggresive_actor` (which forces conflicts by ignoring
+        other vehicles), scenario background cars drive normally so the scene stays
+        realistic: they respect other vehicles and, unless ``ignore_lights``, traffic lights.
+
+        :param start: spawn transform; if None, a random spawn point is used.
+        :param destination: optional Traffic Manager route target; None -> the TM roams.
+        :param target_speed: desired speed in km/h.
+        :param ignore_lights: if True, the vehicle ignores traffic lights.
+        :param stationary: if True, spawn parked with no autopilot (a fixed observer).
+        :param blueprint: optional blueprint; if None, the manager's default vehicle is used.
+
+        :return: the spawned actor, or None if the spawn failed.
+        """
+        vehicle = self.try_spawn_actor(start, blueprint)
+        if vehicle is None:
+            return None
+        if stationary:
+            return vehicle
+        vehicle.set_autopilot(True, self._tm_port)
+        self._vehicle_manager.set_auto_lane_change(vehicle, True)
+        if target_speed is not None:
+            self._vehicle_manager.set_desired_speed(vehicle, float(target_speed))
+        if ignore_lights:
+            self._vehicle_manager._tm.ignore_lights_percentage(vehicle, 100)
+        if destination is not None:
+            # Best-effort TM routing toward a destination. The cars-only scene declares no
+            # destinations, so this branch is currently unused; fall back to roaming if the
+            # installed CARLA/TM lacks set_path.
+            try:
+                self._vehicle_manager._tm.set_path(vehicle, [destination])
+            except Exception as exc:  # noqa: BLE001 - routing failure must not kill the episode
+                print(f"[CARLA] scenario vehicle set_path failed, roaming instead: {exc}")
+        return vehicle
+
     def destroy_actor(self, actor_id: int) -> None:
         """
         Destroy an actor. Call this method if you want to manually destroy an actor spawned by this manager.
